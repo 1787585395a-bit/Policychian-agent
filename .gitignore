@@ -1,0 +1,45 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local environments and secrets
+.env
+.env.*
+!.env.example
+.mcp.local.json
+*.pem
+*.key
+*.crt
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs and local runtime output
+*.log
+*.out
+*.err
+
+# Build/package output
+build/
+dist/
+*.egg-info/
+
+# Local MCP servers and downloaded reports
+external/mcp/
+artifacts/cninfo/reports/
+
+# Test and generated artifacts
+artifacts/test-results/*
+!artifacts/test-results/.gitkeep
+
+# Generated policy databases
+data/processed/*
+!data/processed/.gitkeep

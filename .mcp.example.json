@@ -1,0 +1,30 @@
+{
+  "mcpServers": {
+    "web-search": {
+      "type": "stdio",
+      "command": "cmd",
+      "args": ["/c", "npx", "-y", "open-websearch@latest"],
+      "env": {
+        "MODE": "stdio",
+        "DEFAULT_SEARCH_ENGINE": "bing",
+        "ALLOWED_SEARCH_ENGINES": "bing",
+        "SEARCH_MODE": "request"
+      }
+    },
+    "cninfo": {
+      "type": "stdio",
+      "command": "cmd",
+      "args": ["/c", "npx", "-y", "@youhaozhao/cninfo-mcp"],
+      "env": {}
+    },
+    "cn-financial": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "cn_financial_mcp"],
+      "env": {
+        "PYTHONPATH": "<PROJECT_ROOT>/external/mcp/cn-financial-mcp/src"
+      },
+      "cwd": "<PROJECT_ROOT>/external/mcp/cn-financial-mcp"
+    }
+  }
+}

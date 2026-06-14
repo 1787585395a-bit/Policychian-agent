@@ -1,0 +1,57 @@
+[
+  {
+    "company_name": "清源模型安全科技",
+    "industry_segment": "算法模型研发与评估",
+    "business_keywords": ["算法", "模型", "安全评估", "训练数据"],
+    "matched_business": "提供大模型安全评估、训练数据质量检测和模型风险测试服务。",
+    "source_name": "Mock Company Profile",
+    "source_url": "mock://company/qingyuan-model-safety",
+    "business_evidence": "公司资料显示其核心服务包括模型安全评估、训练数据质量检测和生成式人工智能风险测试。",
+    "revenue_relevance": "medium",
+    "data_date": "2026-01-15"
+  },
+  {
+    "company_name": "数安合规服务",
+    "industry_segment": "数据治理与安全合规",
+    "business_keywords": ["数据", "个人信息", "安全合规", "安全评估"],
+    "matched_business": "提供数据合规审计、个人信息保护评估和安全整改咨询。",
+    "source_name": "Mock Company Profile",
+    "source_url": "mock://company/data-compliance-service",
+    "business_evidence": "公司资料显示其业务覆盖数据合规审计、个人信息保护影响评估和安全整改咨询。",
+    "revenue_relevance": "medium",
+    "data_date": "2026-01-15"
+  },
+  {
+    "company_name": "智内容标识平台",
+    "industry_segment": "互联网内容服务",
+    "business_keywords": ["内容", "标识", "网络信息", "审核"],
+    "matched_business": "提供生成内容标识、内容审核和平台治理工具。",
+    "source_name": "Mock Company Profile",
+    "source_url": "mock://company/content-label-platform",
+    "business_evidence": "公司资料显示其产品包括生成内容标识、内容审核工作台和平台治理规则配置工具。",
+    "revenue_relevance": "medium",
+    "data_date": "2026-01-15"
+  },
+  {
+    "company_name": "未保互动科技",
+    "industry_segment": "未成年人保护相关服务",
+    "business_keywords": ["未成年人", "风险防护", "内容安全"],
+    "matched_business": "提供未成年人内容风险识别和交互式服务安全防护模块。",
+    "source_name": "Mock Company Profile",
+    "source_url": "mock://company/minor-protection-tech",
+    "business_evidence": "公司资料显示其服务面向未成年人内容风险识别、分级提示和安全防护场景。",
+    "revenue_relevance": "low",
+    "data_date": "2026-01-15"
+  },
+  {
+    "company_name": "生成服务运营云",
+    "industry_segment": "生成式人工智能服务",
+    "business_keywords": ["生成式人工智能", "服务提供者", "备案", "投诉"],
+    "matched_business": "提供生成式人工智能服务运营、用户反馈受理和合规流程管理模块。",
+    "source_name": "Mock Company Profile",
+    "source_url": "mock://company/genai-service-ops",
+    "business_evidence": "公司资料显示其平台支持生成式人工智能服务运营、用户投诉受理和合规流程记录。",
+    "revenue_relevance": "medium",
+    "data_date": "2026-01-15"
+  }
+]
