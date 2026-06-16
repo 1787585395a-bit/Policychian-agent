@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "functions": {
+    "api/index.py": {
+      "maxDuration": 300,
+      "memory": 1024,
+      "includeFiles": "data/processed/policychain_full.sqlite"
+    }
+  },
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "/api/index.py"
+    }
+  ],
+  "env": {
+    "POLICYCHAIN_DB": "data/processed/policychain_full.sqlite",
+    "POLICYCHAIN_LLM_PROVIDER": "deepseek",
+    "POLICYCHAIN_SYNC_JOBS": "1"
+  }
+}

@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 from policychain.mcp import StdioMCPInvoker, cache_mcp_invoker
+from policychain.llm import LLMConfigurationError
 from policychain.paths import resolve_default_db_path
 from scripts.run_research import run_research
 
@@ -43,6 +44,15 @@ def _resolve_port(env: dict[str, str] | None = None) -> int:
     return int(values.get("PORT") or values.get("POLICYCHAIN_PORT", "8000"))
 
 
+def _truthy_env(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _sync_jobs_enabled(env: dict[str, str] | None = None) -> bool:
+    values = env if env is not None else os.environ
+    return _truthy_env(values.get("POLICYCHAIN_SYNC_JOBS")) or _truthy_env(values.get("VERCEL"))
+
+
 HOST = _resolve_host()
 PORT = _resolve_port()
 
@@ -55,26 +65,57 @@ def run_query(
     progress_callback: Any | None = None,
 ) -> dict[str, Any]:
     started = perf_counter()
-    mcp_invoker = _build_mcp_invoker() if use_mcp else None
+    effective_use_llm = use_llm
+    mcp_invoker = None
+    runtime_notes: list[str] = []
+    if use_mcp:
+        try:
+            mcp_invoker = _build_mcp_invoker()
+        except Exception as exc:
+            message = f"MCP 外部工具初始化失败，已回退到本地流程：{exc}"
+            runtime_notes.append(message)
+            if progress_callback:
+                progress_callback(2, "MCP 初始化", message)
     try:
-        report = run_research(
-            query=query.strip() or DEFAULT_POLICY_INPUT,
-            db_path=db_path or resolve_default_db_path(),
-            ensure_sample_db=True,
-            rebuild_sample_db=False,
-            use_llm=use_llm,
-            mcp_invoker=mcp_invoker,
-            progress_callback=progress_callback,
-        )
+        try:
+            report = run_research(
+                query=query.strip() or DEFAULT_POLICY_INPUT,
+                db_path=db_path or resolve_default_db_path(),
+                ensure_sample_db=True,
+                rebuild_sample_db=False,
+                use_llm=effective_use_llm,
+                mcp_invoker=mcp_invoker,
+                progress_callback=progress_callback,
+            )
+        except LLMConfigurationError as exc:
+            if not effective_use_llm:
+                raise
+            effective_use_llm = False
+            message = f"模型分析初始化失败，已回退到确定性流程：{exc}"
+            runtime_notes.append(message)
+            if progress_callback:
+                progress_callback(3, "模型初始化", message)
+            report = run_research(
+                query=query.strip() or DEFAULT_POLICY_INPUT,
+                db_path=db_path or resolve_default_db_path(),
+                ensure_sample_db=True,
+                rebuild_sample_db=False,
+                use_llm=False,
+                mcp_invoker=mcp_invoker,
+                progress_callback=progress_callback,
+            )
     finally:
         closer = getattr(mcp_invoker, "close", None)
         if callable(closer):
             closer()
+    if runtime_notes:
+        notes = "\n".join(f"- {escape_note}" for escape_note in runtime_notes)
+        report = f"{report}\n\n## 运行环境提示\n\n{notes}"
     return {
         "query": query.strip() or DEFAULT_POLICY_INPUT,
         "report": report,
-        "use_llm": use_llm,
-        "use_mcp": use_mcp,
+        "use_llm": effective_use_llm,
+        "use_mcp": bool(mcp_invoker),
         "elapsed_seconds": round(perf_counter() - started, 2),
     }
 
@@ -721,8 +762,11 @@ def _create_job(query: str, use_llm: bool, use_mcp: bool) -> str:
             "use_mcp": use_mcp,
             "elapsed_seconds": None,
         }
-    thread = threading.Thread(target=_run_job, args=(job_id,), daemon=True)
-    thread.start()
+    if _sync_jobs_enabled():
+        _run_job(job_id)
+    else:
+        thread = threading.Thread(target=_run_job, args=(job_id,), daemon=True)
+        thread.start()
     return job_id
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 import unittest
 from unittest.mock import patch
@@ -12,9 +13,11 @@ from app import (
     _job_view,
     _resolve_host,
     _resolve_port,
+    _sync_jobs_enabled,
     render_page,
     run_query,
 )
+from policychain.llm import LLMConfigurationError
 from tests.helpers import artifact_db_path
 
 
@@ -25,6 +28,9 @@ class AppTests(unittest.TestCase):
         self.assertEqual(_resolve_port({}), 8000)
         self.assertEqual(_resolve_port({"POLICYCHAIN_PORT": "8010"}), 8010)
         self.assertEqual(_resolve_port({"PORT": "10000", "POLICYCHAIN_PORT": "8010"}), 10000)
+        self.assertFalse(_sync_jobs_enabled({}))
+        self.assertTrue(_sync_jobs_enabled({"VERCEL": "1"}))
+        self.assertTrue(_sync_jobs_enabled({"POLICYCHAIN_SYNC_JOBS": "true"}))
 
     def test_health_payload_is_render_friendly(self) -> None:
         payload = _health_payload()
@@ -126,6 +132,45 @@ class AppTests(unittest.TestCase):
         self.assertIs(fake_runner.call_args.kwargs["mcp_invoker"], fake_invoker)
         self.assertNotIn("skip_annual_reports", fake_runner.call_args.kwargs)
 
+    def test_run_query_falls_back_when_mcp_config_is_missing(self) -> None:
+        progress_events: list[tuple[int, str, str]] = []
+        with patch("app._build_mcp_invoker", side_effect=FileNotFoundError(".mcp.local.json")), patch(
+            "app.run_research",
+            return_value="# PolicyChain 政策研究报告",
+        ) as fake_runner:
+            result = run_query(
+                "测试政策正文",
+                db_path=":memory:",
+                use_mcp=True,
+                progress_callback=lambda progress, stage, message: progress_events.append((progress, stage, message)),
+            )
+
+        self.assertFalse(result["use_mcp"])
+        self.assertIn("运行环境提示", result["report"])
+        self.assertTrue(any(stage == "MCP 初始化" for _, stage, _ in progress_events))
+        self.assertIsNone(fake_runner.call_args.kwargs["mcp_invoker"])
+
+    def test_run_query_falls_back_when_llm_is_unconfigured(self) -> None:
+        progress_events: list[tuple[int, str, str]] = []
+        with patch(
+            "app.run_research",
+            side_effect=[
+                LLMConfigurationError("DEEPSEEK_API_KEY is required"),
+                "# PolicyChain 政策研究报告",
+            ],
+        ) as fake_runner:
+            result = run_query(
+                "测试政策正文",
+                db_path=":memory:",
+                use_llm=True,
+                progress_callback=lambda progress, stage, message: progress_events.append((progress, stage, message)),
+            )
+
+        self.assertFalse(result["use_llm"])
+        self.assertEqual(fake_runner.call_count, 2)
+        self.assertIn("运行环境提示", result["report"])
+        self.assertTrue(any(stage == "模型初始化" for _, stage, _ in progress_events))
+
     def test_async_job_reports_done_status_and_progress_logs(self) -> None:
         def fake_run_query(query: str, **kwargs):
             callback = kwargs["progress_callback"]
@@ -163,6 +208,26 @@ class AppTests(unittest.TestCase):
         self.assertIn("行业影响分析", stages)
         self.assertIn("公司业务匹配", stages)
         self.assertIn("生成报告", stages)
+
+    def test_sync_job_mode_finishes_before_returning_job_id(self) -> None:
+        def fake_run_query(query: str, **kwargs):
+            callback = kwargs["progress_callback"]
+            callback(100, "完成", "报告已生成")
+            return {
+                "query": query,
+                "report": "# PolicyChain 政策研究报告",
+                "use_llm": False,
+                "use_mcp": False,
+                "elapsed_seconds": 0.1,
+            }
+
+        with patch.dict(os.environ, {"POLICYCHAIN_SYNC_JOBS": "1"}), patch("app.run_query", side_effect=fake_run_query):
+            job_id = _create_job("政策正文", use_llm=False, use_mcp=False)
+            view = _job_view(job_id)
+
+        self.assertEqual(view["status"], "done")
+        self.assertEqual(view["progress"], 100)
+        self.assertIn("<h1>PolicyChain 政策研究报告</h1>", view["report_html"])
 
     def test_async_job_reports_error_status(self) -> None:
         with patch("app.run_query", side_effect=RuntimeError("读取失败")):
