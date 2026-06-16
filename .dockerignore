@@ -1,0 +1,38 @@
+.git/
+.github/
+
+# Local secrets and machine-specific config
+.env
+.env.*
+!.env.example
+.mcp.local.json
+*.pem
+*.key
+*.crt
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Local runtime output
+*.log
+*.out
+*.err
+artifacts/
+external/mcp/
+
+# Build output
+build/
+dist/
+*.egg-info/
+
+# Generated databases except the deployable full database
+data/processed/*
+!data/processed/.gitkeep
+!data/processed/policychain_full.sqlite

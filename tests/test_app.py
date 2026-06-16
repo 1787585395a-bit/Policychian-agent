@@ -8,7 +8,10 @@ from app import (
     DEFAULT_POLICY_INPUT,
     EXAMPLE_QUERIES,
     _create_job,
+    _health_payload,
     _job_view,
+    _resolve_host,
+    _resolve_port,
     render_page,
     run_query,
 )
@@ -16,6 +19,20 @@ from tests.helpers import artifact_db_path
 
 
 class AppTests(unittest.TestCase):
+    def test_cloud_runtime_env_helpers(self) -> None:
+        self.assertEqual(_resolve_host({}), "127.0.0.1")
+        self.assertEqual(_resolve_host({"POLICYCHAIN_HOST": "0.0.0.0"}), "0.0.0.0")
+        self.assertEqual(_resolve_port({}), 8000)
+        self.assertEqual(_resolve_port({"POLICYCHAIN_PORT": "8010"}), 8010)
+        self.assertEqual(_resolve_port({"PORT": "10000", "POLICYCHAIN_PORT": "8010"}), 10000)
+
+    def test_health_payload_is_render_friendly(self) -> None:
+        payload = _health_payload()
+
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["service"], "policychain")
+        self.assertIn("time", payload)
+
     def test_render_page_contains_policy_input_progress_and_logs(self) -> None:
         html = render_page().decode("utf-8")
 

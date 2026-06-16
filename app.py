@@ -19,8 +19,6 @@ from scripts.run_research import run_research
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-HOST = "127.0.0.1"
-PORT = int(os.environ.get("POLICYCHAIN_PORT", "8000"))
 DEFAULT_POLICY_INPUT = """生成式人工智能服务管理办法
 
 第一条 为促进生成式人工智能健康发展和规范应用，维护国家安全和社会公共利益，制定本办法。
@@ -33,6 +31,20 @@ EXAMPLE_QUERIES = (
 
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
+
+
+def _resolve_host(env: dict[str, str] | None = None) -> str:
+    values = env if env is not None else os.environ
+    return values.get("POLICYCHAIN_HOST", "127.0.0.1")
+
+
+def _resolve_port(env: dict[str, str] | None = None) -> int:
+    values = env if env is not None else os.environ
+    return int(values.get("PORT") or values.get("POLICYCHAIN_PORT", "8000"))
+
+
+HOST = _resolve_host()
+PORT = _resolve_port()
 
 
 def run_query(
@@ -623,6 +635,9 @@ def render_page(
 class PolicyChainRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/healthz":
+            self._send_json(_health_payload())
+            return
         if parsed.path == "/api/research-status":
             params = parse_qs(parsed.query)
             job_id = (params.get("job_id") or [""])[0]
@@ -818,6 +833,14 @@ def _payload_bool(payload: dict[str, Any], key: str, default: bool) -> bool:
     if isinstance(value, str):
         return value.strip().lower() not in {"", "0", "false", "no", "off"}
     return bool(value)
+
+
+def _health_payload() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "service": "policychain",
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _build_mcp_invoker():

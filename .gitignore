@@ -44,3 +44,4 @@ artifacts/test-results/*
 # Generated policy databases
 data/processed/*
 !data/processed/.gitkeep
+!data/processed/policychain_full.sqlite

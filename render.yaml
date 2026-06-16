@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: policychain-agent
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: POLICYCHAIN_HOST
+        value: 0.0.0.0
+      - key: POLICYCHAIN_DB
+        value: /app/data/processed/policychain_full.sqlite
+      - key: POLICYCHAIN_MCP_CONFIG
+        value: /app/.mcp.local.json
+      - key: POLICYCHAIN_LLM_PROVIDER
+        value: deepseek
+      - key: DEEPSEEK_TIMEOUT_SECONDS
+        value: "120"
+      - key: DEEPSEEK_API_KEY
+        sync: false

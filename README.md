@@ -225,6 +225,47 @@ $env:POLICYCHAIN_DB="data\processed\policychain_full.sqlite"
 python app.py
 ```
 
+## Cloud Deployment on Render
+
+This repository includes a Dockerfile and `render.yaml` for deploying PolicyChain as a public Render Web Service. The first deployment uses Render's default `*.onrender.com` URL and does not configure a custom domain.
+
+Before deploying, make sure the full SQLite database exists:
+
+```powershell
+python scripts/ingest_policy_dir.py --source-dir "D:\Code\人工智能政策文件" --manifest "D:\Code\人工智能政策文件\政策文件清单.csv" --db data/processed/policychain_full.sqlite --reset
+```
+
+Local Docker smoke check:
+
+```powershell
+docker build -t policychain-web .
+docker run --rm -p 8010:10000 -e PORT=10000 -e POLICYCHAIN_HOST=0.0.0.0 policychain-web
+```
+
+Open:
+
+```text
+http://127.0.0.1:8010/
+http://127.0.0.1:8010/healthz
+```
+
+Render setup:
+
+1. Push the repository to GitHub.
+2. In Render, create a new Blueprint or Docker Web Service from this repository.
+3. Use the service name `policychain-agent` if available; otherwise use `policychain-research` or `policychain-rag`.
+4. Set `DEEPSEEK_API_KEY` in Render environment variables. Do not commit it to git.
+5. Deploy and open the generated Render default URL.
+
+The Render service uses:
+
+- `POLICYCHAIN_HOST=0.0.0.0`
+- `POLICYCHAIN_DB=/app/data/processed/policychain_full.sqlite`
+- `POLICYCHAIN_MCP_CONFIG=/app/.mcp.local.json`
+- `POLICYCHAIN_LLM_PROVIDER=deepseek`
+
+The site is public by default. Anyone with the Render URL can submit analyses and trigger DeepSeek/MCP usage.
+
 ## Current Stage
 
 Implemented scope:
