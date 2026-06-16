@@ -4,7 +4,14 @@ import time
 import unittest
 from unittest.mock import patch
 
-from app import DEFAULT_POLICY_INPUT, EXAMPLE_QUERIES, _create_job, _job_view, render_page, run_query
+from app import (
+    DEFAULT_POLICY_INPUT,
+    EXAMPLE_QUERIES,
+    _create_job,
+    _job_view,
+    render_page,
+    run_query,
+)
 from tests.helpers import artifact_db_path
 
 
@@ -13,18 +20,18 @@ class AppTests(unittest.TestCase):
         html = render_page().decode("utf-8")
 
         self.assertIn("<form", html)
-        self.assertIn("粘贴政策链接或正文", html)
+        self.assertIn("粘贴政策链接或政策正文", html)
         self.assertIn("政策链接或政策正文", html)
         self.assertIn(DEFAULT_POLICY_INPUT, html)
-        self.assertIn('name="use_llm"', html)
-        self.assertIn("DeepSeek", html)
-        self.assertIn('name="use_mcp"', html)
-        self.assertIn("MCP 外部证据", html)
-        self.assertNotIn('id="use_mcp" name="use_mcp" type="checkbox" value="1" disabled', html)
+        self.assertIn("默认启用模型分析与外部证据工具", html)
+        self.assertNotIn("数据库：", html)
+        self.assertNotIn("运行模式：", html)
+        self.assertNotIn('name="use_llm"', html)
+        self.assertNotIn('name="use_mcp"', html)
+        self.assertNotIn("DeepSeek", html)
+        self.assertNotIn("MCP 外部证据", html)
         self.assertIn("等待分析结果", html)
         self.assertIn("研究辅助，不构成投资建议", html)
-        self.assertIn("数据库：", html)
-        self.assertIn("运行模式：确定性流程", html)
         self.assertIn('data-loading-label="分析中"', html)
         self.assertIn('id="progress-bar"', html)
         self.assertIn('aria-label="运行日志窗口"', html)
@@ -34,30 +41,32 @@ class AppTests(unittest.TestCase):
         self.assertIn('id="copy-log" type="button" disabled', html)
         self.assertIn("/api/research", html)
         self.assertIn("/api/research-status", html)
-        for example_query in EXAMPLE_QUERIES:
-            self.assertIn(example_query, html)
+        self.assertIn("use_llm: true", html)
+        self.assertIn("use_mcp: true", html)
+        self.assertEqual(len(EXAMPLE_QUERIES), 1)
+        self.assertIn(EXAMPLE_QUERIES[0], html)
 
-    def test_render_page_marks_llm_mode_checkbox(self) -> None:
-        html = render_page(use_llm=True).decode("utf-8")
+    def test_render_page_renders_markdown_report_content(self) -> None:
+        report = (
+            "# 报告标题\n\n"
+            "#### **一、政策核心与总体解读**\n\n"
+            "1. **政策靶向更精准**：不同技术成熟度的产业面临不同矛盾。\n"
+            "2. **资源配置逻辑重构**：政策工具分类施策。\n\n"
+            "##### **路径一：未来产业示范与风险分担机制（IMP-001）**\n\n"
+            "* **政策含义与措施**：建立投入增长和风险分担机制。\n"
+            "- 影响集中在研发、示范应用及产业化初期。\n\n"
+            "主体段落第一句。\n"
+            "主体段落第二句。"
+        )
+        html = render_page(query="测试", report=report).decode("utf-8")
 
-        self.assertIn('id="use_llm"', html)
-        self.assertIn("checked", html)
-        self.assertIn("运行模式：DeepSeek", html)
-        self.assertIn("当前模式：DeepSeek", html)
-
-    def test_render_page_marks_mcp_mode_checkbox(self) -> None:
-        html = render_page(use_mcp=True).decode("utf-8")
-
-        self.assertIn('id="use_mcp"', html)
-        self.assertIn("运行模式：确定性流程 + MCP 外部证据", html)
-        self.assertIn("当前模式：确定性流程 + MCP 外部证据", html)
-
-    def test_render_page_renders_report_content(self) -> None:
-        html = render_page(query="测试", report="# 标题\n\n## 章节\n\n- 条目").decode("utf-8")
-
-        self.assertIn("<h1>标题</h1>", html)
-        self.assertIn("<h2>章节</h2>", html)
-        self.assertIn("<li>条目</li>", html)
+        self.assertIn("<h1>报告标题</h1>", html)
+        self.assertIn("<h4><strong>一、政策核心与总体解读</strong></h4>", html)
+        self.assertIn("<h5><strong>路径一：未来产业示范与风险分担机制（IMP-001）</strong></h5>", html)
+        self.assertIn("<ol>", html)
+        self.assertIn("<ul>", html)
+        self.assertIn("<strong>政策靶向更精准</strong>", html)
+        self.assertIn("<p>主体段落第一句。 主体段落第二句。</p>", html)
 
     def test_render_page_renders_error_content(self) -> None:
         html = render_page(query="测试", error="数据库不可用").decode("utf-8")
@@ -74,7 +83,7 @@ class AppTests(unittest.TestCase):
 
     def test_run_query_can_request_llm_mode(self) -> None:
         with patch("app.run_research", return_value="# PolicyChain 政策研究报告") as fake_runner:
-            result = run_query("测试问题", db_path=":memory:", use_llm=True)
+            result = run_query("测试政策正文", db_path=":memory:", use_llm=True)
 
         self.assertTrue(result["use_llm"])
         self.assertEqual(result["report"], "# PolicyChain 政策研究报告")
@@ -93,7 +102,7 @@ class AppTests(unittest.TestCase):
             "app.run_research",
             return_value="# PolicyChain 政策研究报告",
         ) as fake_runner:
-            result = run_query("测试问题", db_path=":memory:", use_mcp=True)
+            result = run_query("测试政策正文", db_path=":memory:", use_mcp=True)
 
         self.assertTrue(result["use_mcp"])
         self.assertTrue(fake_invoker.closed)

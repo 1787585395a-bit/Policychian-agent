@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import re
 from time import perf_counter
 import threading
 from typing import Any
@@ -14,7 +15,7 @@ from uuid import uuid4
 
 from policychain.mcp import StdioMCPInvoker, cache_mcp_invoker
 from policychain.paths import resolve_default_db_path
-from scripts.run_research import DEFAULT_QUERY, run_research
+from scripts.run_research import run_research
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -22,18 +23,12 @@ HOST = "127.0.0.1"
 PORT = int(os.environ.get("POLICYCHAIN_PORT", "8000"))
 DEFAULT_POLICY_INPUT = """生成式人工智能服务管理办法
 
-第一条 为了促进生成式人工智能健康发展和规范应用，维护国家安全和社会公共利益，制定本办法。
+第一条 为促进生成式人工智能健康发展和规范应用，维护国家安全和社会公共利益，制定本办法。
 第二条 生成式人工智能服务提供者应当依法承担网络信息内容生产者责任，履行网络信息安全义务。
 第三条 服务提供者应当开展算法模型安全评估，提升训练数据质量，采取有效措施防范违法和不良信息生成传播。
 第四条 主管部门应当加强监督管理，推动行业组织建立服务能力评估机制。"""
 EXAMPLE_QUERIES = (
     "https://www.cac.gov.cn/2023-07/13/c_1690898327029107.htm",
-    DEFAULT_POLICY_INPUT,
-    """低空经济基础设施建设管理办法
-
-第一条 为了规范低空经济基础设施建设和运营，促进低空飞行服务安全有序发展，制定本办法。
-第二条 低空经济基础设施运营单位应当建立安全管理制度，依法履行数据安全、通信保障和运行维护义务。
-第三条 主管部门应当加强监督管理，推动空域服务、通信导航、飞行保障和应急处置能力建设。""",
 )
 
 JOBS: dict[str, dict[str, Any]] = {}
@@ -77,18 +72,18 @@ def render_page(
     report: str = "",
     error: str = "",
     elapsed_seconds: float | None = None,
-    use_llm: bool = False,
-    use_mcp: bool = False,
+    use_llm: bool = True,
+    use_mcp: bool = True,
 ) -> bytes:
-    checked = " checked" if use_llm else ""
-    mcp_checked = " checked" if use_mcp else ""
     examples = "\n".join(
         f'<button class="quick" type="button" data-query="{escape(item)}">{escape(item)}</button>'
         for item in EXAMPLE_QUERIES
     )
-    db_status = _db_status_text()
-    mode = _mode_text(use_llm=use_llm, use_mcp=use_mcp)
-    report_html = _markdown_to_html(report) if report else '<div class="empty">等待分析结果。运行后将在这里显示政策分析、相似政策对比、行业影响和公司业务匹配报告。</div>'
+    report_html = (
+        _markdown_to_html(report)
+        if report
+        else '<div class="empty">等待分析结果。运行后将在这里显示政策分析、相似政策对比、行业影响和公司业务匹配报告。</div>'
+    )
     error_html = f'<div class="error" id="error-box">{escape(error)}</div>' if error else '<div class="error hidden" id="error-box"></div>'
 
     html = f"""<!doctype html>
@@ -108,15 +103,16 @@ def render_page(
       --line-strong: #c7c7c7;
       --accent: #111111;
       --danger: #b42318;
-      --ok: #1f7a4d;
     }}
     * {{ box-sizing: border-box; }}
+    html {{ max-width: 100%; overflow-x: hidden; }}
     body {{
       margin: 0;
       background: var(--bg);
       color: var(--text);
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
       letter-spacing: 0;
+      overflow-x: hidden;
     }}
     button, textarea, input {{ font: inherit; }}
     header {{
@@ -134,17 +130,8 @@ def render_page(
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 20px;
     }}
     .brand {{ font-size: 16px; font-weight: 650; line-height: 1; white-space: nowrap; }}
-    .nav-meta {{
-      display: flex;
-      align-items: center;
-      gap: 18px;
-      color: var(--muted);
-      font-size: 13px;
-      white-space: nowrap;
-    }}
     main {{
       max-width: 1060px;
       margin: 0 auto;
@@ -159,12 +146,13 @@ def render_page(
     .hero h1 {{
       margin: 0;
       width: 100%;
-      max-width: 780px;
-      font-size: clamp(40px, 7vw, 72px);
-      line-height: 1;
+      max-width: 960px;
+      font-size: clamp(36px, 5.5vw, 64px);
+      line-height: 1.08;
       font-weight: 650;
       letter-spacing: 0;
       overflow-wrap: anywhere;
+      word-break: break-word;
     }}
     .hero p {{
       margin: 20px 0 0;
@@ -205,6 +193,10 @@ def render_page(
       font-size: 16px;
       line-height: 1.58;
       outline: none;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      white-space: pre-wrap;
+      overflow-x: hidden;
     }}
     textarea::placeholder {{ color: #8a8a8e; }}
     .composer-footer {{
@@ -212,13 +204,9 @@ def render_page(
       padding: 12px;
       display: flex;
       align-items: center;
-      justify-content: space-between;
-      gap: 12px;
+      justify-content: center;
       background: #fff;
     }}
-    .mode-controls {{ display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }}
-    .switch {{ display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--text); }}
-    .switch input {{ width: 16px; height: 16px; margin: 0; accent-color: #111; }}
     .run-button {{
       flex: 0 0 auto;
       min-width: 112px;
@@ -231,6 +219,7 @@ def render_page(
       line-height: 1;
       padding: 12px 18px;
       cursor: pointer;
+      margin: 0 auto;
     }}
     .run-button:hover {{ background: #2b2b2b; }}
     .run-button:disabled {{ cursor: wait; background: #4a4a4a; border-color: #4a4a4a; }}
@@ -254,6 +243,11 @@ def render_page(
       line-height: 1.2;
       padding: 9px 11px;
       cursor: pointer;
+      overflow-wrap: anywhere;
+      word-break: break-all;
+      text-align: left;
+      white-space: normal;
+      min-width: 0;
     }}
     .quick:hover {{ border-color: var(--line-strong); background: #fff; }}
     .status-line, .notice {{
@@ -295,19 +289,6 @@ def render_page(
       background: var(--accent);
       transition: width 220ms ease;
     }}
-    .log-panel {{
-      margin-top: 12px;
-      height: 220px;
-      overflow: auto;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #fff;
-      padding: 10px 12px;
-      color: #2b2b2b;
-      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
-      font-size: 12px;
-      line-height: 1.55;
-    }}
     .log-window-head {{
       margin-top: 14px;
       display: flex;
@@ -321,11 +302,7 @@ def render_page(
       gap: 10px;
       min-width: 0;
     }}
-    .log-title strong {{
-      font-size: 14px;
-      font-weight: 650;
-      color: var(--ink);
-    }}
+    .log-title strong {{ font-size: 14px; font-weight: 650; color: var(--text); }}
     .log-meta {{
       color: var(--muted);
       font-size: 12px;
@@ -337,7 +314,7 @@ def render_page(
       border: 1px solid var(--line-strong);
       border-radius: 8px;
       background: #fff;
-      color: var(--ink);
+      color: var(--text);
       min-height: 34px;
       padding: 0 12px;
       font-size: 13px;
@@ -348,6 +325,19 @@ def render_page(
       border-color: var(--line);
       background: var(--soft);
       cursor: not-allowed;
+    }}
+    .log-panel {{
+      margin-top: 12px;
+      height: 220px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 10px 12px;
+      color: #2b2b2b;
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.55;
     }}
     .log-item {{ padding: 4px 0; border-bottom: 1px solid #f1f1f1; white-space: pre-wrap; }}
     .log-item:last-child {{ border-bottom: 0; }}
@@ -371,28 +361,30 @@ def render_page(
     }}
     .report h1 {{ margin: 0 0 18px; font-size: 30px; line-height: 1.2; font-weight: 650; }}
     .report h2 {{
-      margin: 28px 0 12px;
-      padding-top: 20px;
+      margin: 30px 0 12px;
+      padding-top: 22px;
       border-top: 1px solid var(--line);
-      font-size: 20px;
+      font-size: 22px;
       line-height: 1.35;
       font-weight: 650;
     }}
-    .report h3 {{ margin: 18px 0 8px; font-size: 16px; line-height: 1.45; font-weight: 650; }}
+    .report h3 {{ margin: 22px 0 10px; font-size: 18px; line-height: 1.45; font-weight: 650; }}
+    .report h4 {{ margin: 20px 0 8px; font-size: 16px; line-height: 1.45; font-weight: 650; }}
+    .report h5 {{ margin: 16px 0 8px; font-size: 15px; line-height: 1.45; font-weight: 650; color: #2b2b2b; }}
     .report p {{ margin: 10px 0; color: #1f1f1f; }}
-    .report ul {{ margin: 8px 0 0; padding-left: 22px; }}
-    .report li {{ margin: 6px 0; }}
+    .report ul, .report ol {{ margin: 8px 0 14px; padding-left: 24px; }}
+    .report li {{ margin: 6px 0; padding-left: 2px; }}
+    .report strong {{ font-weight: 650; }}
     .empty {{ padding: 26px 0; color: var(--muted); font-size: 15px; line-height: 1.6; }}
     @media (max-width: 720px) {{
-      .topbar {{ padding: 14px 16px; align-items: flex-start; flex-direction: column; gap: 8px; }}
-      .nav-meta {{ gap: 8px; align-items: flex-start; flex-direction: column; white-space: normal; }}
+      .topbar {{ padding: 14px 16px; }}
       main {{ padding: 34px 16px 48px; }}
       .hero {{ padding-top: 14px; justify-items: start; text-align: left; }}
-      .hero h1 {{ max-width: 340px; font-size: 34px; line-height: 1.08; }}
+      .hero h1 {{ max-width: 100%; font-size: 30px; line-height: 1.14; word-break: break-all; }}
       .hero p, .composer, .examples, .status-line, .notice, .progress-panel {{ max-width: 100%; }}
       .examples {{ justify-content: flex-start; }}
-      .composer-footer {{ flex-direction: column; align-items: stretch; }}
-      .mode-controls {{ gap: 10px; }}
+      .quick {{ width: 100%; }}
+      .composer-footer {{ align-items: stretch; }}
       .run-button {{ width: 100%; min-width: 0; }}
       .log-window-head {{ align-items: stretch; flex-direction: column; }}
       .log-meta {{ white-space: normal; }}
@@ -405,38 +397,24 @@ def render_page(
   <header>
     <nav class="topbar" aria-label="PolicyChain">
       <div class="brand">PolicyChain</div>
-      <div class="nav-meta">
-        <span>{escape(db_status)}</span>
-        <span>运行模式：{escape(mode)}</span>
-      </div>
     </nav>
   </header>
   <main>
     <section class="hero">
-      <h1>粘贴政策链接或正文</h1>
+      <h1>粘贴政策链接或政策正文</h1>
       <p>PolicyChain 会先读取你输入的政策内容，再检索本地知识库中的相似政策用于对比，随后完成政策分析、行业影响和公司业务匹配。</p>
       <form class="composer" method="post" action="/" id="research-form">
         <label for="query">政策链接或政策正文</label>
-        <textarea id="query" name="query" placeholder="粘贴 http/https 政策链接，或直接粘贴政策正文。">{escape(query)}</textarea>
+        <textarea id="query" name="query" wrap="soft" placeholder="粘贴 http/https 政策链接，或直接粘贴政策正文。">{escape(query)}</textarea>
         <div class="composer-footer">
-          <div class="mode-controls">
-            <label class="switch" for="use_llm">
-              <input id="use_llm" name="use_llm" type="checkbox" value="1"{checked}>
-              <span>DeepSeek</span>
-            </label>
-            <label class="switch" for="use_mcp">
-              <input id="use_mcp" name="use_mcp" type="checkbox" value="1"{mcp_checked}>
-              <span>MCP 外部证据</span>
-            </label>
-          </div>
           <button class="run-button" type="submit" data-idle-label="运行分析" data-loading-label="分析中">运行分析</button>
         </div>
       </form>
       <div class="examples" aria-label="快捷输入">
         {examples}
       </div>
-      <div class="status-line" id="status-line" role="status" aria-live="polite">{_elapsed_text(elapsed_seconds, use_llm, use_mcp)}</div>
-      <div class="notice">研究辅助，不构成投资建议。启用 MCP 时会调用 Open-WebSearch 和 CNFinancial；公司匹配依据为公开业务资料。</div>
+      <div class="status-line" id="status-line" role="status" aria-live="polite">{_elapsed_text(elapsed_seconds)}</div>
+      <div class="notice">研究辅助，不构成投资建议。默认启用模型分析与外部证据工具；不可用时会在日志和报告中说明。</div>
       <div class="progress-panel" aria-label="运行进度">
         <div class="progress-head">
           <span id="stage-label">等待开始</span>
@@ -503,8 +481,8 @@ def render_page(
           headers: {{"Content-Type": "application/json"}},
           body: JSON.stringify({{
             query: queryInput.value,
-            use_llm: document.getElementById("use_llm").checked,
-            use_mcp: document.getElementById("use_mcp").checked
+            use_llm: true,
+            use_mcp: true
           }})
         }});
         const payload = await response.json();
@@ -657,16 +635,16 @@ class PolicyChainRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/research":
             payload = self._read_payload()
             query = str(payload.get("query") or DEFAULT_POLICY_INPUT)
-            use_llm = bool(payload.get("use_llm"))
-            use_mcp = bool(payload.get("use_mcp"))
+            use_llm = _payload_bool(payload, "use_llm", default=True)
+            use_mcp = _payload_bool(payload, "use_mcp", default=True)
             job_id = _create_job(query=query, use_llm=use_llm, use_mcp=use_mcp)
             self._send_json({"job_id": job_id, "status": "pending"}, status=202)
             return
 
         payload = self._read_payload()
         query = str(payload.get("query") or DEFAULT_POLICY_INPUT)
-        use_llm = bool(payload.get("use_llm"))
-        use_mcp = bool(payload.get("use_mcp"))
+        use_llm = _payload_bool(payload, "use_llm", default=True)
+        use_mcp = _payload_bool(payload, "use_mcp", default=True)
         try:
             result = run_query(query, use_llm=use_llm, use_mcp=use_mcp)
             html = render_page(
@@ -692,8 +670,8 @@ class PolicyChainRequestHandler(BaseHTTPRequestHandler):
         form = parse_qs(body.decode("utf-8", errors="replace"))
         return {
             "query": (form.get("query") or [DEFAULT_POLICY_INPUT])[0],
-            "use_llm": (form.get("use_llm") or [""])[0] == "1",
-            "use_mcp": (form.get("use_mcp") or [""])[0] == "1",
+            "use_llm": (form.get("use_llm") or ["1"])[0] != "0",
+            "use_mcp": (form.get("use_mcp") or ["1"])[0] != "0",
         }
 
     def _send_html(self, payload: bytes) -> None:
@@ -823,25 +801,23 @@ def _log_event(stage: str, message: str, progress: int) -> dict[str, Any]:
     }
 
 
-def _db_status_text() -> str:
-    path = resolve_default_db_path()
-    label = "完整库" if path.name == "policychain_full.sqlite" else "样例库"
-    state = "已就绪" if path.exists() else "首次运行时准备"
-    return f"数据库：{label}，{state}"
-
-
-def _elapsed_text(elapsed_seconds: float | None, use_llm: bool = False, use_mcp: bool = False) -> str:
-    mode = _mode_text(use_llm=use_llm, use_mcp=use_mcp)
+def _elapsed_text(elapsed_seconds: float | None) -> str:
     if elapsed_seconds is None:
-        return f"当前模式：{mode}。本地政策库只用于检索相似政策。"
-    return f"当前模式：{mode}。完成用时：{elapsed_seconds:.2f} 秒。"
+        return "默认启用模型分析与外部证据工具。本地政策库仅用于检索相似政策。"
+    return f"分析完成，用时：{elapsed_seconds:.2f} 秒。"
 
 
-def _mode_text(use_llm: bool = False, use_mcp: bool = False) -> str:
-    parts = ["DeepSeek" if use_llm else "确定性流程"]
-    if use_mcp:
-        parts.append("MCP 外部证据")
-    return " + ".join(parts)
+def _payload_bool(payload: dict[str, Any], key: str, default: bool) -> bool:
+    if key not in payload:
+        return default
+    value = payload.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    return bool(value)
 
 
 def _build_mcp_invoker():
@@ -856,43 +832,67 @@ def _build_mcp_invoker():
 
 
 def _markdown_to_html(markdown: str) -> str:
-    lines: list[str] = []
-    in_list = False
+    html: list[str] = []
+    paragraph: list[str] = []
+    list_type: str | None = None
+
+    def flush_paragraph() -> None:
+        if paragraph:
+            html.append(f"<p>{_render_inline(' '.join(paragraph))}</p>")
+            paragraph.clear()
+
+    def close_list() -> None:
+        nonlocal list_type
+        if list_type:
+            html.append(f"</{list_type}>")
+            list_type = None
+
     for raw_line in markdown.splitlines():
         line = raw_line.strip()
         if not line:
-            if in_list:
-                lines.append("</ul>")
-                in_list = False
+            flush_paragraph()
+            close_list()
             continue
-        if line.startswith("# "):
-            if in_list:
-                lines.append("</ul>")
-                in_list = False
-            lines.append(f"<h1>{escape(line[2:])}</h1>")
-        elif line.startswith("## "):
-            if in_list:
-                lines.append("</ul>")
-                in_list = False
-            lines.append(f"<h2>{escape(line[3:])}</h2>")
-        elif line.startswith("### "):
-            if in_list:
-                lines.append("</ul>")
-                in_list = False
-            lines.append(f"<h3>{escape(line[4:])}</h3>")
-        elif line.startswith("- "):
-            if not in_list:
-                lines.append("<ul>")
-                in_list = True
-            lines.append(f"<li>{escape(line[2:])}</li>")
-        else:
-            if in_list:
-                lines.append("</ul>")
-                in_list = False
-            lines.append(f"<p>{escape(line)}</p>")
-    if in_list:
-        lines.append("</ul>")
-    return "\n".join(lines)
+
+        heading = re.match(r"^(#{1,5})\s+(.+)$", line)
+        if heading:
+            flush_paragraph()
+            close_list()
+            level = len(heading.group(1))
+            html.append(f"<h{level}>{_render_inline(heading.group(2))}</h{level}>")
+            continue
+
+        unordered = re.match(r"^[-*]\s+(.+)$", line)
+        if unordered:
+            flush_paragraph()
+            if list_type != "ul":
+                close_list()
+                html.append("<ul>")
+                list_type = "ul"
+            html.append(f"<li>{_render_inline(unordered.group(1))}</li>")
+            continue
+
+        ordered = re.match(r"^\d+[.)]\s+(.+)$", line)
+        if ordered:
+            flush_paragraph()
+            if list_type != "ol":
+                close_list()
+                html.append("<ol>")
+                list_type = "ol"
+            html.append(f"<li>{_render_inline(ordered.group(1))}</li>")
+            continue
+
+        close_list()
+        paragraph.append(line)
+
+    flush_paragraph()
+    close_list()
+    return "\n".join(html)
+
+
+def _render_inline(text: str) -> str:
+    escaped = escape(text)
+    return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
 
 
 def main() -> None:
