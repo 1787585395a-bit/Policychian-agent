@@ -8,6 +8,13 @@ PolicyChain is an Agentic RAG project for policy research. The first-stage codeb
 python -m pip install -r requirements.txt
 ```
 
+LangChain is optional. The built-in lightweight ReAct retrieval works without it. To install the optional LangChain wrappers, first make sure pip can access an index, then install:
+
+```powershell
+$env:PIP_NO_INDEX="0"
+python -m pip install -r requirements-langchain.txt
+```
+
 ## Tests
 
 ```powershell
@@ -160,13 +167,12 @@ Reserved MCP servers and tools:
 
 - Open-WebSearch `web-search`: `search`, `fetchWebContent`
 - CNFinancial `cn-financial`: selected industry, macro, company, financial, announcement, and news tools
-- CNINFO `cninfo`: `query_annual_reports_tool`, `download_annual_reports_tool`
 
 Agent responsibilities:
 
 - Policy Analyst keeps local `search_policy`, `get_policy_metadata`, and `read_policy_content` as primary evidence, with Web Search only as supplemental policy evidence.
 - Impact Analyst can receive CNFinancial industry/macro/news evidence plus Web Search industry evidence, and must express `policy measure -> implementation action -> chain segment -> business variables -> affected company types`.
-- Company Matcher can use CNFinancial for candidate screening and CNINFO for recent annual report evidence. If recent annual reports do not contain sufficient business evidence, the match must be downgraded and record that evidence was not found.
+- Company Matcher uses CNFinancial for A-share candidate screening and public company evidence, with Web Search only as supplemental official-announcement/company-site evidence.
 
 Prepare local stdio MCP servers and generate `.mcp.local.json`:
 
@@ -174,7 +180,7 @@ Prepare local stdio MCP servers and generate `.mcp.local.json`:
 python scripts/setup_mcp_servers.py
 ```
 
-The setup script clones or updates CNFinancial under `external/mcp/`, installs its runtime dependencies, installs the CNINFO npm package under `external/mcp/cninfo-node` without postinstall side effects, and preinstalls CNINFO Python dependencies into `external/mcp/cninfo-venv`. The generated local config launches CNINFO's Python MCP server directly; `.mcp.example.json` keeps the official npx template. Use `--skip-cninfo-install` only when that venv is already prepared.
+The setup script clones or updates CNFinancial under `external/mcp/`, installs its runtime dependencies, and generates a local config for Open-WebSearch and CNFinancial.
 
 Check the local MCP config without making live network calls:
 
@@ -182,16 +188,10 @@ Check the local MCP config without making live network calls:
 python scripts/mcp_doctor.py --mcp-config .mcp.local.json
 ```
 
-Smoke-check the configured MCP servers without downloading annual reports:
+Smoke-check the configured MCP servers:
 
 ```powershell
 python scripts/mcp_smoke.py --mcp-config .mcp.local.json
-```
-
-Optionally download a CNINFO annual report during smoke:
-
-```powershell
-python scripts/mcp_smoke.py --mcp-config .mcp.local.json --download-cninfo --stock-code 000888
 ```
 
 Run the deterministic workflow with real MCP tools:
@@ -208,7 +208,7 @@ Run the DeepSeek-backed workflow with real MCP tools:
 python scripts/run_research.py --full-db --llm --mcp --query "生成式人工智能服务提供者有哪些管理要求" --out artifacts/test-results/mcp_live_deepseek_report.md
 ```
 
-Local MCP files and downloaded annual reports are ignored by git: `.mcp.local.json`, `external/mcp/`, and `artifacts/cninfo/reports/`.
+Local MCP files and generated artifacts are ignored by git: `.mcp.local.json`, `external/mcp/`, and `artifacts/`.
 
 Run the local web app:
 

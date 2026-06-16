@@ -128,9 +128,7 @@ class CompanyEvidence:
     source_url: str | None
     text: str
     data_date: str
-    report_year: int | None = None
     revenue_or_ratio: str = ""
-    evidence_found: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -142,10 +140,11 @@ class CompanyMatch:
     industry_segment: str
     matched_business: str
     match_level: str
+    impact_id: str = ""
+    impact_industry: str = ""
     stock_code: str = ""
     chain_segment: str = ""
     related_product_or_business: str = ""
-    annual_report_evidence: list[CompanyEvidence] = field(default_factory=list)
     revenue_or_ratio: str = ""
     source_url: str | None = None
     match_conditions: list[str] = field(default_factory=list)
@@ -157,6 +156,8 @@ class CompanyMatch:
     risks: list[str] = field(default_factory=list)
     data_date: str = ""
     confidence: float = 0.0
+    audit_status: str = "passed"
+    audit_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -164,10 +165,11 @@ class CompanyMatch:
             "industry_segment": self.industry_segment,
             "matched_business": self.matched_business,
             "match_level": self.match_level,
+            "impact_id": self.impact_id,
+            "impact_industry": self.impact_industry,
             "stock_code": self.stock_code,
             "chain_segment": self.chain_segment,
             "related_product_or_business": self.related_product_or_business,
-            "annual_report_evidence": [item.to_dict() for item in self.annual_report_evidence],
             "revenue_or_ratio": self.revenue_or_ratio,
             "source_url": self.source_url,
             "match_conditions": list(self.match_conditions),
@@ -179,6 +181,8 @@ class CompanyMatch:
             "risks": list(self.risks),
             "data_date": self.data_date,
             "confidence": self.confidence,
+            "audit_status": self.audit_status,
+            "audit_reason": self.audit_reason,
         }
 
 

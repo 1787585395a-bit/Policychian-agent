@@ -11,12 +11,6 @@
         "SEARCH_MODE": "request"
       }
     },
-    "cninfo": {
-      "type": "stdio",
-      "command": "cmd",
-      "args": ["/c", "npx", "-y", "@youhaozhao/cninfo-mcp"],
-      "env": {}
-    },
     "cn-financial": {
       "type": "stdio",
       "command": "python",

@@ -27,7 +27,11 @@ class AppTests(unittest.TestCase):
         self.assertIn("运行模式：确定性流程", html)
         self.assertIn('data-loading-label="分析中"', html)
         self.assertIn('id="progress-bar"', html)
+        self.assertIn('aria-label="运行日志窗口"', html)
         self.assertIn('id="log-panel"', html)
+        self.assertIn('id="log-meta"', html)
+        self.assertIn('id="copy-log"', html)
+        self.assertIn('id="copy-log" type="button" disabled', html)
         self.assertIn("/api/research", html)
         self.assertIn("/api/research-status", html)
         for example_query in EXAMPLE_QUERIES:
@@ -76,7 +80,7 @@ class AppTests(unittest.TestCase):
         self.assertEqual(result["report"], "# PolicyChain 政策研究报告")
         self.assertTrue(fake_runner.call_args.kwargs["use_llm"])
 
-    def test_run_query_can_request_mcp_mode_without_annual_reports(self) -> None:
+    def test_run_query_can_request_mcp_mode(self) -> None:
         class FakeClosableInvoker:
             def __init__(self) -> None:
                 self.closed = False
@@ -94,7 +98,7 @@ class AppTests(unittest.TestCase):
         self.assertTrue(result["use_mcp"])
         self.assertTrue(fake_invoker.closed)
         self.assertIs(fake_runner.call_args.kwargs["mcp_invoker"], fake_invoker)
-        self.assertTrue(fake_runner.call_args.kwargs["skip_annual_reports"])
+        self.assertNotIn("skip_annual_reports", fake_runner.call_args.kwargs)
 
     def test_async_job_reports_done_status_and_progress_logs(self) -> None:
         def fake_run_query(query: str, **kwargs):
@@ -121,6 +125,7 @@ class AppTests(unittest.TestCase):
             view = _wait_for_job(job_id)
 
         self.assertEqual(view["status"], "done")
+        self.assertEqual(view["job_id"], job_id)
         self.assertEqual(view["progress"], 100)
         self.assertIn("<h1>PolicyChain 政策研究报告</h1>", view["report_html"])
         stages = {item["stage"] for item in view["logs"]}
@@ -139,8 +144,10 @@ class AppTests(unittest.TestCase):
             view = _wait_for_job(job_id, expected_status="error")
 
         self.assertEqual(view["status"], "error")
+        self.assertEqual(view["job_id"], job_id)
         self.assertIn("读取失败", view["error"])
         self.assertTrue(any(item["stage"] == "错误" for item in view["logs"]))
+        self.assertTrue(any("读取失败" in item["message"] for item in view["logs"]))
 
 
 def _wait_for_job(job_id: str, expected_status: str = "done") -> dict[str, object]:

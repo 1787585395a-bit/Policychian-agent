@@ -9,7 +9,7 @@ from policychain.prompts import render_prompt
 from policychain.schemas.agent_outputs import ImpactAnalysisOutput
 from policychain.state import PolicyResearchState
 from policychain.structured_output import parse_structured_output
-from policychain.tools import collect_impact_research
+from policychain.tools import collect_impact_research, run_impact_react_search
 from policychain.tools.mcp_tools import mcp_unavailable_uncertainty
 
 
@@ -37,6 +37,13 @@ def run_llm_impact_analyst(
         invoker=mcp_invoker,
     )
     state.industry_research = [*research["cnfinancial"], *research["web"]]
+    state.tool_call_logs.extend(research.get("tool_logs", []))
+    client = llm_client or create_llm_client()
+    if not is_unavailable_invoker(mcp_invoker):
+        react_query = _impact_react_query(state.policy_analysis, state.industry_impacts)
+        react_run = run_impact_react_search(react_query, invoker=mcp_invoker, llm_client=client)
+        state.react_traces.extend(_tag_react_traces("impact", react_run.traces))
+        state.industry_research = _merge_external_evidence(state.industry_research, react_run.evidence)
     state.external_evidence = _merge_external_evidence(state.external_evidence, state.industry_research)
     if is_unavailable_invoker(mcp_invoker):
         state.uncertainties = _unique(
@@ -52,10 +59,9 @@ def run_llm_impact_analyst(
         "impact_analyst",
         policy_analysis=_json_for_prompt(state.policy_analysis),
         policy_chunks=_json_for_prompt(state.policy_chunks),
-        industry_research=_json_for_prompt(research["cnfinancial"]),
-        web_evidence=_json_for_prompt(research["web"]),
+        industry_research=_json_for_prompt(_filter_external_evidence(state.industry_research, "cn-financial")),
+        web_evidence=_json_for_prompt(_filter_external_evidence(state.industry_research, "web-search")),
     )
-    client = llm_client or create_llm_client()
     raw_output = client.generate(prompt["system"], prompt["user"])
     output = parse_structured_output(raw_output, prompt["output_schema_name"])
     if not isinstance(output, ImpactAnalysisOutput):
@@ -122,6 +128,23 @@ def _merge_external_evidence(existing: list[dict[str, object]], new_items: list[
             seen.add(key)
             merged.append(item)
     return merged
+
+
+def _filter_external_evidence(items: list[dict[str, object]], server_name: str) -> list[dict[str, object]]:
+    return [item for item in items if str(item.get("server_name") or "") == server_name]
+
+
+def _impact_react_query(policy_analysis: dict[str, object], industry_impacts: list[dict[str, object]]) -> str:
+    parts: list[str] = []
+    for key in ("policy_measures", "target_entities", "policy_goals"):
+        parts.extend(str(value) for value in policy_analysis.get(key) or [])
+    for impact in industry_impacts:
+        parts.extend(str(impact.get(key) or "") for key in ("industry", "chain_segment", "transmission_logic"))
+    return " ".join(part for part in parts if part).strip()[:500] or "policy industry impact"
+
+
+def _tag_react_traces(stage: str, traces: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [{"stage": stage, **trace} for trace in traces]
 
 
 def _unique(values: Iterable[str]) -> list[str]:

@@ -8,9 +8,6 @@ from policychain.agents.company_matcher import match_companies_for_impacts
 from policychain.mcp import FakeMCPInvoker
 from policychain.tools.mcp_tools import (
     CNFINANCIAL_SERVER,
-    CNINFO_DOWNLOAD_ANNUAL_REPORTS_TOOL,
-    CNINFO_QUERY_ANNUAL_REPORTS_TOOL,
-    CNINFO_SERVER,
     OPEN_WEBSEARCH_SEARCH_TOOL,
     OPEN_WEBSEARCH_SERVER,
 )
@@ -50,8 +47,9 @@ class MCPAgentIntegrationTests(unittest.TestCase):
             state = PolicyResearchState(user_query="生成式人工智能")
             run_llm_policy_analyst(state, store, llm_client=client, mcp_invoker=invoker)
 
-            self.assertIn("官方解读", client.calls[0][1])
+            self.assertIn("官方解读", client.calls[-1][1])
             self.assertTrue(state.policy_web_evidence)
+            self.assertTrue(state.react_traces)
         finally:
             store.close()
 
@@ -72,25 +70,25 @@ class MCPAgentIntegrationTests(unittest.TestCase):
         finally:
             store.close()
 
-    def test_company_matcher_uses_cnfinancial_candidates_and_cninfo_evidence(self) -> None:
+    def test_company_matcher_uses_cnfinancial_candidates_without_annual_reports(self) -> None:
         invoker = _fake_company_invoker(content="公司主营业务包括模型安全评估服务，相关产品形成分部收入。")
         output = match_companies_for_impacts([_industry_impact()], mcp_invoker=invoker)
         company = output.to_dict()["companies"][0]
 
         self.assertEqual(company["company_name"], "示例科技")
         self.assertEqual(company["stock_code"], "300001")
-        self.assertTrue(company["annual_report_evidence"])
-        self.assertTrue(company["annual_report_evidence"][0]["evidence_found"])
+        self.assertNotIn("annual_report_evidence", company)
+        self.assertTrue(company["business_evidence"])
         self.assertNotEqual(company["match_level"], "low")
 
-    def test_company_matcher_downgrades_when_recent_annual_reports_lack_business_evidence(self) -> None:
+    def test_company_matcher_does_not_downgrade_only_because_annual_reports_are_absent(self) -> None:
         invoker = _fake_company_invoker(content="本年度公司办公楼修缮完成。")
         output = match_companies_for_impacts([_industry_impact()], mcp_invoker=invoker)
         company = output.to_dict()["companies"][0]
 
-        self.assertEqual(company["match_level"], "low")
-        self.assertIn("未在最近两期年报中找到充分证据", company["negative_evidence"])
-        self.assertLessEqual(company["confidence"], 0.45)
+        self.assertNotIn("annual_report_evidence", company)
+        self.assertNotIn("未在最近两期年报中找到充分证据", str(company))
+        self.assertGreater(company["confidence"], 0.45)
 
 
 def _fake_policy_web_invoker() -> FakeMCPInvoker:
@@ -123,10 +121,17 @@ def _fake_industry_invoker() -> FakeMCPInvoker:
             ],
             (CNFINANCIAL_SERVER, "get_industry_list"): [
                 {
+                    "名称": "软件开发",
+                    "source": "CNFinancial",
+                },
+                {
                     "title": "软件服务行业",
                     "source": "CNFinancial",
                     "description": "行业板块列表",
                 }
+            ],
+            (CNFINANCIAL_SERVER, "get_concept_list"): [
+                {"名称": "人工智能", "source": "CNFinancial"}
             ],
             (CNFINANCIAL_SERVER, "search_news"): [
                 {
@@ -142,6 +147,20 @@ def _fake_industry_invoker() -> FakeMCPInvoker:
 def _fake_company_invoker(content: str) -> FakeMCPInvoker:
     return FakeMCPInvoker(
         {
+            (CNFINANCIAL_SERVER, "get_industry_list"): [
+                {"名称": "软件开发"},
+            ],
+            (CNFINANCIAL_SERVER, "get_concept_list"): [
+                {"名称": "人工智能"},
+            ],
+            (CNFINANCIAL_SERVER, "get_industry_stocks"): [
+                {
+                    "company_name": "示例科技",
+                    "stock_code": "300001",
+                    "main_business": "模型安全评估服务",
+                    "description": "提供模型安全评估和合规审计",
+                }
+            ],
             (CNFINANCIAL_SERVER, "search_stock"): [
                 {
                     "company_name": "示例科技",
@@ -157,12 +176,6 @@ def _fake_company_invoker(content: str) -> FakeMCPInvoker:
                     "source": "CNFinancial",
                 }
             ],
-            (CNINFO_SERVER, CNINFO_QUERY_ANNUAL_REPORTS_TOOL): [
-                {"year": 2025, "title": "2025 年年度报告", "url": "https://example.test/2025.pdf"},
-                {"year": 2024, "title": "2024 年年度报告", "url": "https://example.test/2024.pdf"},
-                {"year": 2023, "title": "2023 年年度报告", "url": "https://example.test/2023.pdf"},
-            ],
-            (CNINFO_SERVER, CNINFO_DOWNLOAD_ANNUAL_REPORTS_TOOL): [{"content": content}],
         }
     )
 
@@ -174,7 +187,7 @@ def _industry_impact() -> dict[str, object]:
         "transmission_logic": "政策要求服务提供者开展安全评估，影响模型安全评估服务需求。",
         "business_variables": ["安全评估需求", "合规成本"],
         "affected_company_types": ["模型评测机构"],
-        "conditions": ["需年报验证主营业务"],
+        "conditions": ["需公告和官网验证主营业务"],
         "risks": [],
     }
 

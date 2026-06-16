@@ -73,6 +73,21 @@ class StructuredOutputTests(unittest.TestCase):
         self.assertEqual(data["companies"][0]["company_name"], "示例公司")
         self.assertEqual(data["companies"][0]["confidence"], 0.82)
 
+    def test_company_uncertainties_accept_object_items_from_llm(self) -> None:
+        payload = _company_payload()
+        payload["uncertainties"] = [
+            {
+                "reason": "CNFinancial 未返回分部收入",
+                "evidence": ["仅有主营业务描述", "缺少收入占比"],
+            }
+        ]
+
+        output = validate_structured_payload(payload, "CompanyMatchOutput")
+
+        self.assertEqual(len(output.uncertainties), 1)
+        self.assertIn("CNFinancial 未返回分部收入", output.uncertainties[0])
+        self.assertIn("缺少收入占比", output.uncertainties[0])
+
     def test_company_evidence_empty_data_date_becomes_unknown(self) -> None:
         payload = _company_payload()
         payload["companies"][0]["business_evidence"][0]["data_date"] = ""
@@ -182,7 +197,7 @@ def _company_payload() -> dict[str, object]:
                 ],
                 "policy_link": "政策要求提升内容安全和模型治理能力",
                 "revenue_relevance": "unknown",
-                "conditions": ["需核验真实公告和年报"],
+                "conditions": ["需核验真实公告和官网"],
                 "risks": ["本地 mock 数据不可代表真实公司资料"],
                 "data_date": "2026-01-01",
                 "confidence": 0.82,

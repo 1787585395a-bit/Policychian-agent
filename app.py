@@ -57,7 +57,6 @@ def run_query(
             rebuild_sample_db=False,
             use_llm=use_llm,
             mcp_invoker=mcp_invoker,
-            skip_annual_reports=True,
             progress_callback=progress_callback,
         )
     finally:
@@ -298,17 +297,59 @@ def render_page(
     }}
     .log-panel {{
       margin-top: 12px;
-      max-height: 168px;
+      height: 220px;
       overflow: auto;
       border: 1px solid var(--line);
       border-radius: 8px;
       background: #fff;
       padding: 10px 12px;
       color: #2b2b2b;
-      font-size: 13px;
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 12px;
       line-height: 1.55;
     }}
-    .log-item {{ padding: 3px 0; border-bottom: 1px solid #f1f1f1; }}
+    .log-window-head {{
+      margin-top: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }}
+    .log-title {{
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      min-width: 0;
+    }}
+    .log-title strong {{
+      font-size: 14px;
+      font-weight: 650;
+      color: var(--ink);
+    }}
+    .log-meta {{
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }}
+    .copy-log {{
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--ink);
+      min-height: 34px;
+      padding: 0 12px;
+      font-size: 13px;
+      cursor: pointer;
+    }}
+    .copy-log:disabled {{
+      color: var(--muted);
+      border-color: var(--line);
+      background: var(--soft);
+      cursor: not-allowed;
+    }}
+    .log-item {{ padding: 4px 0; border-bottom: 1px solid #f1f1f1; white-space: pre-wrap; }}
     .log-item:last-child {{ border-bottom: 0; }}
     .result-wrap {{ margin-top: 32px; }}
     .error {{
@@ -353,6 +394,9 @@ def render_page(
       .composer-footer {{ flex-direction: column; align-items: stretch; }}
       .mode-controls {{ gap: 10px; }}
       .run-button {{ width: 100%; min-width: 0; }}
+      .log-window-head {{ align-items: stretch; flex-direction: column; }}
+      .log-meta {{ white-space: normal; }}
+      .copy-log {{ width: 100%; }}
       .report h1 {{ font-size: 24px; }}
     }}
   </style>
@@ -392,14 +436,23 @@ def render_page(
         {examples}
       </div>
       <div class="status-line" id="status-line" role="status" aria-live="polite">{_elapsed_text(elapsed_seconds, use_llm, use_mcp)}</div>
-      <div class="notice">研究辅助，不构成投资建议。启用 MCP 时会调用 Open-WebSearch 和 CNFinancial；CNINFO 年报下载默认跳过。</div>
+      <div class="notice">研究辅助，不构成投资建议。启用 MCP 时会调用 Open-WebSearch 和 CNFinancial；公司匹配依据为公开业务资料。</div>
       <div class="progress-panel" aria-label="运行进度">
         <div class="progress-head">
           <span id="stage-label">等待开始</span>
           <span id="progress-label">0%</span>
         </div>
         <div class="progress-track"><div class="progress-bar" id="progress-bar"></div></div>
-        <div class="log-panel" id="log-panel"><div class="log-item">等待提交政策链接或正文。</div></div>
+        <div class="log-window" aria-label="运行日志窗口">
+          <div class="log-window-head">
+            <div class="log-title">
+              <strong>运行日志</strong>
+              <span class="log-meta" id="log-meta">Job: - · 0 条</span>
+            </div>
+            <button class="copy-log" id="copy-log" type="button" disabled>复制日志</button>
+          </div>
+          <div class="log-panel" id="log-panel"><div class="log-item">等待提交政策链接或正文。</div></div>
+        </div>
       </div>
     </section>
     <section class="result-wrap" aria-label="分析结果">
@@ -418,9 +471,12 @@ def render_page(
     const progressLabel = document.getElementById("progress-label");
     const progressBar = document.getElementById("progress-bar");
     const logPanel = document.getElementById("log-panel");
+    const logMeta = document.getElementById("log-meta");
+    const copyLogButton = document.getElementById("copy-log");
     const report = document.getElementById("report");
     const errorBox = document.getElementById("error-box");
     let pollTimer = null;
+    let lastStatusPayload = {{status: "idle", progress: 0, stage: "等待开始", job_id: "", logs: []}};
 
     document.querySelectorAll(".quick").forEach((button) => {{
       button.addEventListener("click", () => {{
@@ -437,6 +493,9 @@ def render_page(
       report.innerHTML = '<div class="empty">正在分析，请等待结果。</div>';
       errorBox.classList.add("hidden");
       errorBox.textContent = "";
+      lastStatusPayload = {{status: "pending", progress: 0, stage: "排队中", job_id: "", logs: []}};
+      copyLogButton.disabled = true;
+      copyLogButton.textContent = "复制日志";
       renderStatus({{status: "pending", progress: 0, stage: "排队中", logs: [{{message: "任务已提交。"}}]}});
       try {{
         const response = await fetch("/api/research", {{
@@ -485,16 +544,81 @@ def render_page(
     }}
 
     function renderStatus(payload) {{
+      lastStatusPayload = payload || lastStatusPayload;
       const progress = Math.max(0, Math.min(100, Number(payload.progress || 0)));
       stageLabel.textContent = payload.stage || "运行中";
       progressLabel.textContent = `${{progress}}%`;
       progressBar.style.width = `${{progress}}%`;
       statusLine.textContent = `当前阶段：${{payload.stage || "运行中"}}`;
       const logs = payload.logs || [];
+      const jobId = payload.job_id || "-";
+      logMeta.textContent = `Job: ${{jobId}} · ${{logs.length}} 条`;
       logPanel.innerHTML = logs.length
-        ? logs.map((item) => `<div class="log-item">${{escapeHtml(item.stage || "")}} ${{escapeHtml(item.message || "")}}</div>`).join("")
+        ? logs.map((item) => `<div class="log-item">${{escapeHtml(formatLogLine(item))}}</div>`).join("")
         : '<div class="log-item">暂无日志。</div>';
       logPanel.scrollTop = logPanel.scrollHeight;
+      copyLogButton.disabled = !(payload.status === "done" || payload.status === "error");
+      if (copyLogButton.disabled) copyLogButton.textContent = "复制日志";
+    }}
+
+    copyLogButton.addEventListener("click", async () => {{
+      const text = formatLogsForCopy(lastStatusPayload);
+      try {{
+        if (navigator.clipboard && window.isSecureContext) {{
+          await navigator.clipboard.writeText(text);
+        }} else {{
+          fallbackCopyText(text);
+        }}
+        copyLogButton.textContent = "已复制";
+        setTimeout(() => {{ copyLogButton.textContent = "复制日志"; }}, 1400);
+      }} catch (error) {{
+        fallbackCopyText(text);
+        copyLogButton.textContent = "已复制";
+        setTimeout(() => {{ copyLogButton.textContent = "复制日志"; }}, 1400);
+      }}
+    }});
+
+    function formatLogLine(item) {{
+      const time = formatLogTime(item.time || "");
+      const progress = Number.isFinite(Number(item.progress)) ? `${{Number(item.progress)}}%` : "-";
+      const stage = item.stage || "";
+      const message = item.message || "";
+      return `[${{time}}] [${{progress}}] ${{stage}} - ${{message}}`;
+    }}
+
+    function formatLogsForCopy(payload) {{
+      const logs = payload.logs || [];
+      const lines = [
+        `PolicyChain Job: ${{payload.job_id || "-"}}`,
+        `Status: ${{payload.status || "-"}}`,
+        `Final stage: ${{payload.stage || "-"}}`,
+        ""
+      ];
+      logs.forEach((item) => lines.push(formatLogLine(item)));
+      if (payload.error) {{
+        lines.push("");
+        lines.push(`Error: ${{payload.error}}`);
+      }}
+      return lines.join("\\n");
+    }}
+
+    function formatLogTime(value) {{
+      if (!value) return "-";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return value;
+      return date.toLocaleTimeString("zh-CN", {{hour12: false}});
+    }}
+
+    function fallbackCopyText(text) {{
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.setAttribute("readonly", "");
+      textarea.style.position = "fixed";
+      textarea.style.left = "-9999px";
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand("copy");
+      document.body.removeChild(textarea);
     }}
 
     function showError(message) {{

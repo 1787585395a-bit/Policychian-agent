@@ -4,17 +4,13 @@ import unittest
 
 from policychain.mcp import FakeMCPInvoker
 from policychain.tools.mcp_tools import (
-    CNINFO_DOWNLOAD_ANNUAL_REPORTS_TOOL,
-    CNINFO_QUERY_ANNUAL_REPORTS_TOOL,
     CNFINANCIAL_SERVER,
     OPEN_WEBSEARCH_SEARCH_TOOL,
-    CNINFO_SERVER,
     OPEN_WEBSEARCH_SERVER,
     collect_company_candidates,
     collect_impact_research,
     fetch_web_content,
     search_web,
-    select_recent_annual_reports,
 )
 
 
@@ -46,51 +42,36 @@ class MCPToolsTests(unittest.TestCase):
         self.assertEqual(search_web("生成式人工智能", top_k=1), [])
         self.assertEqual(fetch_web_content("https://example.test/policy"), [])
 
-    def test_select_recent_annual_reports_uses_disclosed_report_years(self) -> None:
-        selected = select_recent_annual_reports(
-            {
-                "reports": [
-                    {"title": "2022 年年度报告"},
-                    {"title": "2025 年年度报告"},
-                    {"title": "2024 年年度报告"},
-                ]
-            }
-        )
-
-        self.assertEqual([item["title"] for item in selected], ["2025 年年度报告", "2024 年年度报告"])
-
-    def test_select_recent_annual_reports_filters_cninfo_stock_code_and_summary(self) -> None:
-        selected = select_recent_annual_reports(
-            {
-                "reports": [
-                    {"announcementTitle": "2025年年度报告摘要", "secCode": "000888"},
-                    {"announcementTitle": "2025年年度报告", "secCode": "000888"},
-                    {"announcementTitle": "2024年年度报告", "secCode": "000888"},
-                    {"announcementTitle": "2025年年度报告", "secCode": "600540"},
-                ]
-            },
-            stock_code="000888",
-        )
-
-        self.assertEqual([item["announcementTitle"] for item in selected], ["2025年年度报告", "2024年年度报告"])
-
-    def test_fake_invoker_records_cninfo_calls(self) -> None:
+    def test_mcp_error_payload_returns_empty_and_records_error(self) -> None:
         invoker = FakeMCPInvoker(
             {
-                (CNINFO_SERVER, CNINFO_QUERY_ANNUAL_REPORTS_TOOL): [{"year": 2025}],
-                (CNINFO_SERVER, CNINFO_DOWNLOAD_ANNUAL_REPORTS_TOOL): [{"content": "主营业务包括模型安全评估服务"}],
+                (CNFINANCIAL_SERVER, "search_news"): {
+                    "result": {
+                        "error": True,
+                        "message": "CNFinancial proxy failed",
+                    }
+                }
             }
         )
 
-        invoker.invoke(CNINFO_SERVER, CNINFO_QUERY_ANNUAL_REPORTS_TOOL, {"stock_code": "300001"})
-        invoker.invoke(CNINFO_SERVER, CNINFO_DOWNLOAD_ANNUAL_REPORTS_TOOL, {"stock_code": "300001", "year": 2025})
+        research = collect_impact_research({}, [_ai_impact()], invoker=invoker, top_k=1)
 
-        self.assertEqual([call["tool_name"] for call in invoker.calls], [CNINFO_QUERY_ANNUAL_REPORTS_TOOL, CNINFO_DOWNLOAD_ANNUAL_REPORTS_TOOL])
-
+        self.assertTrue(any(item["tool_name"] == "select_sectors" for item in research["cnfinancial"]))
+        self.assertFalse(any(item["tool_name"] == "search_news" for item in research["cnfinancial"]))
+        self.assertTrue(any(log["status"] == "error" for log in research["tool_logs"]))
+        self.assertTrue(any("CNFinancial proxy failed" in log["error"] for log in research["tool_logs"]))
+        self.assertTrue(any("CNFinancial proxy failed" in error for error in getattr(invoker, "errors", [])))
 
     def test_collect_impact_research_uses_cnfinancial_official_arguments(self) -> None:
         invoker = FakeMCPInvoker(
             {
+                (CNFINANCIAL_SERVER, "get_industry_list"): [
+                    {"\u540d\u79f0": "\u8f6f\u4ef6\u5f00\u53d1"},
+                    {"\u540d\u79f0": "\u7164\u70ad\u884c\u4e1a"},
+                ],
+                (CNFINANCIAL_SERVER, "get_concept_list"): [
+                    {"\u540d\u79f0": "\u4eba\u5de5\u667a\u80fd"},
+                ],
                 (CNFINANCIAL_SERVER, "get_industry_stocks"): [
                     {
                         "\u540d\u79f0": "\u793a\u4f8b\u79d1\u6280",
@@ -106,7 +87,7 @@ class MCPToolsTests(unittest.TestCase):
             }
         )
 
-        collect_impact_research({}, [_ai_impact()], invoker=invoker, top_k=1)
+        research = collect_impact_research({}, [_ai_impact()], invoker=invoker, top_k=1)
 
         industry_call = next(call for call in invoker.calls if call["tool_name"] == "get_industry_stocks")
         news_call = next(call for call in invoker.calls if call["tool_name"] == "search_news")
@@ -118,11 +99,21 @@ class MCPToolsTests(unittest.TestCase):
             {"\u8f6f\u4ef6\u5f00\u53d1", "\u4e92\u8054\u7f51\u670d\u52a1", "\u8ba1\u7b97\u673a\u8bbe\u5907"},
         )
         self.assertEqual(set(news_call["arguments"]), {"keyword", "num_results"})
-        self.assertEqual(fund_flow_call["arguments"], {})
+        self.assertEqual(set(fund_flow_call["arguments"]), {"sector_type", "indicator"})
+        self.assertTrue(any(log["server_name"] == CNFINANCIAL_SERVER for log in research["tool_logs"]))
+        self.assertTrue(any(log["tool_name"] == "get_industry_stocks" and log["count"] == 1 for log in research["tool_logs"]))
+        self.assertTrue(any(log["tool_name"] == "select_sectors" and log["count"] >= 1 for log in research["tool_logs"]))
 
     def test_collect_company_candidates_prefers_industry_stocks_and_enriches_by_symbol(self) -> None:
         invoker = FakeMCPInvoker(
             {
+                (CNFINANCIAL_SERVER, "get_industry_list"): [
+                    {"\u540d\u79f0": "\u8f6f\u4ef6\u5f00\u53d1"},
+                    {"\u540d\u79f0": "\u7164\u70ad\u884c\u4e1a"},
+                ],
+                (CNFINANCIAL_SERVER, "get_concept_list"): [
+                    {"\u540d\u79f0": "\u4eba\u5de5\u667a\u80fd"},
+                ],
                 (CNFINANCIAL_SERVER, "get_industry_stocks"): [
                     {
                         "\u540d\u79f0": "\u793a\u4f8b\u79d1\u6280",
@@ -139,15 +130,46 @@ class MCPToolsTests(unittest.TestCase):
             }
         )
 
-        candidates = collect_company_candidates([_ai_impact()], invoker=invoker, top_k_per_industry=1)
+        tool_logs: list[dict[str, object]] = []
+        candidates = collect_company_candidates([_ai_impact()], invoker=invoker, top_k_per_industry=1, tool_logs=tool_logs)
 
         self.assertEqual(candidates[0]["company_name"], "\u793a\u4f8b\u79d1\u6280")
         self.assertEqual(candidates[0]["stock_code"], "300001")
         self.assertEqual(candidates[0]["revenue_relevance"], "28%")
+        self.assertEqual(candidates[0]["candidate_source_tool"], "get_industry_stocks")
+        self.assertEqual(candidates[0]["candidate_query"], "\u8f6f\u4ef6\u5f00\u53d1")
         industry_call = next(call for call in invoker.calls if call["tool_name"] == "get_industry_stocks")
         profile_call = next(call for call in invoker.calls if call["tool_name"] == "get_company_profile")
         self.assertEqual(set(industry_call["arguments"]), {"industry"})
         self.assertEqual(profile_call["arguments"], {"symbol": "300001"})
+        self.assertTrue(any(log["tool_name"] == "get_industry_stocks" and log["count"] == 1 for log in tool_logs))
+        self.assertTrue(any(log["tool_name"] == "get_company_profile" and log["count"] == 1 for log in tool_logs))
+
+    def test_collect_company_candidates_does_not_use_concept_as_industry_board(self) -> None:
+        invoker = FakeMCPInvoker(
+            {
+                (CNFINANCIAL_SERVER, "get_industry_list"): [
+                    {"\u540d\u79f0": "\u8f6f\u4ef6\u5f00\u53d1"},
+                ],
+                (CNFINANCIAL_SERVER, "get_concept_list"): [
+                    {"\u540d\u79f0": "ChatGPT\u6982\u5ff5"},
+                ],
+                (CNFINANCIAL_SERVER, "search_stock"): [
+                    {
+                        "\u540d\u79f0": "\u6982\u5ff5\u79d1\u6280",
+                        "\u4ee3\u7801": "300002",
+                    }
+                ],
+            }
+        )
+
+        tool_logs: list[dict[str, object]] = []
+        candidates = collect_company_candidates([_ai_impact()], invoker=invoker, top_k_per_industry=1, tool_logs=tool_logs)
+
+        industry_calls = [call for call in invoker.calls if call["tool_name"] == "get_industry_stocks"]
+        self.assertTrue(all(call["arguments"]["industry"] != "ChatGPT\u6982\u5ff5" for call in industry_calls))
+        self.assertTrue(any(call["tool_name"] == "search_stock" for call in invoker.calls))
+        self.assertTrue(candidates)
 
 
 def _ai_impact() -> dict[str, object]:
@@ -157,7 +179,7 @@ def _ai_impact() -> dict[str, object]:
         "transmission_logic": "\u751f\u6210\u5f0f\u4eba\u5de5\u667a\u80fd\u670d\u52a1\u9700\u8981\u7b97\u6cd5\u6a21\u578b\u5b89\u5168\u8bc4\u4f30\u548c\u5408\u89c4\u5907\u6848",
         "business_variables": ["\u5b89\u5168\u8bc4\u4f30\u9700\u6c42", "\u5408\u89c4\u6210\u672c"],
         "affected_company_types": ["\u6a21\u578b\u8bc4\u6d4b\u673a\u6784", "\u4eba\u5de5\u667a\u80fd\u8f6f\u4ef6\u670d\u52a1\u5546"],
-        "conditions": ["\u9700\u5e74\u62a5\u9a8c\u8bc1\u4e3b\u8425\u4e1a\u52a1"],
+        "conditions": ["\u9700\u516c\u544a\u548c\u5b98\u7f51\u9a8c\u8bc1\u4e3b\u8425\u4e1a\u52a1"],
         "risks": [],
     }
 

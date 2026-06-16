@@ -39,6 +39,7 @@ artifacts/cninfo/reports/
 # Test and generated artifacts
 artifacts/test-results/*
 !artifacts/test-results/.gitkeep
+不同版本输出/
 
 # Generated policy databases
 data/processed/*

@@ -4,6 +4,12 @@ from typing import Any
 
 
 PROHIBITED_INVESTMENT_TERMS = (
+    "涔板叆",
+    "鍗栧嚭",
+    "鐩爣浠?",
+    "鎺ㄨ崘鑲＄エ",
+    "纭畾鎬ф敹鐩?",
+    "纭畾鎬ф姇璧勫缓璁?",
     "买入",
     "卖出",
     "目标价",

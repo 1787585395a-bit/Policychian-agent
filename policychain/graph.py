@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime, timezone
+import re
 
 from policychain.agents import (
     run_company_matcher,
@@ -11,9 +12,9 @@ from policychain.agents import (
     run_llm_policy_analyst,
     run_policy_analyst,
 )
+from policychain.agents.report_writer import write_llm_research_report, write_research_report
 from policychain.llm import LLMClient, create_llm_client
 from policychain.mcp import MCPToolInvoker
-from policychain.agents.report_writer import write_research_report
 from policychain.state import PolicyResearchState
 from policychain.storage.sqlite_store import SQLitePolicyStore
 
@@ -25,7 +26,6 @@ def run_policy_research_workflow(
     user_query: str,
     store: SQLitePolicyStore,
     mcp_invoker: MCPToolInvoker | None = None,
-    use_annual_reports: bool = True,
     progress_callback: ProgressCallback | None = None,
 ) -> PolicyResearchState:
     state = PolicyResearchState(user_query=user_query)
@@ -34,7 +34,8 @@ def run_policy_research_workflow(
     _emit_progress(state, progress_callback, 30, "政策分析", "已完成政策身份、措施和力度分析")
     run_impact_analyst(state, mcp_invoker=mcp_invoker)
     _emit_progress(state, progress_callback, 55, "行业影响分析", "已完成实施路径和行业影响分析")
-    run_company_matcher(state, mcp_invoker=mcp_invoker, use_annual_reports=use_annual_reports)
+    run_company_matcher(state, mcp_invoker=mcp_invoker)
+    _emit_company_coverage_progress(state, progress_callback)
     _emit_progress(state, progress_callback, 75, "公司业务匹配", "已完成候选公司业务匹配")
     _emit_progress(state, progress_callback, 90, "生成报告", "正在整合报告")
     write_research_report(state)
@@ -47,7 +48,6 @@ def run_llm_policy_research_workflow(
     store: SQLitePolicyStore,
     llm_client: LLMClient | None = None,
     mcp_invoker: MCPToolInvoker | None = None,
-    use_annual_reports: bool = True,
     progress_callback: ProgressCallback | None = None,
 ) -> PolicyResearchState:
     """Run the optional LLM-backed workflow over retrieved evidence."""
@@ -55,27 +55,72 @@ def run_llm_policy_research_workflow(
     state = PolicyResearchState(user_query=user_query)
     client = llm_client or create_llm_client()
     _emit_progress(state, progress_callback, 5, "读取用户输入政策", "正在读取政策链接或正文")
-    run_llm_policy_analyst(
-        state,
-        store,
-        llm_client=client,
-        mcp_invoker=mcp_invoker,
-        progress_callback=progress_callback,
-    )
+
+    try:
+        run_llm_policy_analyst(
+            state,
+            store,
+            llm_client=client,
+            mcp_invoker=mcp_invoker,
+            progress_callback=progress_callback,
+        )
+    except Exception as exc:
+        _append_uncertainty(state, f"LLM Policy Analyst 失败，已回退到确定性政策分析：{_compact_error(exc)}")
+        _emit_progress(state, progress_callback, 24, "政策分析回退", "LLM 政策分析失败，正在使用确定性流程")
+        run_policy_analyst(state, store, mcp_invoker=mcp_invoker, progress_callback=progress_callback)
     _emit_progress(state, progress_callback, 30, "政策分析", "已完成 Policy Analyst 分析")
-    run_llm_impact_analyst(state, llm_client=client, mcp_invoker=mcp_invoker)
+
+    try:
+        run_llm_impact_analyst(state, llm_client=client, mcp_invoker=mcp_invoker)
+    except Exception as exc:
+        _append_uncertainty(state, f"LLM Impact Analyst 失败，已回退到确定性行业影响分析：{_compact_error(exc)}")
+        _emit_progress(state, progress_callback, 50, "行业影响分析回退", "LLM 行业影响分析失败，正在使用确定性流程")
+        run_impact_analyst(state, mcp_invoker=mcp_invoker)
     _emit_progress(state, progress_callback, 55, "行业影响分析", "已完成 Impact Analyst 分析")
-    run_llm_company_matcher(
-        state,
-        llm_client=client,
-        mcp_invoker=mcp_invoker,
-        use_annual_reports=use_annual_reports,
-    )
+
+    try:
+        run_llm_company_matcher(
+            state,
+            llm_client=client,
+            mcp_invoker=mcp_invoker,
+        )
+    except Exception as exc:
+        _append_uncertainty(state, f"LLM Company Matcher 失败，已回退到确定性公司业务匹配：{_compact_error(exc)}")
+        _emit_progress(state, progress_callback, 70, "公司业务匹配回退", "LLM 公司匹配失败，正在使用确定性流程")
+        run_company_matcher(state, mcp_invoker=mcp_invoker)
+    _emit_company_coverage_progress(state, progress_callback)
     _emit_progress(state, progress_callback, 75, "公司业务匹配", "已完成 Company Matcher 分析")
+
     _emit_progress(state, progress_callback, 90, "生成报告", "正在整合报告")
-    write_research_report(state)
+    if _can_use_llm_report(state):
+        write_llm_research_report(state, client)
+    else:
+        write_research_report(state)
     _emit_progress(state, progress_callback, 100, "完成", "报告已生成")
     return state
+
+
+def _can_use_llm_report(state: PolicyResearchState) -> bool:
+    return bool(state.policy_analysis) and state.policy_analysis.get("policy_identity", {}).get("status") != "no_policy_found"
+
+
+def _emit_company_coverage_progress(
+    state: PolicyResearchState,
+    callback: ProgressCallback | None,
+) -> None:
+    if not state.company_coverage:
+        return
+    path_count = len(state.company_coverage)
+    passed = sum(int(item.get("passed_count") or 0) for item in state.company_coverage)
+    rejected = sum(int(item.get("rejected_count") or 0) for item in state.company_coverage)
+    no_match = sum(1 for item in state.company_coverage if not item.get("passed_count"))
+    _emit_progress(
+        state,
+        callback,
+        72,
+        "公司匹配审查",
+        f"已审查 {path_count} 条行业路径，通过 {passed} 个公司匹配，剔除 {rejected} 个候选，{no_match} 条路径暂未形成可靠公司匹配",
+    )
 
 
 def _emit_progress(
@@ -94,3 +139,22 @@ def _emit_progress(
     state.progress_events.append(event)
     if callback:
         callback(progress, stage, message)
+
+
+def _append_uncertainty(state: PolicyResearchState, value: str) -> None:
+    state.uncertainties = _unique([*state.uncertainties, value])
+
+
+def _compact_error(exc: Exception) -> str:
+    return re.sub(r"\s+", " ", str(exc)).strip()[:300] or exc.__class__.__name__
+
+
+def _unique(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    output: list[str] = []
+    for value in values:
+        text = re.sub(r"\s+", " ", str(value)).strip()
+        if text and text not in seen:
+            seen.add(text)
+            output.append(text)
+    return output

@@ -128,6 +128,15 @@ class LLMTests(unittest.TestCase):
         with self.assertRaisesRegex(LLMProviderError, "HTTP 401"):
             client.generate("system", "user")
 
+    def test_deepseek_client_wraps_read_timeout(self) -> None:
+        def fake_http_post(request, timeout):
+            raise TimeoutError("The read operation timed out")
+
+        client = DeepSeekClient(api_key="test-key", timeout_seconds=12, http_post=fake_http_post)
+
+        with self.assertRaisesRegex(LLMProviderError, "timed out after 12"):
+            client.generate("system", "user")
+
     def test_deepseek_client_from_env_and_factory(self) -> None:
         with patch.dict(
             "os.environ",

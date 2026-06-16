@@ -6,7 +6,6 @@ from policychain.tools.company_tools import (
     search_company_information,
 )
 from policychain.tools.mcp_tools import (
-    collect_annual_report_evidence,
     collect_company_candidates,
     collect_company_web_evidence,
     collect_impact_research,
@@ -19,9 +18,20 @@ from policychain.tools.policy_tools import (
     read_policy_content,
     search_policy,
 )
+from policychain.tools.react_retrieval import (
+    ReActRun,
+    ReActTool,
+    build_langchain_tools,
+    run_company_react_search,
+    run_impact_react_search,
+    run_policy_react_search,
+    run_react_retrieval,
+)
 
 __all__ = [
-    "collect_annual_report_evidence",
+    "ReActRun",
+    "ReActTool",
+    "build_langchain_tools",
     "collect_company_candidates",
     "collect_company_web_evidence",
     "collect_impact_research",
@@ -31,6 +41,10 @@ __all__ = [
     "load_mock_companies",
     "read_company_source",
     "read_policy_content",
+    "run_company_react_search",
+    "run_impact_react_search",
+    "run_policy_react_search",
+    "run_react_retrieval",
     "search_company_information",
     "search_policy",
     "search_web",

@@ -74,6 +74,7 @@ def run_impact_analyst(
         invoker=mcp_invoker,
     )
     state.industry_research = [*research["cnfinancial"], *research["web"]]
+    state.tool_call_logs.extend(research.get("tool_logs", []))
     state.external_evidence = _merge_external_evidence(state.external_evidence, state.industry_research)
     if is_unavailable_invoker(mcp_invoker):
         state.uncertainties = _unique(

@@ -11,46 +11,50 @@ from policychain.agents import (
     run_policy_analyst,
 )
 from policychain.schemas.agent_outputs import CompanyMatchOutput
+from policychain.mcp import FakeMCPInvoker
+from policychain.tools.mcp_tools import CNFINANCIAL_SERVER
 from policychain.state import PolicyResearchState
 from policychain.structured_output import StructuredOutputError
 from tests.helpers import build_sample_store
 
 
 class RecordingLLMClient:
-    def __init__(self, response: str) -> None:
-        self.response = response
+    def __init__(self, response: str | list[str]) -> None:
+        self.responses = list(response) if isinstance(response, list) else [response]
         self.calls: list[tuple[str, str]] = []
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
         self.calls.append((system_prompt, user_prompt))
-        return self.response
+        if len(self.responses) > 1:
+            return self.responses.pop(0)
+        return self.responses[0]
 
 
 class LLMCompanyMatcherTests(unittest.TestCase):
     def test_run_llm_company_matcher_writes_state_from_valid_json(self) -> None:
         store = build_sample_store()
-        client = RecordingLLMClient(json.dumps(_company_payload(), ensure_ascii=False))
+        client = _company_llm_client()
         try:
             state = _state_with_industry_impacts(store)
-            output = run_llm_company_matcher(state, llm_client=client)
+            output = run_llm_company_matcher(state, llm_client=client, mcp_invoker=_fake_company_invoker())
 
             self.assertIsInstance(output, CompanyMatchOutput)
             self.assertEqual(output.companies[0].company_name, "清源模型安全科技")
             self.assertGreaterEqual(len(state.company_candidates), 1)
             self.assertEqual(state.company_matches[0]["company_name"], "清源模型安全科技")
             self.assertTrue(state.uncertainties)
-            self.assertEqual(len(client.calls), 1)
+            self.assertEqual(len(client.calls), 2)
         finally:
             store.close()
 
     def test_run_llm_company_matcher_prompt_contains_impacts_and_company_candidates(self) -> None:
         store = build_sample_store()
-        client = RecordingLLMClient(json.dumps(_company_payload(), ensure_ascii=False))
+        client = _company_llm_client()
         try:
             state = _state_with_industry_impacts(store)
-            run_llm_company_matcher(state, llm_client=client)
+            run_llm_company_matcher(state, llm_client=client, mcp_invoker=_fake_company_invoker())
 
-            system_prompt, user_prompt = client.calls[0]
+            system_prompt, user_prompt = client.calls[-1]
             self.assertIn("Company Matcher", system_prompt)
             self.assertIn("业务相关性匹配", system_prompt)
             self.assertIn("生成式人工智能服务", user_prompt)
@@ -93,12 +97,12 @@ class LLMCompanyMatcherTests(unittest.TestCase):
 
     def test_run_llm_company_matcher_rejects_malformed_json(self) -> None:
         store = build_sample_store()
-        client = RecordingLLMClient("not json")
+        client = RecordingLLMClient([_react_finish(), "not json"])
         try:
             state = _state_with_industry_impacts(store)
 
             with self.assertRaises(StructuredOutputError):
-                run_llm_company_matcher(state, llm_client=client)
+                run_llm_company_matcher(state, llm_client=client, mcp_invoker=_fake_company_invoker())
         finally:
             store.close()
 
@@ -106,12 +110,12 @@ class LLMCompanyMatcherTests(unittest.TestCase):
         payload = _company_payload()
         payload["companies"][0]["company_name"] = "不存在的公司"
         store = build_sample_store()
-        client = RecordingLLMClient(json.dumps(payload, ensure_ascii=False))
+        client = RecordingLLMClient([_react_finish(), json.dumps(payload, ensure_ascii=False)])
         try:
             state = _state_with_industry_impacts(store)
 
             with self.assertRaisesRegex(LLMCompanyMatchError, "outside candidate records"):
-                run_llm_company_matcher(state, llm_client=client)
+                run_llm_company_matcher(state, llm_client=client, mcp_invoker=_fake_company_invoker())
         finally:
             store.close()
 
@@ -129,10 +133,11 @@ class LLMCompanyMatcherTests(unittest.TestCase):
                 evidence=list(deterministic_state.evidence),
                 uncertainties=list(deterministic_state.uncertainties),
             )
-            run_company_matcher(deterministic_state)
+            run_company_matcher(deterministic_state, mcp_invoker=_fake_company_invoker())
             run_llm_company_matcher(
                 llm_state,
-                llm_client=RecordingLLMClient(json.dumps(_company_payload(), ensure_ascii=False)),
+                llm_client=_company_llm_client(),
+                mcp_invoker=_fake_company_invoker(),
             )
 
             self.assertTrue(deterministic_state.company_matches)
@@ -147,6 +152,37 @@ def _state_with_industry_impacts(store) -> PolicyResearchState:
     run_policy_analyst(state, store)
     run_impact_analyst(state)
     return state
+
+
+def _react_finish() -> str:
+    return json.dumps({"thought": "enough evidence", "action": "finish", "arguments": {}}, ensure_ascii=False)
+
+
+def _company_llm_client() -> RecordingLLMClient:
+    return RecordingLLMClient([_react_finish(), json.dumps(_company_payload(), ensure_ascii=False)])
+
+
+def _fake_company_invoker() -> FakeMCPInvoker:
+    return FakeMCPInvoker(
+        {
+            (CNFINANCIAL_SERVER, "get_industry_list"): [{"名称": "软件开发"}],
+            (CNFINANCIAL_SERVER, "get_concept_list"): [{"名称": "人工智能"}],
+            (CNFINANCIAL_SERVER, "get_industry_stocks"): [
+                {
+                    "company_name": "清源模型安全科技",
+                    "stock_code": "300001",
+                    "main_business": "模型安全评估平台",
+                    "description": "提供模型安全评估和训练数据质量检测服务。",
+                }
+            ],
+            (CNFINANCIAL_SERVER, "get_company_profile"): [
+                {
+                    "main_business": "模型安全评估平台",
+                    "revenue_ratio": "28%",
+                }
+            ],
+        }
+    )
 
 
 def _company_payload() -> dict[str, object]:
@@ -167,7 +203,7 @@ def _company_payload() -> dict[str, object]:
                 ],
                 "policy_link": "政策要求模型、算法和训练数据环节承担安全治理责任。",
                 "revenue_relevance": "medium",
-                "conditions": ["需核验真实官网、年报和公告资料。"],
+                "conditions": ["需核验真实官网和公告资料。"],
                 "risks": ["本地 mock 数据不可代表真实公司资料。"],
                 "data_date": "2026-01-15",
                 "confidence": 0.86,

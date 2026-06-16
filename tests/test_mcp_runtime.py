@@ -15,6 +15,7 @@ from policychain.mcp import (
     diagnose_mcp_config,
     load_mcp_config,
     mcp_diagnostics_have_errors,
+    mcp_payload_error_message,
     _mcp_child_env,
     unwrap_mcp_result,
 )
@@ -36,7 +37,7 @@ class MCPRuntimeTests(unittest.TestCase):
 
         self.assertIn("web-search", config)
         self.assertIn("cn-financial", config)
-        self.assertIn("cninfo", config)
+        self.assertNotIn("cninfo", config)
         self.assertIn(str(Path.cwd()), config["cn-financial"].env["PYTHONPATH"])
 
     def test_stdio_invoker_missing_server_fails_clearly(self) -> None:
@@ -54,6 +55,14 @@ class MCPRuntimeTests(unittest.TestCase):
         result = DummyCallResult([DummyTextContent("plain response")])
 
         self.assertEqual(unwrap_mcp_result(result), {"content": "plain response"})
+
+    def test_unwrap_mcp_result_decodes_nested_json_result(self) -> None:
+        result = DummyCallResult([DummyTextContent('{"result": "{\\"error\\": true, \\"message\\": \\"proxy failed\\"}"}')])
+
+        payload = unwrap_mcp_result(result)
+
+        self.assertEqual(payload["message"], "proxy failed")
+        self.assertIn("proxy failed", mcp_payload_error_message(payload, "cn-financial", "search_stock") or "")
 
     def test_consume_mcp_invoker_errors_clears_errors(self) -> None:
         invoker = StdioMCPInvoker(servers={})
@@ -123,6 +132,8 @@ class MCPRuntimeTests(unittest.TestCase):
                 "HTTP_PROXY": "http://127.0.0.1:9",
                 "HTTPS_PROXY": "http://127.0.0.1:9",
                 "ALL_PROXY": "http://127.0.0.1:9",
+                "GIT_HTTP_PROXY": "http://127.0.0.1:9",
+                "GIT_HTTPS_PROXY": "http://127.0.0.1:9",
             },
             clear=True,
         ):
@@ -132,6 +143,10 @@ class MCPRuntimeTests(unittest.TestCase):
         self.assertNotIn("HTTP_PROXY", env)
         self.assertNotIn("HTTPS_PROXY", env)
         self.assertNotIn("ALL_PROXY", env)
+        self.assertNotIn("GIT_HTTP_PROXY", env)
+        self.assertNotIn("GIT_HTTPS_PROXY", env)
+        self.assertEqual(env["NO_PROXY"], "*")
+        self.assertEqual(env["no_proxy"], "*")
 
     def test_mcp_child_env_can_opt_into_system_proxy(self) -> None:
         with patch.dict(

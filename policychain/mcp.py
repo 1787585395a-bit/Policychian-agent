@@ -30,9 +30,13 @@ PROXY_ENV_KEYS = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "ALL_PROXY",
+    "GIT_HTTP_PROXY",
+    "GIT_HTTPS_PROXY",
     "http_proxy",
     "https_proxy",
     "all_proxy",
+    "git_http_proxy",
+    "git_https_proxy",
 )
 MCP_USE_SYSTEM_PROXY_ENV = "POLICYCHAIN_MCP_USE_SYSTEM_PROXY"
 
@@ -75,6 +79,7 @@ class FakeMCPInvoker:
 
     responses: dict[tuple[str, str], Any] = field(default_factory=dict)
     calls: list[dict[str, Any]] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
     def invoke(self, server_name: str, tool_name: str, arguments: dict[str, Any]) -> Any:
         self.calls.append(
@@ -91,6 +96,11 @@ class FakeMCPInvoker:
         if callable(response):
             return response(server_name=server_name, tool_name=tool_name, arguments=dict(arguments))
         return response
+
+    def consume_errors(self) -> list[str]:
+        errors = list(self.errors)
+        self.errors.clear()
+        return errors
 
 
 @dataclass
@@ -165,7 +175,7 @@ class StdioMCPInvoker:
         try:
             return asyncio.run(
                 asyncio.wait_for(
-                    self._invoke_async(self.servers[server_name], tool_name, arguments),
+                    self._invoke_async(server_name, self.servers[server_name], tool_name, arguments),
                     timeout=self.timeout_seconds,
                 )
             )
@@ -193,7 +203,7 @@ class StdioMCPInvoker:
         self.errors.clear()
         return errors
 
-    async def _invoke_async(self, server: MCPServerConfig, tool_name: str, arguments: dict[str, Any]) -> Any:
+    async def _invoke_async(self, server_name: str, server: MCPServerConfig, tool_name: str, arguments: dict[str, Any]) -> Any:
         try:
             from mcp import ClientSession, StdioServerParameters
             from mcp.client.stdio import stdio_client
@@ -217,7 +227,12 @@ class StdioMCPInvoker:
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
                 result = await session.call_tool(tool_name, arguments)
-        return unwrap_mcp_result(result)
+        payload = unwrap_mcp_result(result)
+        error_message = mcp_payload_error_message(payload, server_name=server_name, tool_name=tool_name)
+        if error_message:
+            self.errors.append(error_message)
+            raise MCPToolError(error_message)
+        return payload
 
 
 def load_mcp_config(
@@ -264,7 +279,7 @@ def unwrap_mcp_result(result: Any) -> Any:
     if result is None:
         return []
     if isinstance(result, (dict, list)):
-        return result
+        return _normalize_nested_payload(result)
     if isinstance(result, str):
         return _parse_text_payload(result)
 
@@ -272,7 +287,7 @@ def unwrap_mcp_result(result: Any) -> Any:
     if structured is None:
         structured = getattr(result, "structured_content", None)
     if structured is not None:
-        return structured
+        return _normalize_nested_payload(structured)
 
     content = getattr(result, "content", None)
     if content is not None:
@@ -282,10 +297,27 @@ def unwrap_mcp_result(result: Any) -> Any:
         return items
 
     if hasattr(result, "model_dump"):
-        return result.model_dump()
+        return _normalize_nested_payload(result.model_dump())
     if hasattr(result, "dict"):
-        return result.dict()
+        return _normalize_nested_payload(result.dict())
     return {"content": str(result)}
+
+
+def mcp_payload_error_message(payload: Any, server_name: str, tool_name: str) -> str | None:
+    """Return a clear error message when an MCP payload reports failure."""
+
+    prefix = f"{server_name}.{tool_name}".strip(".")
+    for item in _payload_error_items(payload):
+        if item.get("error") is True or str(item.get("status") or "").lower() == "error":
+            message = (
+                item.get("message")
+                or item.get("error_message")
+                or item.get("detail")
+                or item.get("content")
+                or "MCP tool returned an error payload"
+            )
+            return f"MCP tool returned error payload: {prefix}: {message}"
+    return None
 
 
 def consume_mcp_invoker_errors(invoker: MCPToolInvoker | None) -> list[str]:
@@ -309,6 +341,8 @@ def _mcp_child_env(server_env: dict[str, str]) -> dict[str, str]:
     if not _truthy_env(env.get(MCP_USE_SYSTEM_PROXY_ENV)):
         for key in PROXY_ENV_KEYS:
             env.pop(key, None)
+        env["NO_PROXY"] = "*"
+        env["no_proxy"] = "*"
     return env
 
 
@@ -371,8 +405,56 @@ def _parse_text_payload(text: str) -> Any:
     except json.JSONDecodeError:
         return {"content": stripped}
     if isinstance(parsed, (dict, list)):
-        return parsed
+        return _normalize_nested_payload(parsed)
     return {"content": parsed}
+
+
+def _normalize_nested_payload(payload: Any) -> Any:
+    if isinstance(payload, list):
+        return [_normalize_nested_payload(item) for item in payload]
+    if not isinstance(payload, dict):
+        return payload
+
+    normalized = {key: _normalize_nested_payload(value) for key, value in payload.items()}
+    for key in ("result", "content", "text"):
+        value = normalized.get(key)
+        if not isinstance(value, str):
+            continue
+        parsed = _try_parse_json_text(value)
+        if parsed is not None:
+            if len(normalized) == 1:
+                return parsed
+            normalized[key] = parsed
+    return normalized
+
+
+def _try_parse_json_text(text: str) -> Any | None:
+    stripped = text.strip()
+    if not stripped or stripped[0] not in "[{":
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    return _normalize_nested_payload(parsed)
+
+
+def _payload_error_items(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        items: list[dict[str, Any]] = [payload]
+        for key in ("results", "data", "items", "reports", "announcements", "stocks", "companies", "result"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                items.extend(_payload_error_items(value))
+            elif isinstance(value, list):
+                items.extend(_payload_error_items(value))
+        return items
+    if isinstance(payload, list):
+        items = []
+        for item in payload:
+            items.extend(_payload_error_items(item))
+        return items
+    return []
 
 
 def _truthy_env(value: str | None) -> bool:

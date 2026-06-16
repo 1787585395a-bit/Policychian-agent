@@ -2,17 +2,20 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from datetime import datetime, timezone
-from pathlib import Path
 import re
 from typing import Any
 
-from policychain.ingestion.loaders import read_policy_file
-from policychain.mcp import MCPToolError, MCPToolInvoker, MCPToolUnavailable, UnavailableMCPInvoker
+from policychain.mcp import (
+    MCPToolError,
+    MCPToolInvoker,
+    MCPToolUnavailable,
+    UnavailableMCPInvoker,
+    mcp_payload_error_message,
+)
 
 
 OPEN_WEBSEARCH_SERVER = "web-search"
 CNFINANCIAL_SERVER = "cn-financial"
-CNINFO_SERVER = "cninfo"
 
 OPEN_WEBSEARCH_SEARCH_TOOL = "search"
 OPEN_WEBSEARCH_FETCH_TOOL = "fetchWebContent"
@@ -41,9 +44,6 @@ CNFINANCIAL_COMPANY_TOOLS = (
     "get_company_announcements",
     "get_stock_news",
 )
-
-CNINFO_QUERY_ANNUAL_REPORTS_TOOL = "query_annual_reports_tool"
-CNINFO_DOWNLOAD_ANNUAL_REPORTS_TOOL = "download_annual_reports_tool"
 
 CNFINANCIAL_INDUSTRY_TOOLS_WITH_TERM = {"get_industry_stocks", "get_industry_pe"}
 CNFINANCIAL_LIST_TOOLS = {"get_industry_list", "get_concept_list", "get_sector_fund_flow"}
@@ -121,6 +121,20 @@ REVENUE_KEYS = (
     "\u8425\u6536\u5360\u6bd4",
     "\u4e3b\u8425\u5360\u6bd4",
 )
+SECTOR_NAME_KEYS = (
+    "name",
+    "title",
+    "industry",
+    "concept",
+    "sector",
+    "board_name",
+    "\u540d\u79f0",
+    "\u677f\u5757\u540d\u79f0",
+    "\u884c\u4e1a",
+    "\u884c\u4e1a\u540d\u79f0",
+    "\u6982\u5ff5",
+    "\u6982\u5ff5\u540d\u79f0",
+)
 
 POLICY_WEB_TOPICS = (
     "历史政策",
@@ -137,7 +151,7 @@ POLICY_SOURCE_PRIORITY = ("政府官网", "主管部门", "官方解读")
 INDUSTRY_SOURCE_PRIORITY = ("政府部门", "国家统计局", "行业协会", "权威机构")
 COMPANY_SOURCE_PRIORITY = ("交易所公告", "巨潮资讯", "公司官网")
 
-ANNUAL_REPORT_EVIDENCE_KEYWORDS = (
+COMPANY_BUSINESS_EVIDENCE_KEYWORDS = (
     "产品",
     "服务",
     "主营业务",
@@ -163,6 +177,7 @@ def search_web(
     source_priority: Iterable[str] | None = None,
     top_k: int = 5,
     invoker: MCPToolInvoker | None = None,
+    tool_logs: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     if top_k <= 0:
         raise ValueError("top_k must be positive")
@@ -174,6 +189,7 @@ def search_web(
         server_name=OPEN_WEBSEARCH_SERVER,
         tool_name=OPEN_WEBSEARCH_SEARCH_TOOL,
         arguments={"query": query, "limit": top_k},
+        tool_logs=tool_logs,
     )
     return normalize_mcp_evidence(
         raw,
@@ -188,6 +204,7 @@ def fetch_web_content(
     url: str,
     max_chars: int = 30000,
     invoker: MCPToolInvoker | None = None,
+    tool_logs: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     if not url.strip():
         return []
@@ -196,6 +213,7 @@ def fetch_web_content(
         server_name=OPEN_WEBSEARCH_SERVER,
         tool_name=OPEN_WEBSEARCH_FETCH_TOOL,
         arguments={"url": url, "maxChars": max_chars},
+        tool_logs=tool_logs,
     )
     return normalize_mcp_evidence(
         raw,
@@ -232,6 +250,7 @@ def collect_impact_research(
     industry_terms = _industry_terms(policy_analysis, industry_impacts)
     financial: list[dict[str, Any]] = []
     web: list[dict[str, Any]] = []
+    tool_logs: list[dict[str, Any]] = []
 
     for term in industry_terms:
         for tool_name in CNFINANCIAL_IMPACT_TOOLS:
@@ -241,6 +260,7 @@ def collect_impact_research(
                     server_name=CNFINANCIAL_SERVER,
                     tool_name=tool_name,
                     arguments=_cnfinancial_impact_arguments(tool_name, query_term),
+                    tool_logs=tool_logs,
                 )
                 financial.extend(
                     normalize_mcp_evidence(
@@ -256,12 +276,14 @@ def collect_impact_research(
                 source_priority=INDUSTRY_SOURCE_PRIORITY,
                 top_k=top_k,
                 invoker=invoker,
+                tool_logs=tool_logs,
             )
         )
 
     return {
         "cnfinancial": _dedupe_evidence(financial),
         "web": _dedupe_evidence(web),
+        "tool_logs": tool_logs,
     }
 
 
@@ -269,6 +291,7 @@ def collect_company_candidates(
     industry_impacts: list[dict[str, Any]],
     invoker: MCPToolInvoker | None = None,
     top_k_per_industry: int = 3,
+    tool_logs: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for impact in industry_impacts:
@@ -278,6 +301,7 @@ def collect_company_candidates(
                 server_name=CNFINANCIAL_SERVER,
                 tool_name="get_industry_stocks",
                 arguments={"industry": industry},
+                tool_logs=tool_logs,
             )
             for item in _payload_items(raw)[:top_k_per_industry]:
                 candidate = _normalize_company_candidate(item, impact, industry_segment=industry)
@@ -289,7 +313,7 @@ def collect_company_candidates(
                     server_name=CNFINANCIAL_SERVER,
                     tool_name="get_industry_stocks",
                 )
-                _enrich_company_candidate(candidate, invoker=invoker)
+                _enrich_company_candidate(candidate, invoker=invoker, tool_logs=tool_logs)
                 candidates.append(candidate)
 
         if len(_dedupe_companies(candidates)) >= top_k_per_industry:
@@ -301,6 +325,7 @@ def collect_company_candidates(
                 server_name=CNFINANCIAL_SERVER,
                 tool_name="search_stock",
                 arguments={"keyword": term},
+                tool_logs=tool_logs,
             )
             for item in _payload_items(raw)[:top_k_per_industry]:
                 candidate = _normalize_company_candidate(item, impact)
@@ -312,7 +337,211 @@ def collect_company_candidates(
                     server_name=CNFINANCIAL_SERVER,
                     tool_name="search_stock",
                 )
-                _enrich_company_candidate(candidate, invoker=invoker)
+                _enrich_company_candidate(candidate, invoker=invoker, tool_logs=tool_logs)
+                candidates.append(candidate)
+            if len(_dedupe_companies(candidates)) >= top_k_per_industry:
+                break
+    return _dedupe_companies(candidates)
+
+
+def collect_impact_research(
+    policy_analysis: dict[str, Any],
+    industry_impacts: list[dict[str, Any]],
+    invoker: MCPToolInvoker | None = None,
+    top_k: int = 3,
+) -> dict[str, Any]:
+    industry_terms = _industry_terms(policy_analysis, industry_impacts)
+    financial: list[dict[str, Any]] = []
+    web: list[dict[str, Any]] = []
+    tool_logs: list[dict[str, Any]] = []
+
+    industry_catalog, concept_catalog = _load_cnfinancial_sector_catalogs(invoker, tool_logs)
+    financial.extend(
+        normalize_mcp_evidence(
+            industry_catalog,
+            query="get_industry_list",
+            server_name=CNFINANCIAL_SERVER,
+            tool_name="get_industry_list",
+        )
+    )
+    financial.extend(
+        normalize_mcp_evidence(
+            concept_catalog,
+            query="get_concept_list",
+            server_name=CNFINANCIAL_SERVER,
+            tool_name="get_concept_list",
+        )
+    )
+
+    sector_selection = _select_cnfinancial_sectors(
+        terms=industry_terms,
+        industry_impacts=industry_impacts,
+        industry_catalog=industry_catalog,
+        concept_catalog=concept_catalog,
+    )
+    _append_sector_selection_log(tool_logs, sector_selection)
+    financial.append(_sector_selection_evidence(sector_selection))
+
+    for tool_name in CNFINANCIAL_MACRO_TOOLS:
+        raw = _invoke_or_empty(
+            invoker=invoker,
+            server_name=CNFINANCIAL_SERVER,
+            tool_name=tool_name,
+            arguments={},
+            tool_logs=tool_logs,
+        )
+        financial.extend(
+            normalize_mcp_evidence(
+                raw,
+                query=tool_name,
+                server_name=CNFINANCIAL_SERVER,
+                tool_name=tool_name,
+            )
+        )
+
+    for sector_type in ("\u884c\u4e1a\u8d44\u91d1\u6d41", "\u6982\u5ff5\u8d44\u91d1\u6d41"):
+        raw = _invoke_or_empty(
+            invoker=invoker,
+            server_name=CNFINANCIAL_SERVER,
+            tool_name="get_sector_fund_flow",
+            arguments={"sector_type": sector_type, "indicator": "\u4eca\u65e5"},
+            tool_logs=tool_logs,
+        )
+        financial.extend(
+            normalize_mcp_evidence(
+                raw,
+                query=sector_type,
+                server_name=CNFINANCIAL_SERVER,
+                tool_name="get_sector_fund_flow",
+            )
+        )
+
+    for industry in _selected_sector_names(sector_selection, "selected_industries"):
+        for tool_name in ("get_industry_stocks", "get_industry_pe"):
+            raw = _invoke_or_empty(
+                invoker=invoker,
+                server_name=CNFINANCIAL_SERVER,
+                tool_name=tool_name,
+                arguments={"industry": industry},
+                tool_logs=tool_logs,
+            )
+            financial.extend(
+                normalize_mcp_evidence(
+                    raw,
+                    query=industry,
+                    server_name=CNFINANCIAL_SERVER,
+                    tool_name=tool_name,
+                )
+            )
+
+    for term in _sector_search_terms(sector_selection, industry_terms):
+        raw = _invoke_or_empty(
+            invoker=invoker,
+            server_name=CNFINANCIAL_SERVER,
+            tool_name="search_news",
+            arguments={"keyword": term, "num_results": 5},
+            tool_logs=tool_logs,
+        )
+        financial.extend(
+            normalize_mcp_evidence(
+                raw,
+                query=term,
+                server_name=CNFINANCIAL_SERVER,
+                tool_name="search_news",
+            )
+        )
+
+    for term in industry_terms:
+        web.extend(
+            search_web(
+                query=f"{term} industry data statistics association production sales price inventory capacity technology route",
+                source_priority=INDUSTRY_SOURCE_PRIORITY,
+                top_k=top_k,
+                invoker=invoker,
+                tool_logs=tool_logs,
+            )
+        )
+
+    return {
+        "cnfinancial": _dedupe_evidence(financial),
+        "web": _dedupe_evidence(web),
+        "tool_logs": tool_logs,
+        "sector_selection": sector_selection,
+    }
+
+
+def collect_company_candidates(
+    industry_impacts: list[dict[str, Any]],
+    invoker: MCPToolInvoker | None = None,
+    top_k_per_industry: int = 3,
+    tool_logs: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    industry_terms = _industry_terms({}, industry_impacts)
+    industry_catalog, concept_catalog = _load_cnfinancial_sector_catalogs(invoker, tool_logs)
+    sector_selection = _select_cnfinancial_sectors(
+        terms=industry_terms,
+        industry_impacts=industry_impacts,
+        industry_catalog=industry_catalog,
+        concept_catalog=concept_catalog,
+    )
+    _append_sector_selection_log(tool_logs, sector_selection)
+    legal_industries = _selected_sector_names(sector_selection, "selected_industries")
+    selected_concepts = _selected_sector_names(sector_selection, "selected_concepts")
+    search_terms = _sector_search_terms(sector_selection, industry_terms)
+
+    for impact in industry_impacts:
+        for industry in legal_industries:
+            raw = _invoke_or_empty(
+                invoker=invoker,
+                server_name=CNFINANCIAL_SERVER,
+                tool_name="get_industry_stocks",
+                arguments={"industry": industry},
+                tool_logs=tool_logs,
+            )
+            for item in _payload_items(raw)[:top_k_per_industry]:
+                candidate = _normalize_company_candidate(item, impact, industry_segment=industry)
+                if not candidate.get("company_name"):
+                    continue
+                candidate["candidate_source_tool"] = "get_industry_stocks"
+                candidate["candidate_query"] = industry
+                candidate["selected_industries"] = legal_industries
+                candidate["selected_concepts"] = selected_concepts
+                candidate["mcp_evidence"] = normalize_mcp_evidence(
+                    item,
+                    query=industry,
+                    server_name=CNFINANCIAL_SERVER,
+                    tool_name="get_industry_stocks",
+                )
+                _enrich_company_candidate(candidate, invoker=invoker, tool_logs=tool_logs)
+                candidates.append(candidate)
+
+        if len(_dedupe_companies(candidates)) >= top_k_per_industry:
+            continue
+
+        for term in _unique([*search_terms, *_candidate_stock_search_terms(impact)]):
+            raw = _invoke_or_empty(
+                invoker=invoker,
+                server_name=CNFINANCIAL_SERVER,
+                tool_name="search_stock",
+                arguments={"keyword": term},
+                tool_logs=tool_logs,
+            )
+            for item in _payload_items(raw)[:top_k_per_industry]:
+                candidate = _normalize_company_candidate(item, impact)
+                if not candidate.get("company_name"):
+                    continue
+                candidate["candidate_source_tool"] = "search_stock"
+                candidate["candidate_query"] = term
+                candidate["selected_industries"] = legal_industries
+                candidate["selected_concepts"] = selected_concepts
+                candidate["mcp_evidence"] = normalize_mcp_evidence(
+                    item,
+                    query=term,
+                    server_name=CNFINANCIAL_SERVER,
+                    tool_name="search_stock",
+                )
+                _enrich_company_candidate(candidate, invoker=invoker, tool_logs=tool_logs)
                 candidates.append(candidate)
             if len(_dedupe_companies(candidates)) >= top_k_per_industry:
                 break
@@ -323,6 +552,7 @@ def collect_company_web_evidence(
     company_records: list[dict[str, Any]],
     invoker: MCPToolInvoker | None = None,
     top_k: int = 2,
+    tool_logs: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     evidence: list[dict[str, Any]] = []
     for company in company_records:
@@ -332,66 +562,14 @@ def collect_company_web_evidence(
             continue
         evidence.extend(
             search_web(
-                query=f"{name} {code} 公司官网 交易所公告 巨潮资讯 主营业务 年报",
+                query=f"{name} {code} 公司官网 交易所公告 巨潮资讯 主营业务 公告",
                 source_priority=COMPANY_SOURCE_PRIORITY,
                 top_k=top_k,
                 invoker=invoker,
+                tool_logs=tool_logs,
             )
         )
     return _dedupe_evidence(evidence)
-
-
-def collect_annual_report_evidence(
-    company_records: list[dict[str, Any]],
-    industry_impacts: list[dict[str, Any]],
-    invoker: MCPToolInvoker | None = None,
-    reports_dir: str | Path = "artifacts/cninfo/reports",
-) -> list[dict[str, Any]]:
-    evidence: list[dict[str, Any]] = []
-    for company in company_records:
-        stock_code = str(company.get("stock_code") or company.get("symbol") or "")
-        if not stock_code:
-            continue
-        raw_reports = _invoke_or_empty(
-            invoker=invoker,
-            server_name=CNINFO_SERVER,
-            tool_name=CNINFO_QUERY_ANNUAL_REPORTS_TOOL,
-            arguments={"stock_code": stock_code},
-        )
-        reports = select_recent_annual_reports(raw_reports, limit=2, stock_code=stock_code)
-        if not reports:
-            evidence.append(_missing_annual_report_evidence(company, None))
-            continue
-        for report in reports:
-            year = _report_year(report)
-            downloaded = _invoke_or_empty(
-                invoker=invoker,
-                server_name=CNINFO_SERVER,
-                tool_name=CNINFO_DOWNLOAD_ANNUAL_REPORTS_TOOL,
-                arguments={"stock_code": stock_code, "year": year},
-            )
-            evidence.append(
-                _annual_report_evidence(
-                    company=company,
-                    report=report,
-                    downloaded=downloaded,
-                    industry_impacts=industry_impacts,
-                    reports_dir=Path(reports_dir),
-                )
-            )
-    return evidence
-
-
-def select_recent_annual_reports(raw_reports: Any, limit: int = 2, stock_code: str | None = None) -> list[dict[str, Any]]:
-    reports = [
-        item
-        for item in _payload_items(raw_reports)
-        if _report_year(item) is not None
-        and _stock_code_matches(item, stock_code)
-        and _is_formal_annual_report(item)
-    ]
-    reports.sort(key=lambda item: (_report_year(item) or 0), reverse=True)
-    return reports[:limit]
 
 
 def normalize_mcp_evidence(
@@ -421,7 +599,7 @@ def normalize_mcp_evidence(
         )
         source_url = _first_value(item, ("url", "link", "source_url", "original_source_url", "pdf_url", "download_url", "adjunctUrl"))
         source_org = _first_value(item, ("source_org", "source", "agency", "publisher", "org", "engine", "secName"))
-        published_date = _first_value(item, ("publish_date", "published_date", "date", "report_year", "year", "announcement_time", "announcementTime"))
+        published_date = _first_value(item, ("publish_date", "published_date", "date", "year", "announcement_time", "announcementTime"))
         summary = _first_value(item, ("summary", "description", "snippet", "content", "text", "business_evidence", *BUSINESS_KEYS))
         if not any((title, source_url, source_org, published_date, summary)):
             continue
@@ -452,12 +630,58 @@ def _invoke_or_empty(
     server_name: str,
     tool_name: str,
     arguments: dict[str, Any],
+    tool_logs: list[dict[str, Any]] | None = None,
 ) -> Any:
     active_invoker = invoker or UnavailableMCPInvoker()
+    log_entry = _new_tool_log(server_name=server_name, tool_name=tool_name, arguments=arguments)
     try:
-        return active_invoker.invoke(server_name, tool_name, arguments)
-    except (MCPToolError, MCPToolUnavailable):
+        raw = active_invoker.invoke(server_name, tool_name, arguments)
+        error_message = mcp_payload_error_message(raw, server_name=server_name, tool_name=tool_name)
+        if error_message:
+            log_entry.update({"status": "error", "error": error_message, "count": 0})
+            _append_tool_log(tool_logs, log_entry)
+            _record_invoker_error(active_invoker, error_message)
+            return []
+        log_entry.update({"status": "ok", "count": _payload_count(raw), "error": ""})
+        _append_tool_log(tool_logs, log_entry)
+        return raw
+    except (MCPToolError, MCPToolUnavailable) as exc:
+        log_entry.update({"status": "error", "error": str(exc), "count": 0})
+        _append_tool_log(tool_logs, log_entry)
+        _record_invoker_error(active_invoker, str(exc))
         return []
+
+
+def _new_tool_log(server_name: str, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "time": datetime.now(timezone.utc).isoformat(),
+        "server_name": server_name,
+        "tool_name": tool_name,
+        "arguments": dict(arguments),
+        "status": "pending",
+        "count": 0,
+        "error": "",
+    }
+
+
+def _append_tool_log(tool_logs: list[dict[str, Any]] | None, log_entry: dict[str, Any]) -> None:
+    if tool_logs is not None:
+        tool_logs.append(log_entry)
+
+
+def _payload_count(payload: Any) -> int:
+    return len(_payload_items(payload))
+
+
+def _record_invoker_error(invoker: MCPToolInvoker, message: str) -> None:
+    errors = getattr(invoker, "errors", None)
+    if isinstance(errors, list) and message not in errors:
+        errors.append(message)
+        return
+    inner = getattr(invoker, "inner", None)
+    inner_errors = getattr(inner, "errors", None)
+    if isinstance(inner_errors, list) and message not in inner_errors:
+        inner_errors.append(message)
 
 
 def _payload_items(payload: Any) -> list[dict[str, Any]]:
@@ -466,10 +690,12 @@ def _payload_items(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, list):
         return [item for item in payload if isinstance(item, dict)]
     if isinstance(payload, dict):
-        for key in ("results", "data", "items", "reports", "announcements", "stocks", "companies"):
+        for key in ("results", "result", "data", "items", "reports", "announcements", "stocks", "companies"):
             value = payload.get(key)
             if isinstance(value, list):
                 return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                return [value]
         return [payload]
     return []
 
@@ -480,6 +706,166 @@ def _first_value(payload: dict[str, Any], keys: tuple[str, ...]) -> Any:
         if value not in (None, ""):
             return value
     return None
+
+
+def _load_cnfinancial_sector_catalogs(
+    invoker: MCPToolInvoker | None,
+    tool_logs: list[dict[str, Any]] | None = None,
+) -> tuple[Any, Any]:
+    industry_catalog = _invoke_or_empty(
+        invoker=invoker,
+        server_name=CNFINANCIAL_SERVER,
+        tool_name="get_industry_list",
+        arguments={},
+        tool_logs=tool_logs,
+    )
+    concept_catalog = _invoke_or_empty(
+        invoker=invoker,
+        server_name=CNFINANCIAL_SERVER,
+        tool_name="get_concept_list",
+        arguments={},
+        tool_logs=tool_logs,
+    )
+    return industry_catalog, concept_catalog
+
+
+def _select_cnfinancial_sectors(
+    terms: list[str],
+    industry_impacts: list[dict[str, Any]],
+    industry_catalog: Any,
+    concept_catalog: Any,
+    max_industries: int = 4,
+    max_concepts: int = 4,
+) -> dict[str, Any]:
+    keyword_terms = _sector_keyword_terms(terms, industry_impacts)
+    industry_names = _extract_sector_names(industry_catalog)
+    concept_names = _extract_sector_names(concept_catalog)
+    selected_industries = _rank_sector_names(industry_names, keyword_terms, max_items=max_industries)
+    selected_concepts = _rank_sector_names(concept_names, keyword_terms, max_items=max_concepts)
+    return {
+        "keywords": keyword_terms,
+        "selected_industries": selected_industries,
+        "selected_concepts": selected_concepts,
+        "industry_catalog_available": bool(industry_names),
+        "concept_catalog_available": bool(concept_names),
+    }
+
+
+def _extract_sector_names(raw_catalog: Any) -> list[str]:
+    names: list[str] = []
+    for item in _payload_items(raw_catalog):
+        value = _first_value(item, SECTOR_NAME_KEYS)
+        if value:
+            names.append(str(value).strip())
+    return _unique([name for name in names if name])
+
+
+def _sector_keyword_terms(terms: list[str], industry_impacts: list[dict[str, Any]]) -> list[str]:
+    output: list[str] = []
+    output.extend(terms)
+    for impact in industry_impacts:
+        output.extend(
+            str(impact.get(key) or "")
+            for key in ("industry", "chain_segment", "policy_measure", "implementation_action", "transmission_logic")
+        )
+        for key in ("business_variables", "affected_company_types", "conditions"):
+            output.extend(str(value) for value in impact.get(key) or [])
+        output.extend(_candidate_industry_terms(impact))
+        output.extend(_candidate_stock_search_terms(impact))
+    return _unique([_clip(term.strip(), max_chars=40) for term in output if term and term.strip()])[:20]
+
+
+def _rank_sector_names(names: list[str], keyword_terms: list[str], max_items: int) -> list[dict[str, Any]]:
+    ranked: list[dict[str, Any]] = []
+    for name in names:
+        score, matched_terms = _sector_match_score(name, keyword_terms)
+        if score <= 0:
+            continue
+        ranked.append({"name": name, "score": score, "matched_terms": matched_terms})
+    ranked.sort(key=lambda item: (-int(item["score"]), str(item["name"])))
+    return ranked[:max_items]
+
+
+def _sector_match_score(name: str, keyword_terms: list[str]) -> tuple[int, list[str]]:
+    score = 0
+    matched_terms: list[str] = []
+    compact_name = _compact_match_text(name)
+    for term in keyword_terms:
+        compact_term = _compact_match_text(term)
+        if not compact_term:
+            continue
+        if compact_term == compact_name:
+            score += 20
+            matched_terms.append(term)
+        elif compact_term in compact_name or compact_name in compact_term:
+            score += 10
+            matched_terms.append(term)
+        else:
+            token_hits = sum(1 for token in _match_tokens(compact_term) if token and token in compact_name)
+            if token_hits:
+                score += min(token_hits * 2, 6)
+                matched_terms.append(term)
+    return score, _unique(matched_terms)[:5]
+
+
+def _compact_match_text(value: str) -> str:
+    return re.sub(r"\s+", "", value).lower()
+
+
+def _match_tokens(value: str) -> list[str]:
+    tokens = re.split(r"[\s,，、/;；|()（）]+", value)
+    return [token for token in tokens if len(token) >= 2]
+
+
+def _append_sector_selection_log(tool_logs: list[dict[str, Any]] | None, selection: dict[str, Any]) -> None:
+    log_entry = _new_tool_log(
+        server_name=CNFINANCIAL_SERVER,
+        tool_name="select_sectors",
+        arguments={"keywords": selection.get("keywords") or []},
+    )
+    selected_count = len(selection.get("selected_industries") or []) + len(selection.get("selected_concepts") or [])
+    log_entry.update(
+        {
+            "status": "ok" if selected_count else "empty",
+            "count": selected_count,
+            "error": "",
+            "selected_industries": selection.get("selected_industries") or [],
+            "selected_concepts": selection.get("selected_concepts") or [],
+        }
+    )
+    _append_tool_log(tool_logs, log_entry)
+
+
+def _sector_selection_evidence(selection: dict[str, Any]) -> dict[str, Any]:
+    industries = ", ".join(_selected_sector_names(selection, "selected_industries")) or "none"
+    concepts = ", ".join(_selected_sector_names(selection, "selected_concepts")) or "none"
+    return {
+        "title": "CNFinancial sector selection",
+        "source_org": "CNFinancial MCP",
+        "published_date": "",
+        "source_url": "",
+        "summary": f"selected industries: {industries}; selected concepts: {concepts}",
+        "query": "select_sectors",
+        "query_time": datetime.now(timezone.utc).isoformat(),
+        "server_name": CNFINANCIAL_SERVER,
+        "tool_name": "select_sectors",
+        "source_priority": [],
+        "raw_payload": selection,
+    }
+
+
+def _selected_sector_names(selection: dict[str, Any], key: str) -> list[str]:
+    return [str(item.get("name") or "") for item in selection.get(key) or [] if item.get("name")]
+
+
+def _sector_search_terms(selection: dict[str, Any], fallback_terms: list[str]) -> list[str]:
+    terms = [
+        *_selected_sector_names(selection, "selected_concepts"),
+        *_selected_sector_names(selection, "selected_industries"),
+        *list(selection.get("keywords") or []),
+        *fallback_terms,
+    ]
+    return _unique([_clip(str(term), max_chars=30) for term in terms if str(term).strip()])[:8]
 
 
 def _industry_terms(policy_analysis: dict[str, Any], industry_impacts: list[dict[str, Any]]) -> list[str]:
@@ -586,7 +972,11 @@ def _normalize_company_candidate(
     }
 
 
-def _enrich_company_candidate(candidate: dict[str, Any], invoker: MCPToolInvoker | None) -> None:
+def _enrich_company_candidate(
+    candidate: dict[str, Any],
+    invoker: MCPToolInvoker | None,
+    tool_logs: list[dict[str, Any]] | None = None,
+) -> None:
     stock_code = str(candidate.get("stock_code") or "")
     if not stock_code:
         return
@@ -599,6 +989,7 @@ def _enrich_company_candidate(candidate: dict[str, Any], invoker: MCPToolInvoker
             server_name=CNFINANCIAL_SERVER,
             tool_name=tool_name,
             arguments=_cnfinancial_company_arguments(tool_name, stock_code, candidate),
+            tool_logs=tool_logs,
         )
         normalized = normalize_mcp_evidence(
             raw,
@@ -677,7 +1068,7 @@ def _company_keywords(impact: dict[str, Any]) -> list[str]:
         " ".join(impact.get("affected_company_types") or []),
     ]
     text = " ".join(values)
-    return [keyword for keyword in ANNUAL_REPORT_EVIDENCE_KEYWORDS if keyword in text]
+    return [keyword for keyword in COMPANY_BUSINESS_EVIDENCE_KEYWORDS if keyword in text]
 
 
 def _dedupe_companies(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -689,143 +1080,6 @@ def _dedupe_companies(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
             seen.add(key)
             output.append(candidate)
     return output
-
-
-def _annual_report_evidence(
-    company: dict[str, Any],
-    report: dict[str, Any],
-    downloaded: Any,
-    industry_impacts: list[dict[str, Any]],
-    reports_dir: Path,
-) -> dict[str, Any]:
-    text = _downloaded_report_text(downloaded, reports_dir=reports_dir)
-    keywords = _annual_keywords(company, industry_impacts)
-    excerpt = _find_relevant_excerpt(text, keywords)
-    year = _report_year(report)
-    if not excerpt:
-        return _missing_annual_report_evidence(company, year, report=report)
-    return {
-        "company_name": company.get("company_name"),
-        "stock_code": company.get("stock_code"),
-        "report_year": year,
-        "title": _first_value(report, ("title", "report_title", "announcementTitle", "announcement_title", "name"))
-        or f"{year} 年年度报告",
-        "source_url": _first_value(report, ("source_url", "url", "pdf_url", "download_url", "adjunctUrl")),
-        "text": excerpt,
-        "evidence_found": True,
-        "raw_payload": {"report": report, "downloaded": downloaded},
-    }
-
-
-def _missing_annual_report_evidence(
-    company: dict[str, Any],
-    report_year: int | None,
-    report: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    return {
-        "company_name": company.get("company_name"),
-        "stock_code": company.get("stock_code"),
-        "report_year": report_year,
-        "title": _first_value(report or {}, ("title", "report_title", "announcementTitle", "announcement_title", "name")) or "",
-        "source_url": _first_value(report or {}, ("source_url", "url", "pdf_url", "download_url", "adjunctUrl")),
-        "text": "未在最近两期年报中找到充分证据",
-        "evidence_found": False,
-        "raw_payload": {"report": report or {}},
-    }
-
-
-def _downloaded_report_text(downloaded: Any, reports_dir: Path) -> str:
-    chunks: list[str] = []
-    for item in _payload_items(downloaded):
-        for key in ("content", "text", "summary"):
-            value = item.get(key)
-            if value:
-                chunks.append(str(value))
-        file_path = _first_value(item, ("file_path", "path", "pdf_path"))
-        if file_path:
-            path = Path(str(file_path))
-            if not path.is_absolute():
-                path = reports_dir / path
-            if path.exists() and path.is_file():
-                chunks.append(read_policy_file(path))
-    return "\n".join(chunks)
-
-
-def _annual_keywords(company: dict[str, Any], industry_impacts: list[dict[str, Any]]) -> list[str]:
-    keywords = list(company.get("business_keywords") or [])
-    keywords.extend(str(company.get("matched_business") or "").split())
-    for impact in industry_impacts:
-        keywords.extend(_company_keywords(impact))
-    keywords.extend(ANNUAL_REPORT_EVIDENCE_KEYWORDS)
-    return _unique([keyword for keyword in keywords if keyword])
-
-
-def _find_relevant_excerpt(text: str, keywords: list[str], max_chars: int = 420) -> str:
-    compacted = re.sub(r"\s+", " ", text).strip()
-    if not compacted:
-        return ""
-    for keyword in keywords:
-        if keyword and keyword in compacted:
-            start = max(compacted.find(keyword) - 120, 0)
-            return _clip(compacted[start:], max_chars=max_chars)
-    return ""
-
-
-def _report_year(report: dict[str, Any]) -> int | None:
-    for key in ("report_year", "year", "年度", "fiscal_year"):
-        value = report.get(key)
-        year = _parse_year(value)
-        if year:
-            return year
-    text = " ".join(str(value) for value in report.values())
-    return _parse_year(text)
-
-
-def _stock_code_matches(report: dict[str, Any], stock_code: str | None) -> bool:
-    target = _normalize_stock_code(stock_code)
-    if not target:
-        return True
-    values = [
-        report.get(key)
-        for key in ("stock_code", "code", "symbol", "secCode", "security_code", "证券代码", "股票代码")
-        if report.get(key) not in (None, "")
-    ]
-    if not values:
-        return True
-    return any(_normalize_stock_code(value) == target for value in values)
-
-
-def _normalize_stock_code(value: Any) -> str:
-    if value is None:
-        return ""
-    match = re.search(r"(?<!\d)(\d{6})(?!\d)", str(value))
-    return match.group(1) if match else ""
-
-
-def _is_formal_annual_report(report: dict[str, Any]) -> bool:
-    title = str(_first_value(report, ("title", "report_title", "announcementTitle", "announcement_title", "name")) or "")
-    if not title:
-        return True
-    compact = re.sub(r"\s+", "", title)
-    lower = compact.lower()
-    if any(term in compact for term in ("摘要", "取消", "确认意见")) or "summary" in lower:
-        return False
-    if any(term in compact for term in ("年度报告", "年年度报告", "年报")):
-        return True
-    if "annualreport" in lower:
-        return True
-    return _report_year(report) is not None
-
-
-def _parse_year(value: Any) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, int) and 1900 <= value <= 2100:
-        return value
-    match = re.search(r"(20\d{2}|19\d{2})", str(value))
-    if not match:
-        return None
-    return int(match.group(1))
 
 
 def _dedupe_evidence(items: list[dict[str, Any]]) -> list[dict[str, Any]]:

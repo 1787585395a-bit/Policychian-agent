@@ -18,7 +18,7 @@ from policychain.source_policy import (
 from policychain.state import PolicyResearchState
 from policychain.storage.sqlite_store import SQLitePolicyStore
 from policychain.structured_output import parse_structured_output
-from policychain.tools import collect_policy_web_evidence, read_policy_content, search_policy
+from policychain.tools import collect_policy_web_evidence, read_policy_content, run_policy_react_search, search_policy
 from policychain.tools.mcp_tools import mcp_unavailable_uncertainty
 
 
@@ -55,8 +55,14 @@ def run_llm_policy_analyst(
         state.uncertainties = _unique([*state.uncertainties, "未在本地知识库中找到相似政策。"])
     _emit_progress(state, progress_callback, 15, "检索相似政策", f"找到 {len(similar_results)} 条相似政策证据")
 
+    client = llm_client or create_llm_client()
     web_query = str(source_policy.get("title") or state.user_query)
     web_evidence = collect_policy_web_evidence(web_query, invoker=mcp_invoker)
+    if not is_unavailable_invoker(mcp_invoker):
+        _emit_progress(state, progress_callback, 18, "ReAct 检索", "正在观察 Web Search 结果并补查相似政策证据")
+        react_run = run_policy_react_search(web_query, invoker=mcp_invoker, llm_client=client)
+        state.react_traces.extend(_tag_react_traces("policy", react_run.traces))
+        web_evidence = _merge_external_evidence(web_evidence, react_run.evidence)
     state.policy_web_evidence = web_evidence
     state.external_evidence = _merge_external_evidence(state.external_evidence, web_evidence)
     if is_unavailable_invoker(mcp_invoker):
@@ -72,7 +78,6 @@ def run_llm_policy_analyst(
         similar_policy_matches=_json_for_prompt(similar_results),
         web_evidence=_json_for_prompt(web_evidence),
     )
-    client = llm_client or create_llm_client()
     raw_output = client.generate(prompt["system"], prompt["user"])
     output = parse_structured_output(raw_output, prompt["output_schema_name"])
     if not isinstance(output, PolicyAnalysisOutput):
@@ -244,6 +249,10 @@ def _merge_external_evidence(existing: list[dict[str, object]], new_items: list[
             seen.add(key)
             merged.append(item)
     return merged
+
+
+def _tag_react_traces(stage: str, traces: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [{"stage": stage, **trace} for trace in traces]
 
 
 def _unique(values: Iterable[str]) -> list[str]:

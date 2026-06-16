@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import socket
 from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
@@ -135,6 +136,12 @@ class DeepSeekClient:
                 else ""
             )
             raise LLMProviderError(f"DeepSeek API request failed for {self.base_url}: {exc.reason}.{proxy_hint}") from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise LLMProviderError(
+                f"DeepSeek API request timed out after {self.timeout_seconds} seconds"
+            ) from exc
+        except OSError as exc:
+            raise LLMProviderError(f"DeepSeek API request failed for {self.base_url}: {exc}") from exc
         except json.JSONDecodeError as exc:
             raise LLMProviderError("DeepSeek API returned invalid JSON") from exc
 

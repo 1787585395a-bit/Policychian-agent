@@ -91,7 +91,7 @@ def _build_policy_analysis(payload: dict[str, Any]) -> PolicyAnalysisOutput:
         historical_changes=_coerce_historical_changes(payload),
         strength_assessment=_build_strength_assessment(_require_dict(payload, "strength_assessment")),
         evidence=_build_evidence_list(_require_list(payload, "evidence"), "evidence"),
-        uncertainties=_require_list_of_str(payload, "uncertainties"),
+        uncertainties=_coerce_explanatory_list(payload, "uncertainties"),
     )
 
 
@@ -119,7 +119,7 @@ def _build_impact_analysis(payload: dict[str, Any]) -> ImpactAnalysisOutput:
             _build_industry_impact(item, f"industry_impacts[{index}]")
             for index, item in enumerate(_require_list(payload, "industry_impacts"))
         ],
-        uncertainties=_require_list_of_str(payload, "uncertainties"),
+        uncertainties=_coerce_explanatory_list(payload, "uncertainties"),
         evidence=_build_evidence_list(_require_list(payload, "evidence"), "evidence"),
     )
 
@@ -131,7 +131,7 @@ def _build_company_match_output(payload: dict[str, Any]) -> CompanyMatchOutput:
             _build_company_match(item, f"companies[{index}]")
             for index, item in enumerate(_require_list(payload, "companies"))
         ],
-        uncertainties=_require_list_of_str(payload, "uncertainties"),
+        uncertainties=_coerce_explanatory_list(payload, "uncertainties"),
     )
 
 
@@ -143,7 +143,7 @@ def _build_strength_assessment(payload: dict[str, Any]) -> StrengthAssessment:
     return StrengthAssessment(
         level=level,
         reasons=_require_list_of_str(payload, "reasons"),
-        uncertainties=_require_list_of_str(payload, "uncertainties"),
+        uncertainties=_coerce_explanatory_list(payload, "uncertainties"),
     )
 
 
@@ -241,13 +241,11 @@ def _build_company_match(payload: Any, field_name: str) -> CompanyMatch:
         industry_segment=_require_str(payload, "industry_segment", field_name),
         matched_business=_require_str(payload, "matched_business", field_name),
         match_level=match_level,
+        impact_id=_optional_str(payload, "impact_id", field_name) or "",
+        impact_industry=_optional_str(payload, "impact_industry", field_name) or "",
         stock_code=_optional_str(payload, "stock_code", field_name) or "",
         chain_segment=_optional_str(payload, "chain_segment", field_name) or "",
         related_product_or_business=_optional_str(payload, "related_product_or_business", field_name) or "",
-        annual_report_evidence=[
-            _build_company_evidence(item, f"{field_name}.annual_report_evidence[{index}]")
-            for index, item in enumerate(_optional_list(payload, "annual_report_evidence", field_name))
-        ],
         revenue_or_ratio=_optional_str(payload, "revenue_or_ratio", field_name) or "",
         source_url=_optional_str(payload, "source_url", field_name),
         match_conditions=_optional_list_of_str(payload, "match_conditions", field_name),
@@ -262,6 +260,8 @@ def _build_company_match(payload: Any, field_name: str) -> CompanyMatch:
         risks=_require_list_of_str(payload, "risks", field_name),
         data_date=_require_str(payload, "data_date", field_name),
         confidence=float(confidence),
+        audit_status=_optional_str(payload, "audit_status", field_name) or "pending",
+        audit_reason=_optional_str(payload, "audit_reason", field_name) or "",
     )
 
 
@@ -274,9 +274,7 @@ def _build_company_evidence(payload: Any, field_name: str) -> CompanyEvidence:
         source_url=_optional_str(payload, "source_url", field_name),
         text=_require_str(payload, "text", field_name),
         data_date=_optional_str(payload, "data_date", field_name) or "unknown",
-        report_year=_optional_int(payload, "report_year", field_name),
         revenue_or_ratio=_optional_str(payload, "revenue_or_ratio", field_name) or "",
-        evidence_found=_optional_bool(payload, "evidence_found", field_name, default=True),
     )
 
 
@@ -353,6 +351,70 @@ def _compact_history_change(value: dict[str, Any]) -> str:
     return "；".join(parts)
 
 
+def _coerce_explanatory_list(payload: dict[str, Any], field_name: str, parent: str | None = None) -> list[str]:
+    values = _require_list(payload, field_name, parent)
+    items: list[str] = []
+    for index, value in enumerate(values):
+        text = _compact_explanatory_item(value)
+        if text:
+            items.append(text)
+            continue
+        if value is not None:
+            raise StructuredOutputError(f"{_field_path(field_name, parent)}[{index}] must be a string-like explanation")
+    return items
+
+
+def _compact_explanatory_item(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        parts = [_compact_explanatory_item(item) for item in value]
+        return "; ".join(part for part in parts if part)
+    if isinstance(value, dict):
+        return _compact_explanatory_mapping(value)
+    return ""
+
+
+def _compact_explanatory_mapping(value: dict[str, Any]) -> str:
+    preferred_keys = (
+        "message",
+        "uncertainty",
+        "issue",
+        "reason",
+        "detail",
+        "description",
+        "evidence",
+        "source",
+        "tool",
+        "error",
+    )
+    parts: list[str] = []
+    for key in preferred_keys:
+        if key not in value:
+            continue
+        text = _compact_explanatory_item(value.get(key))
+        if text:
+            parts.append(f"{key}: {text}")
+    if not parts:
+        for key, item in value.items():
+            text = _compact_explanatory_item(item)
+            if text:
+                parts.append(f"{key}: {text}")
+    return _clip_text("; ".join(parts), 600)
+
+
+def _clip_text(value: str, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    return value[: max_chars - 1].rstrip() + "…"
+
+
 def _optional_list(payload: dict[str, Any], field_name: str, parent: str | None = None) -> list[Any]:
     if field_name not in payload or payload.get(field_name) is None:
         return []
@@ -378,24 +440,6 @@ def _optional_str(payload: dict[str, Any], field_name: str, parent: str | None =
         return None
     if not isinstance(value, str):
         raise StructuredOutputError(f"{_field_path(field_name, parent)} must be a string or null")
-    return value
-
-
-def _optional_int(payload: dict[str, Any], field_name: str, parent: str | None = None) -> int | None:
-    value = payload.get(field_name)
-    if value is None:
-        return None
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise StructuredOutputError(f"{_field_path(field_name, parent)} must be an integer or null")
-    return value
-
-
-def _optional_bool(payload: dict[str, Any], field_name: str, parent: str | None = None, default: bool = False) -> bool:
-    value = payload.get(field_name)
-    if value is None:
-        return default
-    if not isinstance(value, bool):
-        raise StructuredOutputError(f"{_field_path(field_name, parent)} must be a boolean or null")
     return value
 
 

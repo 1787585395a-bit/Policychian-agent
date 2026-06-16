@@ -18,7 +18,7 @@ from policychain.agents.policy_analyst import (
     analyze_policy_content,
     run_policy_analyst,
 )
-from policychain.agents.report_writer import ReportWriterError, write_research_report
+from policychain.agents.report_writer import ReportWriterError, write_llm_research_report, write_research_report
 
 __all__ = [
     "CompanyMatchError",
@@ -38,4 +38,5 @@ __all__ = [
     "run_llm_policy_analyst",
     "run_policy_analyst",
     "write_research_report",
+    "write_llm_research_report",
 ]

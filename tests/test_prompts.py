@@ -44,6 +44,23 @@ class PromptTests(unittest.TestCase):
         self.assertIn('"companies"', rendered["user"])
         self.assertIn('"company_name"', rendered["user"])
         self.assertIn("不得编造公司", rendered["user"])
+        self.assertIn("逐条绑定到行业路径", rendered["user"])
+        self.assertIn("合理性审查", rendered["system"])
+        self.assertIn('"impact_id"', rendered["user"])
+
+    def test_report_writer_prompt_requires_detail_and_full_path_coverage(self) -> None:
+        rendered = render_prompt(
+            "report_writer",
+            policy_analysis={"policy_identity": {"title": "测试政策"}},
+            impact_analysis={"industry_impacts": [{"industry": "钢铁"}, {"industry": "算力"}]},
+            company_matches={"company_coverage": []},
+            evidence={},
+            uncertainties=[],
+        )
+
+        self.assertIn("较完整的政策研究说明", rendered["system"])
+        self.assertIn("必须覆盖所有行业影响路径", rendered["system"])
+        self.assertIn("没有可靠公司匹配的路径也要说明原因", rendered["system"])
 
     def test_impact_analyst_prompt_includes_exact_json_contract(self) -> None:
         rendered = render_prompt(

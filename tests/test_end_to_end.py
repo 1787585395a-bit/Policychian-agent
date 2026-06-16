@@ -22,10 +22,11 @@ class EndToEndWorkflowTests(unittest.TestCase):
             self.assertTrue(state.policy_analysis)
             self.assertGreaterEqual(len(state.implementation_path), 1)
             self.assertGreaterEqual(len(state.industry_impacts), 1)
-            self.assertGreaterEqual(len(state.company_matches), 1)
+            self.assertEqual(state.company_matches, [])
             self.assertIn("PolicyChain 政策研究报告", state.final_report)
             self.assertGreaterEqual(len(state.evidence), 1)
             self.assertTrue(state.uncertainties)
+            self.assertTrue(any("候选公司" in item or "mock" in item for item in state.uncertainties))
         finally:
             store.close()
 

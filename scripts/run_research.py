@@ -29,7 +29,6 @@ def run_research(
     use_llm: bool = False,
     llm_client: LLMClient | None = None,
     mcp_invoker: MCPToolInvoker | None = None,
-    skip_annual_reports: bool = False,
     progress_callback: Callable[[int, str, str], None] | None = None,
 ) -> str:
     db = Path(db_path) if db_path else resolve_default_db_path()
@@ -49,7 +48,6 @@ def run_research(
                 store,
                 llm_client=llm_client,
                 mcp_invoker=mcp_invoker,
-                use_annual_reports=not skip_annual_reports,
                 progress_callback=progress_callback,
             )
         else:
@@ -57,7 +55,6 @@ def run_research(
                 query,
                 store,
                 mcp_invoker=mcp_invoker,
-                use_annual_reports=not skip_annual_reports,
                 progress_callback=progress_callback,
             )
     finally:
@@ -85,7 +82,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mcp-config", default=".mcp.local.json", help="Path to local MCP config used with --mcp.")
     parser.add_argument("--mcp-timeout", type=float, default=60, help="Timeout seconds per MCP tool call.")
     parser.add_argument("--no-mcp-cache", action="store_true", help="Disable in-process cache for repeated MCP calls.")
-    parser.add_argument("--skip-annual-reports", action="store_true", help="Skip CNINFO annual report query/download during company matching.")
     args = parser.parse_args(argv)
     if args.sample_db and args.full_db:
         parser.error("--sample-db and --full-db cannot be used together.")
@@ -124,7 +120,6 @@ def main(argv: list[str] | None = None) -> int:
         output_path=args.out,
         use_llm=args.llm,
         mcp_invoker=mcp_invoker,
-        skip_annual_reports=args.skip_annual_reports,
     )
     print(report)
     return 0
