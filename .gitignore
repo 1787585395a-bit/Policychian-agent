@@ -45,3 +45,5 @@ artifacts/test-results/*
 data/processed/*
 !data/processed/.gitkeep
 !data/processed/policychain_full.sqlite
+
+.vercel
