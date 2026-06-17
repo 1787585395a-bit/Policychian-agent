@@ -13,6 +13,7 @@ from app import (
     _create_job,
     _health_payload,
     _job_view,
+    _mcp_default_enabled,
     _resolve_host,
     _resolve_port,
     _sync_jobs_enabled,
@@ -70,6 +71,13 @@ class AppTests(unittest.TestCase):
         self.assertIn("use_mcp: true", html)
         self.assertEqual(len(EXAMPLE_QUERIES), 1)
         self.assertIn(EXAMPLE_QUERIES[0], html)
+
+    def test_render_page_can_disable_default_mcp_for_cloud(self) -> None:
+        with patch.dict(os.environ, {"POLICYCHAIN_ENABLE_MCP_BY_DEFAULT": "0"}):
+            html = render_page().decode("utf-8")
+
+        self.assertFalse(_mcp_default_enabled({"POLICYCHAIN_ENABLE_MCP_BY_DEFAULT": "0"}))
+        self.assertIn("use_mcp: false", html)
 
     def test_render_page_renders_markdown_report_content(self) -> None:
         report = (

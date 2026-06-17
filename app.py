@@ -53,6 +53,18 @@ def _sync_jobs_enabled(env: dict[str, str] | None = None) -> bool:
     return _truthy_env(values.get("POLICYCHAIN_SYNC_JOBS")) or _truthy_env(values.get("VERCEL"))
 
 
+def _mcp_default_enabled(env: dict[str, str] | None = None) -> bool:
+    values = env if env is not None else os.environ
+    raw = values.get("POLICYCHAIN_ENABLE_MCP_BY_DEFAULT")
+    if raw is None:
+        return True
+    return _truthy_env(raw)
+
+
+def _js_bool(value: bool) -> str:
+    return "true" if value else "false"
+
+
 HOST = _resolve_host()
 PORT = _resolve_port()
 
@@ -128,8 +140,9 @@ def render_page(
     error: str = "",
     elapsed_seconds: float | None = None,
     use_llm: bool = True,
-    use_mcp: bool = True,
+    use_mcp: bool | None = None,
 ) -> bytes:
+    effective_use_mcp = _mcp_default_enabled() if use_mcp is None else use_mcp
     examples = "\n".join(
         f'<button class="quick" type="button" data-query="{escape(item)}">{escape(item)}</button>'
         for item in EXAMPLE_QUERIES
@@ -537,7 +550,7 @@ def render_page(
           body: JSON.stringify({{
             query: queryInput.value,
             use_llm: true,
-            use_mcp: true
+            use_mcp: {_js_bool(effective_use_mcp)}
           }})
         }});
         const payload = await response.json();
@@ -694,7 +707,7 @@ class PolicyChainRequestHandler(BaseHTTPRequestHandler):
             payload = self._read_payload()
             query = str(payload.get("query") or DEFAULT_POLICY_INPUT)
             use_llm = _payload_bool(payload, "use_llm", default=True)
-            use_mcp = _payload_bool(payload, "use_mcp", default=True)
+            use_mcp = _payload_bool(payload, "use_mcp", default=_mcp_default_enabled())
             job_id = _create_job(query=query, use_llm=use_llm, use_mcp=use_mcp)
             self._send_json({"job_id": job_id, "status": "pending"}, status=202)
             return
@@ -702,7 +715,7 @@ class PolicyChainRequestHandler(BaseHTTPRequestHandler):
         payload = self._read_payload()
         query = str(payload.get("query") or DEFAULT_POLICY_INPUT)
         use_llm = _payload_bool(payload, "use_llm", default=True)
-        use_mcp = _payload_bool(payload, "use_mcp", default=True)
+        use_mcp = _payload_bool(payload, "use_mcp", default=_mcp_default_enabled())
         try:
             result = run_query(query, use_llm=use_llm, use_mcp=use_mcp)
             html = render_page(
@@ -729,7 +742,7 @@ class PolicyChainRequestHandler(BaseHTTPRequestHandler):
         return {
             "query": (form.get("query") or [DEFAULT_POLICY_INPUT])[0],
             "use_llm": (form.get("use_llm") or ["1"])[0] != "0",
-            "use_mcp": (form.get("use_mcp") or ["1"])[0] != "0",
+            "use_mcp": (form.get("use_mcp") or ["1" if _mcp_default_enabled() else "0"])[0] != "0",
         }
 
     def _send_html(self, payload: bytes) -> None:
