@@ -124,19 +124,18 @@ def _install_cnfinancial(cnfinancial_dir: Path) -> None:
     try:
         _run_checked([sys.executable, "-m", "pip", "install", "-e", str(cnfinancial_dir)])
     except subprocess.CalledProcessError as exc:
-        uv_path = shutil.which("uv")
         requirements_path = cnfinancial_dir / "requirements.txt"
-        if uv_path is None or not requirements_path.is_file():
+        if not requirements_path.is_file():
             raise RuntimeError(
-                "Failed to install cn-financial-mcp with pip, and uv/requirements.txt "
+                "Failed to install cn-financial-mcp with pip, and requirements.txt "
                 "fallback is unavailable."
             ) from exc
         print(
-            "pip editable install failed; falling back to uv runtime dependency install. "
+            "pip editable install failed; falling back to requirements.txt dependency install. "
             "The MCP server will run through PYTHONPATH=src.",
             file=sys.stderr,
         )
-        _run_checked([uv_path, "pip", "install", "-r", str(requirements_path), "--python", sys.executable])
+        _run_checked([sys.executable, "-m", "pip", "install", "-r", str(requirements_path)])
 
 
 def _run_checked(command: list[str]) -> None:
