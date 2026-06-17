@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 import unittest
+from io import BytesIO
 from unittest.mock import patch
 
 from app import (
@@ -241,6 +243,27 @@ class AppTests(unittest.TestCase):
         self.assertTrue(any("读取失败" in item["message"] for item in view["logs"]))
 
 
+    def test_vercel_wsgi_entrypoint_serves_health_and_research_api(self) -> None:
+        from api.index import app as wsgi_app
+
+        status, _, body = _call_wsgi(wsgi_app, "GET", "/healthz")
+
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(json.loads(body.decode("utf-8"))["status"], "ok")
+
+        with patch("api.index._create_job", return_value="job-123"):
+            status, _, body = _call_wsgi(
+                wsgi_app,
+                "POST",
+                "/api/research",
+                body=json.dumps({"query": "policy text"}).encode("utf-8"),
+                content_type="application/json",
+            )
+
+        self.assertEqual(status, "202 Accepted")
+        self.assertEqual(json.loads(body.decode("utf-8"))["job_id"], "job-123")
+
+
 def _wait_for_job(job_id: str, expected_status: str = "done") -> dict[str, object]:
     deadline = time.time() + 5
     view = _job_view(job_id)
@@ -250,6 +273,31 @@ def _wait_for_job(job_id: str, expected_status: str = "done") -> dict[str, objec
             return view
         time.sleep(0.05)
     raise AssertionError(f"Job did not reach {expected_status}: {view}")
+
+
+def _call_wsgi(
+    wsgi_app,
+    method: str,
+    path: str,
+    body: bytes = b"",
+    content_type: str = "",
+) -> tuple[str, list[tuple[str, str]], bytes]:
+    captured: dict[str, object] = {}
+
+    def start_response(status: str, headers: list[tuple[str, str]]) -> None:
+        captured["status"] = status
+        captured["headers"] = headers
+
+    environ = {
+        "REQUEST_METHOD": method,
+        "PATH_INFO": path,
+        "QUERY_STRING": "",
+        "CONTENT_LENGTH": str(len(body)),
+        "CONTENT_TYPE": content_type,
+        "wsgi.input": BytesIO(body),
+    }
+    response_body = b"".join(wsgi_app(environ, start_response))
+    return str(captured["status"]), list(captured["headers"]), response_body
 
 
 if __name__ == "__main__":
