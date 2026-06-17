@@ -71,6 +71,8 @@ def run_query(
     if use_mcp:
         try:
             mcp_invoker = _build_mcp_invoker()
+            if progress_callback:
+                progress_callback(2, "MCP 初始化", "MCP 外部工具初始化成功，已启用 Open-WebSearch/CNFinancial 工具通道")
         except Exception as exc:
             message = f"MCP 外部工具初始化失败，已回退到本地流程：{exc}"
             runtime_notes.append(message)

@@ -134,6 +134,26 @@ class AppTests(unittest.TestCase):
         self.assertIs(fake_runner.call_args.kwargs["mcp_invoker"], fake_invoker)
         self.assertNotIn("skip_annual_reports", fake_runner.call_args.kwargs)
 
+    def test_run_query_logs_successful_mcp_initialization(self) -> None:
+        class FakeClosableInvoker:
+            def close(self) -> None:
+                return None
+
+        progress_events: list[tuple[int, str, str]] = []
+        with patch("app._build_mcp_invoker", return_value=FakeClosableInvoker()), patch(
+            "app.run_research",
+            return_value="# PolicyChain report",
+        ):
+            run_query(
+                "policy text",
+                db_path=":memory:",
+                use_mcp=True,
+                progress_callback=lambda progress, stage, message: progress_events.append((progress, stage, message)),
+            )
+
+        self.assertTrue(any(stage == "MCP 初始化" for _, stage, _ in progress_events))
+        self.assertTrue(any("Open-WebSearch/CNFinancial" in message for _, _, message in progress_events))
+
     def test_run_query_falls_back_when_mcp_config_is_missing(self) -> None:
         progress_events: list[tuple[int, str, str]] = []
         with patch("app._build_mcp_invoker", side_effect=FileNotFoundError(".mcp.local.json")), patch(

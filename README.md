@@ -1,3 +1,9 @@
+---
+title: PolicyChain
+sdk: docker
+app_port: 10000
+---
+
 # PolicyChain
 
 PolicyChain is an Agentic RAG project for policy research. The first-stage codebase focuses on offline policy ingestion: reading policy files, generating stable IDs, extracting metadata, chunking text, and validating the pipeline with tests.
@@ -224,6 +230,40 @@ To force the web app to use the full local database:
 $env:POLICYCHAIN_DB="data\processed\policychain_full.sqlite"
 python app.py
 ```
+
+## Cloud Deployment on Hugging Face Spaces
+
+This repository is configured for Hugging Face Spaces Docker deployment through the README front matter:
+
+```yaml
+sdk: docker
+app_port: 10000
+```
+
+Create a Hugging Face Space with SDK `Docker` and hardware `CPU Basic`, then push this repository to the Space git remote or connect it from GitHub.
+
+Set these Space variables:
+
+- `POLICYCHAIN_HOST=0.0.0.0`
+- `PORT=10000`
+- `POLICYCHAIN_DB=/app/data/processed/policychain_full.sqlite`
+- `POLICYCHAIN_MCP_CONFIG=/app/.mcp.local.json`
+- `POLICYCHAIN_LLM_PROVIDER=deepseek`
+- `POLICYCHAIN_MCP_TIMEOUT=90`
+
+Set this Space secret:
+
+- `DEEPSEEK_API_KEY`
+
+The Docker build installs Node/npm/git, Python dependencies, and prepares the stdio MCP config at `/app/.mcp.local.json`. Open-WebSearch and CNFinancial remain MCP tools; they are not replaced with direct Python functions.
+
+After deployment, check:
+
+```text
+https://<space-owner>-policychain-agent.hf.space/healthz
+```
+
+Then submit a policy URL and confirm the runtime logs show MCP initialization instead of a missing MCP config fallback.
 
 ## Cloud Deployment on Render
 

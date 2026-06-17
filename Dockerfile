@@ -2,9 +2,13 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    HOME=/home/user \
+    NPM_CONFIG_CACHE=/tmp/npm-cache \
+    PIP_CACHE_DIR=/tmp/pip-cache \
     PORT=10000 \
     POLICYCHAIN_HOST=0.0.0.0 \
-    POLICYCHAIN_MCP_CONFIG=/app/.mcp.local.json
+    POLICYCHAIN_MCP_CONFIG=/app/.mcp.local.json \
+    POLICYCHAIN_MCP_TIMEOUT=90
 
 WORKDIR /app
 
@@ -15,7 +19,10 @@ RUN apt-get update \
         git \
         nodejs \
         npm \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -u 1000 user \
+    && mkdir -p /tmp/npm-cache /tmp/pip-cache \
+    && chown -R user:user /tmp/npm-cache /tmp/pip-cache
 
 COPY requirements.txt ./
 RUN python -m pip install --no-cache-dir --upgrade pip \
@@ -23,7 +30,10 @@ RUN python -m pip install --no-cache-dir --upgrade pip \
 
 COPY . .
 
-RUN python scripts/setup_mcp_servers.py --config /app/.mcp.local.json
+RUN python scripts/setup_mcp_servers.py --config /app/.mcp.local.json \
+    && chown -R user:user /app /tmp/npm-cache /tmp/pip-cache
+
+USER user
 
 EXPOSE 10000
 
