@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from datetime import datetime, timezone
+import os
 import re
 from typing import Any
 
@@ -43,6 +44,12 @@ CNFINANCIAL_COMPANY_TOOLS = (
     "get_competitors",
     "get_company_announcements",
     "get_stock_news",
+)
+
+DEFAULT_COMPANY_ENRICHMENT_TOOLS = (
+    "get_company_profile",
+    "get_segments_revenue",
+    "get_financial_indicators",
 )
 
 CNFINANCIAL_INDUSTRY_TOOLS_WITH_TERM = {"get_industry_stocks", "get_industry_pe"}
@@ -378,6 +385,8 @@ def collect_impact_research(
         industry_impacts=industry_impacts,
         industry_catalog=industry_catalog,
         concept_catalog=concept_catalog,
+        max_industries=_mcp_int_setting("POLICYCHAIN_MCP_MAX_SELECTED_INDUSTRIES", 2, minimum=1),
+        max_concepts=_mcp_int_setting("POLICYCHAIN_MCP_MAX_SELECTED_CONCEPTS", 3, minimum=0),
     )
     _append_sector_selection_log(tool_logs, sector_selection)
     financial.append(_sector_selection_evidence(sector_selection))
@@ -434,7 +443,7 @@ def collect_impact_research(
                 )
             )
 
-    for term in _sector_search_terms(sector_selection, industry_terms):
+    for term in _limited(_sector_search_terms(sector_selection, industry_terms), _mcp_int_setting("POLICYCHAIN_MCP_MAX_SEARCH_TERMS", 3, minimum=1)):
         raw = _invoke_or_empty(
             invoker=invoker,
             server_name=CNFINANCIAL_SERVER,
@@ -451,7 +460,7 @@ def collect_impact_research(
             )
         )
 
-    for term in industry_terms:
+    for term in _limited(industry_terms, _mcp_int_setting("POLICYCHAIN_MCP_MAX_SEARCH_TERMS", 3, minimum=1)):
         web.extend(
             search_web(
                 query=f"{term} industry data statistics association production sales price inventory capacity technology route",
@@ -477,6 +486,7 @@ def collect_company_candidates(
     tool_logs: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
+    max_candidates = _mcp_int_setting("POLICYCHAIN_MCP_MAX_COMPANY_CANDIDATES", 4, minimum=1)
     industry_terms = _industry_terms({}, industry_impacts)
     industry_catalog, concept_catalog = _load_cnfinancial_sector_catalogs(invoker, tool_logs)
     sector_selection = _select_cnfinancial_sectors(
@@ -484,14 +494,20 @@ def collect_company_candidates(
         industry_impacts=industry_impacts,
         industry_catalog=industry_catalog,
         concept_catalog=concept_catalog,
+        max_industries=_mcp_int_setting("POLICYCHAIN_MCP_MAX_SELECTED_INDUSTRIES", 2, minimum=1),
+        max_concepts=_mcp_int_setting("POLICYCHAIN_MCP_MAX_SELECTED_CONCEPTS", 3, minimum=0),
     )
     _append_sector_selection_log(tool_logs, sector_selection)
     legal_industries = _selected_sector_names(sector_selection, "selected_industries")
     selected_concepts = _selected_sector_names(sector_selection, "selected_concepts")
-    search_terms = _sector_search_terms(sector_selection, industry_terms)
+    search_terms = _limited(_sector_search_terms(sector_selection, industry_terms), _mcp_int_setting("POLICYCHAIN_MCP_MAX_SEARCH_TERMS", 3, minimum=1))
 
     for impact in industry_impacts:
+        if len(_dedupe_companies(candidates)) >= max_candidates:
+            break
         for industry in legal_industries:
+            if len(_dedupe_companies(candidates)) >= max_candidates:
+                break
             raw = _invoke_or_empty(
                 invoker=invoker,
                 server_name=CNFINANCIAL_SERVER,
@@ -499,7 +515,7 @@ def collect_company_candidates(
                 arguments={"industry": industry},
                 tool_logs=tool_logs,
             )
-            for item in _payload_items(raw)[:top_k_per_industry]:
+            for item in _payload_items(raw)[: min(top_k_per_industry, _remaining_candidate_slots(candidates, max_candidates))]:
                 candidate = _normalize_company_candidate(item, impact, industry_segment=industry)
                 if not candidate.get("company_name"):
                     continue
@@ -515,11 +531,18 @@ def collect_company_candidates(
                 )
                 _enrich_company_candidate(candidate, invoker=invoker, tool_logs=tool_logs)
                 candidates.append(candidate)
+                if len(_dedupe_companies(candidates)) >= max_candidates:
+                    break
+
+        if len(_dedupe_companies(candidates)) >= max_candidates:
+            break
 
         if len(_dedupe_companies(candidates)) >= top_k_per_industry:
             continue
 
         for term in _unique([*search_terms, *_candidate_stock_search_terms(impact)]):
+            if len(_dedupe_companies(candidates)) >= max_candidates:
+                break
             raw = _invoke_or_empty(
                 invoker=invoker,
                 server_name=CNFINANCIAL_SERVER,
@@ -527,7 +550,7 @@ def collect_company_candidates(
                 arguments={"keyword": term},
                 tool_logs=tool_logs,
             )
-            for item in _payload_items(raw)[:top_k_per_industry]:
+            for item in _payload_items(raw)[: min(top_k_per_industry, _remaining_candidate_slots(candidates, max_candidates))]:
                 candidate = _normalize_company_candidate(item, impact)
                 if not candidate.get("company_name"):
                     continue
@@ -543,6 +566,8 @@ def collect_company_candidates(
                 )
                 _enrich_company_candidate(candidate, invoker=invoker, tool_logs=tool_logs)
                 candidates.append(candidate)
+                if len(_dedupe_companies(candidates)) >= max_candidates:
+                    break
             if len(_dedupe_companies(candidates)) >= top_k_per_industry:
                 break
     return _dedupe_companies(candidates)
@@ -858,6 +883,12 @@ def _selected_sector_names(selection: dict[str, Any], key: str) -> list[str]:
     return [str(item.get("name") or "") for item in selection.get(key) or [] if item.get("name")]
 
 
+def _limited(values: list[str], max_items: int) -> list[str]:
+    if max_items < 0:
+        return values
+    return values[:max_items]
+
+
 def _sector_search_terms(selection: dict[str, Any], fallback_terms: list[str]) -> list[str]:
     terms = [
         *_selected_sector_names(selection, "selected_concepts"),
@@ -948,6 +979,30 @@ def _impact_candidate_term(impact: dict[str, Any]) -> str:
     return str(impact.get("chain_segment") or impact.get("industry") or impact.get("affected_company_types") or "")
 
 
+def _mcp_int_setting(name: str, default: int, minimum: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return max(default, minimum)
+    try:
+        return max(int(raw), minimum)
+    except ValueError:
+        return max(default, minimum)
+
+
+def _mcp_company_enrichment_tools() -> tuple[str, ...]:
+    configured = os.environ.get("POLICYCHAIN_MCP_COMPANY_ENRICH_TOOLS", "")
+    if configured.strip():
+        requested = [tool.strip() for tool in configured.split(",") if tool.strip()]
+    else:
+        requested = list(DEFAULT_COMPANY_ENRICHMENT_TOOLS)
+    allowed = set(CNFINANCIAL_COMPANY_TOOLS) - {"search_stock"}
+    return tuple(tool for tool in requested if tool in allowed)
+
+
+def _remaining_candidate_slots(candidates: list[dict[str, Any]], max_candidates: int) -> int:
+    return max(max_candidates - len(_dedupe_companies(candidates)), 0)
+
+
 def _normalize_company_candidate(
     item: dict[str, Any],
     impact: dict[str, Any],
@@ -981,9 +1036,7 @@ def _enrich_company_candidate(
     if not stock_code:
         return
     evidence: list[dict[str, Any]] = []
-    for tool_name in CNFINANCIAL_COMPANY_TOOLS:
-        if tool_name == "search_stock":
-            continue
+    for tool_name in _mcp_company_enrichment_tools():
         raw = _invoke_or_empty(
             invoker=invoker,
             server_name=CNFINANCIAL_SERVER,

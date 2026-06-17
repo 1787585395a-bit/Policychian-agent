@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from policychain.mcp import FakeMCPInvoker
 from policychain.tools.mcp_tools import (
@@ -170,6 +171,64 @@ class MCPToolsTests(unittest.TestCase):
         self.assertTrue(all(call["arguments"]["industry"] != "ChatGPT\u6982\u5ff5" for call in industry_calls))
         self.assertTrue(any(call["tool_name"] == "search_stock" for call in invoker.calls))
         self.assertTrue(candidates)
+
+    def test_collect_company_candidates_respects_cloud_candidate_budget(self) -> None:
+        invoker = FakeMCPInvoker(
+            {
+                (CNFINANCIAL_SERVER, "get_industry_list"): [
+                    {"\u540d\u79f0": "\u8f6f\u4ef6\u5f00\u53d1"},
+                ],
+                (CNFINANCIAL_SERVER, "get_concept_list"): [],
+                (CNFINANCIAL_SERVER, "get_industry_stocks"): [
+                    {"\u540d\u79f0": "\u516c\u53f8A", "\u4ee3\u7801": "300001"},
+                    {"\u540d\u79f0": "\u516c\u53f8B", "\u4ee3\u7801": "300002"},
+                    {"\u540d\u79f0": "\u516c\u53f8C", "\u4ee3\u7801": "300003"},
+                ],
+                (CNFINANCIAL_SERVER, "get_company_profile"): [],
+            }
+        )
+
+        with patch.dict(
+            "os.environ",
+            {
+                "POLICYCHAIN_MCP_MAX_COMPANY_CANDIDATES": "2",
+                "POLICYCHAIN_MCP_COMPANY_ENRICH_TOOLS": "get_company_profile",
+            },
+        ):
+            candidates = collect_company_candidates(
+                [_ai_impact()],
+                invoker=invoker,
+                top_k_per_industry=3,
+            )
+
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual([candidate["stock_code"] for candidate in candidates], ["300001", "300002"])
+
+    def test_company_enrichment_uses_core_tools_by_default(self) -> None:
+        invoker = FakeMCPInvoker(
+            {
+                (CNFINANCIAL_SERVER, "get_industry_list"): [
+                    {"\u540d\u79f0": "\u8f6f\u4ef6\u5f00\u53d1"},
+                ],
+                (CNFINANCIAL_SERVER, "get_concept_list"): [],
+                (CNFINANCIAL_SERVER, "get_industry_stocks"): [
+                    {"\u540d\u79f0": "\u793a\u4f8b\u79d1\u6280", "\u4ee3\u7801": "300001"},
+                ],
+                (CNFINANCIAL_SERVER, "get_company_profile"): [],
+                (CNFINANCIAL_SERVER, "get_segments_revenue"): [],
+                (CNFINANCIAL_SERVER, "get_financial_indicators"): [],
+            }
+        )
+
+        collect_company_candidates([_ai_impact()], invoker=invoker, top_k_per_industry=1)
+
+        called_tools = [call["tool_name"] for call in invoker.calls]
+        self.assertIn("get_company_profile", called_tools)
+        self.assertIn("get_segments_revenue", called_tools)
+        self.assertIn("get_financial_indicators", called_tools)
+        self.assertNotIn("get_competitors", called_tools)
+        self.assertNotIn("get_company_announcements", called_tools)
+        self.assertNotIn("get_stock_news", called_tools)
 
 
 def _ai_impact() -> dict[str, object]:
