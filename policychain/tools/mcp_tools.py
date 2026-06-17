@@ -234,7 +234,12 @@ def collect_policy_web_evidence(
     top_k_per_topic: int = 2,
 ) -> list[dict[str, Any]]:
     evidence: list[dict[str, Any]] = []
-    for topic in POLICY_WEB_TOPICS:
+    max_topics = _mcp_int_setting(
+        "POLICYCHAIN_MCP_MAX_POLICY_WEB_TOPICS",
+        1 if _mcp_fast_mode() else len(POLICY_WEB_TOPICS),
+        minimum=0,
+    )
+    for topic in list(POLICY_WEB_TOPICS)[:max_topics]:
         evidence.extend(
             search_web(
                 query=f"{user_query} {topic}",
@@ -389,42 +394,45 @@ def collect_impact_research(
     _append_sector_selection_log(tool_logs, sector_selection)
     financial.append(_sector_selection_evidence(sector_selection))
 
-    for tool_name in CNFINANCIAL_MACRO_TOOLS:
-        raw = _invoke_or_empty(
-            invoker=invoker,
-            server_name=CNFINANCIAL_SERVER,
-            tool_name=tool_name,
-            arguments={},
-            tool_logs=tool_logs,
-        )
-        financial.extend(
-            normalize_mcp_evidence(
-                raw,
-                query=tool_name,
+    fast_mode = _mcp_fast_mode()
+    if not fast_mode:
+        for tool_name in CNFINANCIAL_MACRO_TOOLS:
+            raw = _invoke_or_empty(
+                invoker=invoker,
                 server_name=CNFINANCIAL_SERVER,
                 tool_name=tool_name,
+                arguments={},
+                tool_logs=tool_logs,
             )
-        )
+            financial.extend(
+                normalize_mcp_evidence(
+                    raw,
+                    query=tool_name,
+                    server_name=CNFINANCIAL_SERVER,
+                    tool_name=tool_name,
+                )
+            )
 
-    for sector_type in ("\u884c\u4e1a\u8d44\u91d1\u6d41", "\u6982\u5ff5\u8d44\u91d1\u6d41"):
-        raw = _invoke_or_empty(
-            invoker=invoker,
-            server_name=CNFINANCIAL_SERVER,
-            tool_name="get_sector_fund_flow",
-            arguments={"sector_type": sector_type, "indicator": "\u4eca\u65e5"},
-            tool_logs=tool_logs,
-        )
-        financial.extend(
-            normalize_mcp_evidence(
-                raw,
-                query=sector_type,
+        for sector_type in ("\u884c\u4e1a\u8d44\u91d1\u6d41", "\u6982\u5ff5\u8d44\u91d1\u6d41"):
+            raw = _invoke_or_empty(
+                invoker=invoker,
                 server_name=CNFINANCIAL_SERVER,
                 tool_name="get_sector_fund_flow",
+                arguments={"sector_type": sector_type, "indicator": "\u4eca\u65e5"},
+                tool_logs=tool_logs,
             )
-        )
+            financial.extend(
+                normalize_mcp_evidence(
+                    raw,
+                    query=sector_type,
+                    server_name=CNFINANCIAL_SERVER,
+                    tool_name="get_sector_fund_flow",
+                )
+            )
 
     for industry in _selected_sector_names(sector_selection, "selected_industries"):
-        for tool_name in ("get_industry_stocks", "get_industry_pe"):
+        industry_tools = ("get_industry_stocks",) if fast_mode else ("get_industry_stocks", "get_industry_pe")
+        for tool_name in industry_tools:
             raw = _invoke_or_empty(
                 invoker=invoker,
                 server_name=CNFINANCIAL_SERVER,
@@ -441,33 +449,34 @@ def collect_impact_research(
                 )
             )
 
-    for term in _limited(_sector_search_terms(sector_selection, industry_terms), _mcp_int_setting("POLICYCHAIN_MCP_MAX_SEARCH_TERMS", 2, minimum=1)):
-        raw = _invoke_or_empty(
-            invoker=invoker,
-            server_name=CNFINANCIAL_SERVER,
-            tool_name="search_news",
-            arguments={"keyword": term, "num_results": 5},
-            tool_logs=tool_logs,
-        )
-        financial.extend(
-            normalize_mcp_evidence(
-                raw,
-                query=term,
+    if not fast_mode:
+        for term in _limited(_sector_search_terms(sector_selection, industry_terms), _mcp_int_setting("POLICYCHAIN_MCP_MAX_SEARCH_TERMS", 2, minimum=1)):
+            raw = _invoke_or_empty(
+                invoker=invoker,
                 server_name=CNFINANCIAL_SERVER,
                 tool_name="search_news",
-            )
-        )
-
-    for term in _limited(industry_terms, _mcp_int_setting("POLICYCHAIN_MCP_MAX_SEARCH_TERMS", 2, minimum=1)):
-        web.extend(
-            search_web(
-                query=f"{term} industry data statistics association production sales price inventory capacity technology route",
-                source_priority=INDUSTRY_SOURCE_PRIORITY,
-                top_k=top_k,
-                invoker=invoker,
+                arguments={"keyword": term, "num_results": 5},
                 tool_logs=tool_logs,
             )
-        )
+            financial.extend(
+                normalize_mcp_evidence(
+                    raw,
+                    query=term,
+                    server_name=CNFINANCIAL_SERVER,
+                    tool_name="search_news",
+                )
+            )
+
+        for term in _limited(industry_terms, _mcp_int_setting("POLICYCHAIN_MCP_MAX_SEARCH_TERMS", 2, minimum=1)):
+            web.extend(
+                search_web(
+                    query=f"{term} industry data statistics association production sales price inventory capacity technology route",
+                    source_priority=INDUSTRY_SOURCE_PRIORITY,
+                    top_k=top_k,
+                    invoker=invoker,
+                    tool_logs=tool_logs,
+                )
+            )
 
     return {
         "cnfinancial": _dedupe_evidence(financial),
@@ -575,6 +584,9 @@ def collect_company_web_evidence(
     top_k: int = 2,
     tool_logs: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    if _mcp_fast_mode():
+        _append_fast_mode_skip_log(tool_logs, "company_web_evidence")
+        return []
     evidence: list[dict[str, Any]] = []
     for company in company_records:
         name = str(company.get("company_name") or "")
@@ -983,6 +995,33 @@ def _mcp_int_setting(name: str, default: int, minimum: int = 0) -> int:
         return max(int(raw), minimum)
     except ValueError:
         return max(default, minimum)
+
+
+def _mcp_bool_setting(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _mcp_fast_mode() -> bool:
+    return _mcp_bool_setting("POLICYCHAIN_MCP_FAST_MODE")
+
+
+def _append_fast_mode_skip_log(tool_logs: list[dict[str, Any]] | None, tool_name: str) -> None:
+    log_entry = _new_tool_log(
+        server_name="policychain",
+        tool_name=tool_name,
+        arguments={"fast_mode": True},
+    )
+    log_entry.update(
+        {
+            "status": "skipped",
+            "count": 0,
+            "error": "Skipped by POLICYCHAIN_MCP_FAST_MODE",
+        }
+    )
+    _append_tool_log(tool_logs, log_entry)
 
 
 def _mcp_company_enrichment_tools() -> tuple[str, ...]:

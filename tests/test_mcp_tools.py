@@ -9,6 +9,7 @@ from policychain.tools.mcp_tools import (
     OPEN_WEBSEARCH_SEARCH_TOOL,
     OPEN_WEBSEARCH_SERVER,
     collect_company_candidates,
+    collect_company_web_evidence,
     collect_impact_research,
     fetch_web_content,
     search_web,
@@ -171,6 +172,48 @@ class MCPToolsTests(unittest.TestCase):
         self.assertTrue(all(call["arguments"]["industry"] != "ChatGPT\u6982\u5ff5" for call in industry_calls))
         self.assertTrue(any(call["tool_name"] == "search_stock" for call in invoker.calls))
         self.assertTrue(candidates)
+
+    def test_fast_mode_skips_expensive_impact_tools(self) -> None:
+        invoker = FakeMCPInvoker(
+            {
+                (CNFINANCIAL_SERVER, "get_industry_list"): [
+                    {"\u540d\u79f0": "\u8f6f\u4ef6\u5f00\u53d1"},
+                ],
+                (CNFINANCIAL_SERVER, "get_concept_list"): [
+                    {"\u540d\u79f0": "\u4eba\u5de5\u667a\u80fd"},
+                ],
+                (CNFINANCIAL_SERVER, "get_industry_stocks"): [
+                    {"\u540d\u79f0": "\u793a\u4f8b\u79d1\u6280", "\u4ee3\u7801": "300001"},
+                ],
+            }
+        )
+
+        with patch.dict("os.environ", {"POLICYCHAIN_MCP_FAST_MODE": "1"}):
+            research = collect_impact_research({}, [_ai_impact()], invoker=invoker, top_k=1)
+
+        called_tools = [call["tool_name"] for call in invoker.calls]
+        self.assertIn("get_industry_stocks", called_tools)
+        self.assertNotIn("get_industry_pe", called_tools)
+        self.assertNotIn("get_sector_fund_flow", called_tools)
+        self.assertNotIn("get_macro_gdp", called_tools)
+        self.assertNotIn("search_news", called_tools)
+        self.assertNotIn(OPEN_WEBSEARCH_SEARCH_TOOL, called_tools)
+        self.assertEqual(research["web"], [])
+
+    def test_fast_mode_skips_company_web_evidence(self) -> None:
+        invoker = FakeMCPInvoker()
+        tool_logs: list[dict[str, object]] = []
+
+        with patch.dict("os.environ", {"POLICYCHAIN_MCP_FAST_MODE": "1"}):
+            evidence = collect_company_web_evidence(
+                [{"company_name": "\u793a\u4f8b\u79d1\u6280", "stock_code": "300001"}],
+                invoker=invoker,
+                tool_logs=tool_logs,
+            )
+
+        self.assertEqual(evidence, [])
+        self.assertEqual(invoker.calls, [])
+        self.assertTrue(any(log["tool_name"] == "company_web_evidence" and log["status"] == "skipped" for log in tool_logs))
 
     def test_collect_company_candidates_respects_cloud_candidate_budget(self) -> None:
         invoker = FakeMCPInvoker(
