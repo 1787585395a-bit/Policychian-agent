@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import unittest
+from http.client import HTTPConnection
+from http.server import HTTPServer
 from io import BytesIO
 from unittest.mock import patch
 
@@ -17,6 +20,7 @@ from app import (
     _resolve_host,
     _resolve_port,
     _sync_jobs_enabled,
+    PolicyChainRequestHandler,
     render_page,
     run_query,
 )
@@ -78,6 +82,31 @@ class AppTests(unittest.TestCase):
 
         self.assertFalse(_mcp_default_enabled({"POLICYCHAIN_ENABLE_MCP_BY_DEFAULT": "0"}))
         self.assertIn("use_mcp: false", html)
+
+    def test_head_requests_are_ready_for_hf_health_checks(self) -> None:
+        server = HTTPServer(("127.0.0.1", 0), PolicyChainRequestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            host, port = server.server_address
+            for path, expected_content_type in (
+                ("/", "text/html; charset=utf-8"),
+                ("/healthz", "application/json; charset=utf-8"),
+            ):
+                connection = HTTPConnection(host, port, timeout=5)
+                try:
+                    connection.request("HEAD", path)
+                    response = connection.getresponse()
+                    body = response.read()
+                finally:
+                    connection.close()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.getheader("Content-Type"), expected_content_type)
+                self.assertEqual(body, b"")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_render_page_renders_markdown_report_content(self) -> None:
         report = (

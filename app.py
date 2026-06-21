@@ -689,6 +689,16 @@ def render_page(
 
 
 class PolicyChainRequestHandler(BaseHTTPRequestHandler):
+    def do_HEAD(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/healthz":
+            self._send_head("application/json; charset=utf-8")
+            return
+        if parsed.path == "/api/research-status":
+            self._send_head("application/json; charset=utf-8")
+            return
+        self._send_head("text/html; charset=utf-8")
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/healthz":
@@ -751,6 +761,12 @@ class PolicyChainRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def _send_head(self, content_type: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _send_json(self, payload: dict[str, Any], status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
