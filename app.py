@@ -20,6 +20,7 @@ from scripts.run_research import run_research
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+EXAMPLE_REPORT_PATH = PROJECT_ROOT / "docs" / "analysis_result_example.zh-CN.md"
 DEFAULT_POLICY_INPUT = """生成式人工智能服务管理办法
 
 第一条 为促进生成式人工智能健康发展和规范应用，维护国家安全和社会公共利益，制定本办法。
@@ -200,6 +201,15 @@ def render_page(
       justify-content: space-between;
     }}
     .brand {{ font-size: 16px; font-weight: 650; line-height: 1; white-space: nowrap; }}
+    .top-links {{ display: flex; align-items: center; gap: 14px; }}
+    .nav-link {{
+      color: var(--text);
+      text-decoration: none;
+      font-size: 14px;
+      line-height: 1;
+      white-space: nowrap;
+    }}
+    .nav-link:hover {{ text-decoration: underline; }}
     main {{
       max-width: 1060px;
       margin: 0 auto;
@@ -318,6 +328,29 @@ def render_page(
       min-width: 0;
     }}
     .quick:hover {{ border-color: var(--line-strong); background: #fff; }}
+    .example-actions {{
+      width: 100%;
+      max-width: 860px;
+      margin-top: 12px;
+      display: flex;
+      justify-content: center;
+    }}
+    .example-report-link {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 38px;
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 600;
+      line-height: 1;
+      padding: 0 14px;
+      text-decoration: none;
+    }}
+    .example-report-link:hover {{ background: var(--soft); }}
     .status-line, .notice {{
       width: 100%;
       max-width: 860px;
@@ -442,6 +475,16 @@ def render_page(
     .report p {{ margin: 10px 0; color: #1f1f1f; }}
     .report ul, .report ol {{ margin: 8px 0 14px; padding-left: 24px; }}
     .report li {{ margin: 6px 0; padding-left: 2px; }}
+    .report h1, .report h2, .report h3, .report h4, .report h5, .report p, .report li {{
+      overflow-wrap: anywhere;
+      word-break: break-all;
+    }}
+    .report blockquote {{
+      margin: 12px 0;
+      padding: 0 0 0 14px;
+      border-left: 3px solid var(--line);
+      color: var(--muted);
+    }}
     .report strong {{ font-weight: 650; }}
     .empty {{ padding: 26px 0; color: var(--muted); font-size: 15px; line-height: 1.6; }}
     @media (max-width: 720px) {{
@@ -451,6 +494,8 @@ def render_page(
       .hero h1 {{ max-width: 100%; font-size: 30px; line-height: 1.14; word-break: break-all; }}
       .hero p, .composer, .examples, .status-line, .notice, .progress-panel {{ max-width: 100%; }}
       .examples {{ justify-content: flex-start; }}
+      .example-actions {{ justify-content: stretch; max-width: 100%; }}
+      .example-report-link {{ width: 100%; }}
       .quick {{ width: 100%; }}
       .composer-footer {{ align-items: stretch; }}
       .run-button {{ width: 100%; min-width: 0; }}
@@ -465,6 +510,9 @@ def render_page(
   <header>
     <nav class="topbar" aria-label="PolicyChain">
       <div class="brand">PolicyChain</div>
+      <div class="top-links">
+        <a class="nav-link" href="/example-report">示例报告</a>
+      </div>
     </nav>
   </header>
   <main>
@@ -480,6 +528,9 @@ def render_page(
       </form>
       <div class="examples" aria-label="快捷输入">
         {examples}
+      </div>
+      <div class="example-actions">
+        <a class="example-report-link" href="/example-report">查看示例报告</a>
       </div>
       <div class="status-line" id="status-line" role="status" aria-live="polite">{_elapsed_text(elapsed_seconds)}</div>
       <div class="notice">研究辅助，不构成投资建议。默认启用模型分析与外部证据工具；不可用时会在日志和报告中说明。</div>
@@ -688,6 +739,176 @@ def render_page(
     return html.encode("utf-8")
 
 
+def render_example_report_page() -> bytes:
+    try:
+        markdown = _read_example_report_markdown()
+        report_html = _markdown_to_html(markdown)
+        error_html = ""
+    except OSError as exc:
+        report_html = ""
+        error_html = f'<div class="error">示例报告读取失败：{escape(str(exc))}</div>'
+
+    html = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PolicyChain 示例报告</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #ffffff;
+      --soft: #f7f7f8;
+      --text: #101010;
+      --muted: #6e6e73;
+      --line: #dedede;
+      --danger: #b42318;
+    }}
+    * {{ box-sizing: border-box; }}
+    html {{ max-width: 100%; overflow-x: hidden; }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+      letter-spacing: 0;
+      width: 100%;
+      max-width: 100vw;
+      overflow-x: hidden;
+    }}
+    header {{
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.94);
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      backdrop-filter: blur(12px);
+    }}
+    .topbar {{
+      max-width: 1060px;
+      margin: 0 auto;
+      padding: 15px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }}
+    .brand {{ font-size: 16px; font-weight: 650; line-height: 1; white-space: nowrap; }}
+    .back-link {{
+      color: var(--text);
+      text-decoration: none;
+      font-size: 14px;
+      line-height: 1;
+      white-space: nowrap;
+    }}
+    .back-link:hover {{ text-decoration: underline; }}
+    main {{
+      width: 100%;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 48px 24px 72px;
+    }}
+    .page-head {{
+      min-width: 0;
+      max-width: 100%;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 22px;
+      margin-bottom: 26px;
+    }}
+    .page-head h1 {{
+      margin: 0;
+      font-size: clamp(30px, 4vw, 48px);
+      line-height: 1.12;
+      font-weight: 650;
+      letter-spacing: 0;
+    }}
+    .page-head p {{
+      margin: 16px 0 0;
+      max-width: 720px;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.65;
+    }}
+    .error {{
+      margin: 0 0 18px;
+      padding: 14px 16px;
+      color: var(--danger);
+      border: 1px solid #fecdca;
+      background: #fffbfa;
+      border-radius: 8px;
+      line-height: 1.55;
+    }}
+    .report {{
+      min-width: 0;
+      max-width: 100%;
+      line-height: 1.72;
+      overflow-wrap: anywhere;
+      word-break: break-all;
+    }}
+    .report h1 {{ margin: 0 0 18px; font-size: 30px; line-height: 1.2; font-weight: 650; }}
+    .report h2 {{
+      margin: 30px 0 12px;
+      padding-top: 22px;
+      border-top: 1px solid var(--line);
+      font-size: 22px;
+      line-height: 1.35;
+      font-weight: 650;
+    }}
+    .report h3 {{ margin: 22px 0 10px; font-size: 18px; line-height: 1.45; font-weight: 650; }}
+    .report h4 {{ margin: 20px 0 8px; font-size: 16px; line-height: 1.45; font-weight: 650; }}
+    .report h5 {{ margin: 16px 0 8px; font-size: 15px; line-height: 1.45; font-weight: 650; color: #2b2b2b; }}
+    .report p {{ margin: 10px 0; color: #1f1f1f; }}
+    .report ul, .report ol {{ margin: 8px 0 14px; padding-left: 24px; }}
+    .report li {{ margin: 6px 0; padding-left: 2px; }}
+    .report h1, .report h2, .report h3, .report h4, .report h5, .report p, .report li {{
+      overflow-wrap: anywhere;
+      word-break: break-all;
+    }}
+    .report blockquote {{
+      margin: 12px 0;
+      padding: 0 0 0 14px;
+      border-left: 3px solid var(--line);
+      color: var(--muted);
+    }}
+    .report strong {{ font-weight: 650; }}
+    @media (max-width: 720px) {{
+      .topbar {{ padding: 14px 16px; }}
+      main {{ padding: 34px 16px 56px; }}
+      .page-head h1 {{ font-size: 30px; line-height: 1.14; word-break: break-all; }}
+      .page-head p, .report h1, .report h2, .report h3, .report h4, .report h5, .report p, .report li {{
+        overflow-wrap: anywhere;
+        word-break: break-all;
+      }}
+      .report h1 {{ font-size: 24px; }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <nav class="topbar" aria-label="PolicyChain 示例报告">
+      <div class="brand">PolicyChain</div>
+      <a class="back-link" href="/">返回首页</a>
+    </nav>
+  </header>
+  <main>
+    <section class="page-head">
+      <h1>示例报告</h1>
+      <p>以下内容用于展示 PolicyChain 已完成报告的大致形态。示例仅用于政策研究和公司业务匹配说明，不构成任何投资建议。</p>
+    </section>
+    {error_html}
+    <article class="report">
+      {report_html}
+    </article>
+  </main>
+</body>
+</html>"""
+    return html.encode("utf-8")
+
+
+def _read_example_report_markdown() -> str:
+    return EXAMPLE_REPORT_PATH.read_text(encoding="utf-8")
+
+
 class PolicyChainRequestHandler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         parsed = urlparse(self.path)
@@ -708,6 +929,9 @@ class PolicyChainRequestHandler(BaseHTTPRequestHandler):
             params = parse_qs(parsed.query)
             job_id = (params.get("job_id") or [""])[0]
             self._send_json(_job_view(job_id))
+            return
+        if parsed.path == "/example-report":
+            self._send_html(render_example_report_page())
             return
         self._send_html(render_page())
 
@@ -958,6 +1182,13 @@ def _markdown_to_html(markdown: str) -> str:
             close_list()
             level = len(heading.group(1))
             html.append(f"<h{level}>{_render_inline(heading.group(2))}</h{level}>")
+            continue
+
+        quote = re.match(r"^>\s?(.*)$", line)
+        if quote:
+            flush_paragraph()
+            close_list()
+            html.append(f"<blockquote>{_render_inline(quote.group(1))}</blockquote>")
             continue
 
         unordered = re.match(r"^[-*]\s+(.+)$", line)

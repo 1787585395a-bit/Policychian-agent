@@ -17,6 +17,7 @@ from app import (  # noqa: E402
     _health_payload,
     _job_view,
     _payload_bool,
+    render_example_report_page,
     render_page,
     run_query,
 )
@@ -45,6 +46,8 @@ def _handle_get(environ: dict[str, Any], path: str, start_response: StartRespons
         params = parse_qs(str(environ.get("QUERY_STRING") or ""))
         job_id = (params.get("job_id") or [""])[0]
         return _json_response(start_response, _job_view(job_id))
+    if path == "example-report":
+        return _response(start_response, render_example_report_page(), content_type="text/html; charset=utf-8")
     return _response(start_response, render_page(), content_type="text/html; charset=utf-8")
 
 

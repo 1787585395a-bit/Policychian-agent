@@ -21,6 +21,7 @@ from app import (
     _resolve_port,
     _sync_jobs_enabled,
     PolicyChainRequestHandler,
+    render_example_report_page,
     render_page,
     run_query,
 )
@@ -71,6 +72,8 @@ class AppTests(unittest.TestCase):
         self.assertIn('id="copy-log" type="button" disabled', html)
         self.assertIn("/api/research", html)
         self.assertIn("/api/research-status", html)
+        self.assertIn("查看示例报告", html)
+        self.assertIn('href="/example-report"', html)
         self.assertIn("use_llm: true", html)
         self.assertIn("use_mcp: true", html)
         self.assertEqual(len(EXAMPLE_QUERIES), 1)
@@ -92,6 +95,7 @@ class AppTests(unittest.TestCase):
             for path, expected_content_type in (
                 ("/", "text/html; charset=utf-8"),
                 ("/healthz", "application/json; charset=utf-8"),
+                ("/example-report", "text/html; charset=utf-8"),
             ):
                 connection = HTTPConnection(host, port, timeout=5)
                 try:
@@ -103,6 +107,39 @@ class AppTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 self.assertEqual(response.getheader("Content-Type"), expected_content_type)
                 self.assertEqual(body, b"")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_render_example_report_page_contains_completed_report(self) -> None:
+        html = render_example_report_page().decode("utf-8")
+
+        self.assertIn("示例报告", html)
+        self.assertIn("生成式人工智能服务管理暂行办法", html)
+        self.assertIn("不构成任何投资建议", html)
+        self.assertIn("<blockquote>", html)
+        self.assertNotIn("&gt; 本页用于展示", html)
+        self.assertIn('href="/"', html)
+
+    def test_http_handler_serves_example_report_page(self) -> None:
+        server = HTTPServer(("127.0.0.1", 0), PolicyChainRequestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            host, port = server.server_address
+            connection = HTTPConnection(host, port, timeout=5)
+            try:
+                connection.request("GET", "/example-report")
+                response = connection.getresponse()
+                body = response.read().decode("utf-8")
+            finally:
+                connection.close()
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.getheader("Content-Type"), "text/html; charset=utf-8")
+            self.assertIn("示例报告", body)
+            self.assertIn("生成式人工智能服务管理暂行办法", body)
         finally:
             server.shutdown()
             server.server_close()
@@ -307,6 +344,13 @@ class AppTests(unittest.TestCase):
 
         self.assertEqual(status, "200 OK")
         self.assertEqual(json.loads(body.decode("utf-8"))["status"], "ok")
+
+        status, _, body = _call_wsgi(wsgi_app, "GET", "/example-report")
+
+        self.assertEqual(status, "200 OK")
+        decoded = body.decode("utf-8")
+        self.assertIn("示例报告", decoded)
+        self.assertIn("生成式人工智能服务管理暂行办法", decoded)
 
         with patch("api.index._create_job", return_value="job-123"):
             status, _, body = _call_wsgi(
