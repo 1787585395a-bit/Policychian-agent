@@ -8,6 +8,8 @@ app_port: 10000
 
 [中文说明](README.zh-CN.md) | English
 
+Example output: [Analysis Result Example](docs/analysis_result_example.zh-CN.md)
+
 PolicyChain is an Agentic RAG project for policy research. The first-stage codebase focuses on offline policy ingestion: reading policy files, generating stable IDs, extracting metadata, chunking text, and validating the pipeline with tests.
 
 ## Setup
