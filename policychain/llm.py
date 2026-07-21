@@ -187,7 +187,7 @@ class DeepSeekClient:
 
 def create_llm_client(provider: str | None = None) -> LLMClient:
     load_local_env()
-    selected_provider = (provider or os.getenv("POLICYCHAIN_LLM_PROVIDER", "mock")).strip().lower()
+    selected_provider = (provider or os.getenv("POLICYCHAIN_LLM_PROVIDER") or "deepseek").strip().lower()
     if selected_provider == "mock":
         return MockLLMClient()
     if selected_provider == "deepseek":

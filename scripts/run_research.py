@@ -28,7 +28,7 @@ def run_research(
     ensure_sample_db: bool = True,
     rebuild_sample_db: bool = False,
     output_path: str | Path | None = None,
-    use_llm: bool = False,
+    use_llm: bool = True,
     llm_client: LLMClient | None = None,
     mcp_invoker: MCPToolInvoker | None = None,
     progress_callback: Callable[[int, str, str], None] | None = None,
@@ -89,7 +89,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rebuild-sample-db", action="store_true", help="Rebuild the sample database before running.")
     parser.add_argument("--no-ingest", action="store_true", help="Do not auto-build a missing sample database.")
     parser.add_argument("--out", default=None, help="Optional Markdown report output path.")
-    parser.add_argument("--llm", action="store_true", help="Use the optional LLM-backed workflow.")
+    llm_mode = parser.add_mutually_exclusive_group()
+    llm_mode.add_argument(
+        "--llm",
+        dest="use_llm",
+        action="store_true",
+        default=True,
+        help="Use the default DeepSeek-backed workflow (default).",
+    )
+    llm_mode.add_argument(
+        "--no-llm",
+        dest="use_llm",
+        action="store_false",
+        help="Explicitly use the deterministic fallback workflow.",
+    )
     parser.add_argument("--mcp", action="store_true", help="Use real stdio MCP tools from a local MCP config.")
     parser.add_argument("--mcp-config", default=".mcp.local.json", help="Path to local MCP config used with --mcp.")
     parser.add_argument("--mcp-timeout", type=float, default=60, help="Timeout seconds per MCP tool call.")
@@ -130,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
         ensure_sample_db=not args.no_ingest,
         rebuild_sample_db=args.rebuild_sample_db,
         output_path=args.out,
-        use_llm=args.llm,
+        use_llm=args.use_llm,
         mcp_invoker=mcp_invoker,
     )
     print(report)

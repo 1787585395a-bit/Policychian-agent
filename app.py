@@ -73,7 +73,7 @@ PORT = _resolve_port()
 def run_query(
     query: str,
     db_path: str | Path | None = None,
-    use_llm: bool = False,
+    use_llm: bool = True,
     use_mcp: bool = False,
     progress_callback: Any | None = None,
     run_recorder: RunRecorder | None = None,

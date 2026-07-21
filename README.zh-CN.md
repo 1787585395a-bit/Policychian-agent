@@ -22,7 +22,7 @@ https://zengliao-policychain-agent.hf.space
 https://zengliao-policychain-agent.hf.space/healthz
 ```
 
-在线版本默认可以完成确定性分析流程。由于 Hugging Face 免费 CPU 对 stdio MCP 调用较慢，云端默认关闭 MCP。DeepSeek 需要在 Hugging Face Space 的 Secrets 中配置 `DEEPSEEK_API_KEY` 后才会启用模型增强。
+在线版本默认使用 DeepSeek 完成模型分析；必须在 Hugging Face Space 的 Secrets 中配置 `DEEPSEEK_API_KEY`。由于 Hugging Face 免费 CPU 对 stdio MCP 调用较慢，云端默认关闭 MCP。确定性流程仅在 DeepSeek 不可用时作为带日志记录的回退。
 
 ## 用户使用流程
 
@@ -137,7 +137,7 @@ python scripts/run_research.py --full-db --query "粘贴政策正文或政策问
 
 ## DeepSeek 配置
 
-本项目默认可以离线运行。启用 DeepSeek 时，请使用环境变量或平台 Secrets，不要把 API Key 写入代码。
+本项目默认使用 DeepSeek。请使用环境变量或平台 Secrets 配置 API Key，不要把 API Key 写入代码。确定性流程仅作为显式 `--no-llm` 模式或 DeepSeek 不可用时的回退。
 
 本地 PowerShell 示例：
 

@@ -82,10 +82,10 @@ Run against the full local policy database explicitly:
 python scripts/run_research.py --full-db --query "生成式人工智能服务提供者有哪些管理要求"
 ```
 
-Run the optional DeepSeek-backed workflow after configuring `.env.local` or environment variables:
+The CLI uses the DeepSeek-backed workflow by default after `.env.local` or environment variables are configured:
 
 ```powershell
-python scripts/run_research.py --full-db --query "生成式人工智能服务提供者有哪些管理要求" --llm
+python scripts/run_research.py --full-db --query "生成式人工智能服务提供者有哪些管理要求"
 ```
 
 Write the Markdown report to a file:
@@ -96,7 +96,7 @@ python scripts/run_research.py --out artifacts/test-results/sample_report.md
 
 ## DeepSeek LLM Provider
 
-The project defaults to the offline `MockLLMClient`, so tests and local sample workflows do not require network access or an API key.
+The product defaults to DeepSeek. Deterministic analysis is retained only as an explicit `--no-llm` mode and as a recorded fallback when DeepSeek is unavailable. Unit tests inject fake or mock clients and never require a live API call.
 
 To create a DeepSeek client from environment variables:
 
@@ -117,7 +117,7 @@ $env:DEEPSEEK_REASONING_EFFORT='high'
 $env:DEEPSEEK_USE_SYSTEM_PROXY='1'
 ```
 
-`DeepSeekClient` uses the standard-library HTTP stack and calls `/chat/completions`. It ignores system proxy variables by default to avoid local proxy ports breaking API calls; set `DEEPSEEK_USE_SYSTEM_PROXY=1` only when you intentionally want Python to use the system proxy. It is available as a provider boundary only; the deterministic sample Agent workflow is still the default execution path.
+`DeepSeekClient` uses the standard-library HTTP stack and calls `/chat/completions`. It ignores system proxy variables by default to avoid local proxy ports breaking API calls; set `DEEPSEEK_USE_SYSTEM_PROXY=1` only when you intentionally want Python to use the system proxy.
 
 Run the optional LLM Policy Analyst from Python code after configuring a provider:
 
@@ -129,7 +129,7 @@ state = PolicyResearchState(user_query="生成式人工智能服务提供者有�
 run_llm_policy_analyst(state, store)
 ```
 
-The default CLI, web app, and `run_policy_research_workflow` still use the deterministic Policy Analyst.
+The CLI and web app default to the DeepSeek workflow. `run_policy_research_workflow` remains the explicit deterministic fallback API.
 
 The optional LLM Impact Analyst can be run after `state.policy_analysis` and `state.policy_chunks` are populated:
 

@@ -175,9 +175,13 @@ class LLMTests(unittest.TestCase):
 
         self.assertTrue(client.use_system_proxy)
 
-    def test_create_llm_client_defaults_to_mock(self) -> None:
-        with patch.dict("os.environ", {"POLICYCHAIN_DISABLE_DOTENV": "1"}, clear=True):
-            self.assertIsInstance(create_llm_client(), MockLLMClient)
+    def test_create_llm_client_defaults_to_deepseek(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"POLICYCHAIN_DISABLE_DOTENV": "1", "DEEPSEEK_API_KEY": "default-key"},
+            clear=True,
+        ):
+            self.assertIsInstance(create_llm_client(), DeepSeekClient)
 
     def test_create_llm_client_can_read_local_env_file(self) -> None:
         temp_dir = _workspace_temp_dir()

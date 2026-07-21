@@ -186,16 +186,16 @@ class AppTests(unittest.TestCase):
         self.assertIn("数据库不可用", html)
         self.assertIn('class="error"', html)
 
-    def test_run_query_returns_report(self) -> None:
-        result = run_query(DEFAULT_POLICY_INPUT, db_path=artifact_db_path("app_query"))
+    def test_run_query_can_explicitly_use_deterministic_fallback(self) -> None:
+        result = run_query(DEFAULT_POLICY_INPUT, db_path=artifact_db_path("app_query"), use_llm=False)
 
         self.assertIn("PolicyChain", result["report"])
         self.assertGreaterEqual(result["elapsed_seconds"], 0)
         self.assertFalse(result["use_llm"])
 
-    def test_run_query_can_request_llm_mode(self) -> None:
+    def test_run_query_defaults_to_llm_mode(self) -> None:
         with patch("app.run_research", return_value="# PolicyChain 政策研究报告") as fake_runner:
-            result = run_query("测试政策正文", db_path=":memory:", use_llm=True)
+            result = run_query("测试政策正文", db_path=":memory:")
 
         self.assertTrue(result["use_llm"])
         self.assertEqual(result["report"], "# PolicyChain 政策研究报告")
@@ -259,8 +259,8 @@ class AppTests(unittest.TestCase):
         self.assertFalse(result["use_mcp"])
         self.assertIn("运行环境提示", result["report"])
         self.assertTrue(result["fallback_used"])
-        self.assertEqual(result["requested_run_mode"], "deterministic")
-        self.assertEqual(result["effective_run_mode"], "deterministic")
+        self.assertEqual(result["requested_run_mode"], "llm")
+        self.assertEqual(result["effective_run_mode"], "llm")
         self.assertTrue(any(stage == "MCP 初始化" for _, stage, _ in progress_events))
         self.assertIsNone(fake_runner.call_args.kwargs["mcp_invoker"])
 
