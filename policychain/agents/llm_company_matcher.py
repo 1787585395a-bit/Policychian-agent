@@ -4,9 +4,10 @@ import json
 import re
 from typing import Any, Iterable
 
-from policychain.agents.company_matcher import audit_company_match_output, match_candidate_records_to_impacts
-from policychain.llm import LLMClient, create_llm_client
+from policychain.agents.company_matcher import audit_company_match_output, match_candidate_records_to_impacts, resolve_company_match_limit
+from policychain.llm import LLMClient, create_llm_client, observed_llm_generate
 from policychain.mcp import MCPToolInvoker, consume_mcp_invoker_errors, is_unavailable_invoker
+from policychain.observability import record_event
 from policychain.prompts import render_prompt
 from policychain.schemas.agent_outputs import CompanyMatchOutput
 from policychain.state import PolicyResearchState
@@ -14,6 +15,7 @@ from policychain.structured_output import parse_structured_output
 from policychain.tools import (
     collect_company_candidates,
     collect_company_web_evidence,
+    merge_react_company_candidates,
     run_company_react_search,
 )
 from policychain.tools.mcp_tools import mcp_unavailable_uncertainty
@@ -31,6 +33,8 @@ def run_llm_company_matcher(
 ) -> CompanyMatchOutput:
     """Run the optional LLM Company Matcher over retrieved company candidates."""
 
+    top_k_per_industry = resolve_company_match_limit(top_k_per_industry)
+
     if not state.industry_impacts:
         output = CompanyMatchOutput(uncertainties=["缺少行业影响分析，无法生成公司业务匹配清单。"])
         _write_state(state, output, candidates=[], coverage=[], audit_logs=[])
@@ -43,7 +47,44 @@ def run_llm_company_matcher(
         mcp_invoker=mcp_invoker,
         tool_logs=tool_logs,
     )
-    state.tool_call_logs.extend(tool_logs)
+    client = llm_client or create_llm_client()
+    react_evidence: list[dict[str, Any]] = []
+    react_candidate_audit: list[dict[str, Any]] = []
+    if not is_unavailable_invoker(mcp_invoker):
+        for impact_index, impact in enumerate(state.industry_impacts, start=1):
+            impact_id = str(impact.get("impact_id") or f"IMP-{impact_index:03d}")
+            scoped_records = [
+                record
+                for record in company_records
+                if impact_id in (record.get("impact_ids") or [])
+            ]
+            react_query = _company_react_query([impact], scoped_records)
+            react_run = run_company_react_search(
+                react_query,
+                invoker=mcp_invoker,
+                llm_client=client,
+                impact=impact,
+                impact_id=impact_id,
+                tool_logs=tool_logs,
+            )
+            state.react_traces.extend(_tag_react_traces("company", react_run.traces, impact_id=impact_id))
+            react_evidence = _merge_external_evidence(react_evidence, react_run.evidence)
+        company_records, react_candidate_audit = merge_react_company_candidates(
+            company_records,
+            state.industry_impacts,
+            react_evidence,
+            invoker=mcp_invoker,
+            tool_logs=tool_logs,
+        )
+    state.react_candidate_audit = react_candidate_audit
+    for item in react_candidate_audit:
+        record_event(
+            "react.candidate",
+            stage="company_matcher",
+            status=str(item.get("decision") or ""),
+            **item,
+        )
+    state.tool_call_logs = _merge_tool_logs(state.tool_call_logs, tool_logs)
     if not company_records:
         output = CompanyMatchOutput(uncertainties=["未从 CNFinancial/Web 检索到可用于业务匹配的候选公司。"])
         _matches, coverage, audit_logs = match_candidate_records_to_impacts(
@@ -54,14 +95,9 @@ def run_llm_company_matcher(
         _write_state(state, output, candidates=[], coverage=coverage, audit_logs=audit_logs)
         return output
 
-    client = llm_client or create_llm_client()
     company_web_evidence = collect_company_web_evidence(company_records, invoker=mcp_invoker, tool_logs=tool_logs)
+    company_web_evidence = _merge_external_evidence(company_web_evidence, react_evidence)
     state.tool_call_logs = _merge_tool_logs(state.tool_call_logs, tool_logs)
-    if not is_unavailable_invoker(mcp_invoker):
-        react_query = _company_react_query(state.industry_impacts, company_records)
-        react_run = run_company_react_search(react_query, invoker=mcp_invoker, llm_client=client)
-        state.react_traces.extend(_tag_react_traces("company", react_run.traces))
-        company_web_evidence = _merge_external_evidence(company_web_evidence, react_run.evidence)
     state.company_research = company_web_evidence
     state.external_evidence = _merge_external_evidence(
         state.external_evidence,
@@ -83,7 +119,7 @@ def run_llm_company_matcher(
         company_records=_json_for_prompt(company_records),
         web_evidence=_json_for_prompt(company_web_evidence),
     )
-    raw_output = client.generate(prompt["system"], prompt["user"])
+    raw_output = observed_llm_generate(client, prompt["system"], prompt["user"], agent="company_matcher")
     output = parse_structured_output(raw_output, prompt["output_schema_name"])
     if not isinstance(output, CompanyMatchOutput):
         raise LLMCompanyMatchError("LLM Company Matcher returned an unexpected output schema")
@@ -153,6 +189,8 @@ def _merge_external_evidence(existing: list[dict[str, Any]], new_items: list[dic
     merged: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for item in [*existing, *new_items]:
+        if str(item.get("tool_name") or "") in {"get_industry_list", "get_concept_list"}:
+            continue
         key = (
             str(item.get("server_name") or item.get("stock_code") or ""),
             str(item.get("tool_name") or item.get("data_date") or ""),
@@ -191,8 +229,12 @@ def _company_react_query(industry_impacts: list[dict[str, Any]], company_records
     return " ".join(part for part in parts if part).strip()[:500] or "A-share company business evidence"
 
 
-def _tag_react_traces(stage: str, traces: list[dict[str, object]]) -> list[dict[str, object]]:
-    return [{"stage": stage, **trace} for trace in traces]
+def _tag_react_traces(
+    stage: str,
+    traces: list[dict[str, object]],
+    impact_id: str = "",
+) -> list[dict[str, object]]:
+    return [{"stage": stage, "impact_id": impact_id, **trace} for trace in traces]
 
 
 def _unique(values: Iterable[str]) -> list[str]:

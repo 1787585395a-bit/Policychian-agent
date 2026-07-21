@@ -4,7 +4,8 @@ import json
 import re
 from typing import Any
 
-from policychain.llm import LLMClient
+from policychain.llm import LLMClient, observed_llm_generate
+from policychain.observability import current_run_recorder, record_event
 from policychain.prompts import render_prompt
 from policychain.safety import assert_no_investment_advice
 from policychain.state import PolicyResearchState
@@ -37,6 +38,7 @@ def write_research_report(state: PolicyResearchState) -> str:
     ).strip()
     assert_no_investment_advice(report, context="Report")
     state.final_report = report
+    record_event("report.source", stage="report_writer", status="ok", source="deterministic_rules")
     return report
 
 
@@ -70,7 +72,9 @@ def write_llm_research_report(state: PolicyResearchState, llm_client: LLMClient)
             evidence=_json_for_prompt(_reference_payload(state)),
             uncertainties=_json_for_prompt(state.uncertainties),
         )
-        body = _strip_reference_sections(llm_client.generate(prompt["system"], prompt["user"]))
+        body = _strip_reference_sections(
+            observed_llm_generate(llm_client, prompt["system"], prompt["user"], agent="report_writer")
+        )
         if not body.strip():
             raise ReportWriterError("LLM Report Writer returned an empty report")
         body = _ensure_impact_coverage(body.strip(), state)
@@ -83,8 +87,12 @@ def write_llm_research_report(state: PolicyResearchState, llm_client: LLMClient)
         ).strip()
         assert_no_investment_advice(report, context="LLM report")
         state.final_report = report
+        record_event("report.source", stage="report_writer", status="ok", source="llm")
         return report
     except Exception as exc:
+        recorder = current_run_recorder()
+        if recorder is not None:
+            recorder.mark_fallback("report_writer", str(exc)[:300], "deterministic_report_writer")
         state.uncertainties = _unique(
             [
                 *state.uncertainties,
@@ -436,12 +444,16 @@ def _compact_tool_logs(tool_logs: list[dict[str, Any]], limit: int) -> list[str]
 
 def _compact_react_traces(react_traces: list[dict[str, Any]], limit: int) -> list[str]:
     output = []
-    for trace in react_traces[:limit]:
+    for trace in react_traces:
+        if _is_catalog_tool(str(trace.get("action") or "")):
+            continue
         stage = trace.get("stage") or "react"
         action = trace.get("action") or "unknown"
         count = trace.get("evidence_count")
         detail = trace.get("error") or trace.get("observation") or trace.get("message") or ""
         output.append(f"{stage}.{action} -> count={count}; {_clip(str(detail), 100)}")
+        if len(output) >= limit:
+            break
     return output
 
 
@@ -452,6 +464,8 @@ def _prioritize_external_evidence(external_evidence: list[dict[str, Any]]) -> li
         "other": [],
     }
     for item in external_evidence:
+        if _is_catalog_tool(str(item.get("tool_name") or "")):
+            continue
         server = str(item.get("server_name") or item.get("source_name") or "").lower()
         grouped[server if server in grouped else "other"].append(item)
 
@@ -463,7 +477,17 @@ def _prioritize_external_evidence(external_evidence: list[dict[str, Any]]) -> li
 
 def _prioritize_tool_logs(tool_logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     order = {"cn-financial": 0, "policychain": 1, "web-search": 2}
-    return sorted(tool_logs, key=lambda item: order.get(str(item.get("server_name") or ""), 9))
+    visible = [
+        item
+        for item in tool_logs
+        if not item.get("internal_only") and not _is_catalog_tool(str(item.get("tool_name") or ""))
+    ]
+    return sorted(visible, key=lambda item: order.get(str(item.get("server_name") or ""), 9))
+
+
+def _is_catalog_tool(tool_name: str) -> bool:
+    normalized = tool_name.rsplit(".", 1)[-1]
+    return normalized in {"get_industry_list", "get_concept_list"}
 
 
 def _strip_reference_sections(text: str) -> str:

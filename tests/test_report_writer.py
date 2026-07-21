@@ -188,7 +188,8 @@ class ReportWriterTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 1)
         self.assertIn("模型自行组织的政策研究说明", report)
         self.assertIn("参考资料与工具依据", report)
-        self.assertIn("cn-financial.get_industry_list", report)
+        self.assertNotIn("cn-financial.get_industry_list", report)
+        self.assertNotIn("行业列表", client.calls[0][1])
         self.assertEqual(state.final_report, report)
 
 

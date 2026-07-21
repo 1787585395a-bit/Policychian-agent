@@ -11,6 +11,7 @@ from policychain.tools.mcp_tools import (
     collect_impact_research,
     collect_policy_web_evidence,
     fetch_web_content,
+    merge_react_company_candidates,
     search_web,
 )
 from policychain.tools.policy_tools import (
@@ -39,6 +40,7 @@ __all__ = [
     "fetch_web_content",
     "get_policy_metadata",
     "load_mock_companies",
+    "merge_react_company_candidates",
     "read_company_source",
     "read_policy_content",
     "run_company_react_search",

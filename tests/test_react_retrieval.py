@@ -67,7 +67,7 @@ class ReActRetrievalTests(unittest.TestCase):
 
         self.assertIsInstance(tools, list)
 
-    def test_impact_react_search_runs_cnfinancial_required_probes_first(self) -> None:
+    def test_impact_react_search_keeps_full_sector_catalogs_out_of_react_context(self) -> None:
         invoker = FakeMCPInvoker(
             {
                 (CNFINANCIAL_SERVER, "get_industry_list"): [{"name": "软件开发"}],
@@ -79,15 +79,10 @@ class ReActRetrievalTests(unittest.TestCase):
 
         result = run_impact_react_search("人工智能安全评估", invoker=invoker, llm_client=planner, max_steps=1)
 
-        self.assertEqual(
-            [call["tool_name"] for call in invoker.calls[:3]],
-            ["get_industry_list", "get_concept_list", "search_news"],
-        )
-        self.assertEqual([trace["action"] for trace in result.traces[:3]], [
-            "cnfinancial.get_industry_list",
-            "cnfinancial.get_concept_list",
-            "cnfinancial.search_news",
-        ])
+        self.assertEqual([call["tool_name"] for call in invoker.calls], ["search_news"])
+        self.assertEqual(result.traces[0]["action"], "cnfinancial.search_news")
+        self.assertNotIn("get_industry_list", planner.prompts[0][1])
+        self.assertNotIn("get_concept_list", planner.prompts[0][1])
         self.assertTrue(result.evidence)
 
 

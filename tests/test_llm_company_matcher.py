@@ -43,7 +43,7 @@ class LLMCompanyMatcherTests(unittest.TestCase):
             self.assertGreaterEqual(len(state.company_candidates), 1)
             self.assertEqual(state.company_matches[0]["company_name"], "清源模型安全科技")
             self.assertTrue(state.uncertainties)
-            self.assertEqual(len(client.calls), 2)
+            self.assertEqual(len(client.calls), len(state.industry_impacts) + 1)
         finally:
             store.close()
 
@@ -97,7 +97,7 @@ class LLMCompanyMatcherTests(unittest.TestCase):
 
     def test_run_llm_company_matcher_rejects_malformed_json(self) -> None:
         store = build_sample_store()
-        client = RecordingLLMClient([_react_finish(), "not json"])
+        client = RecordingLLMClient([*[_react_finish()] * 5, "not json"])
         try:
             state = _state_with_industry_impacts(store)
 
@@ -110,7 +110,7 @@ class LLMCompanyMatcherTests(unittest.TestCase):
         payload = _company_payload()
         payload["companies"][0]["company_name"] = "不存在的公司"
         store = build_sample_store()
-        client = RecordingLLMClient([_react_finish(), json.dumps(payload, ensure_ascii=False)])
+        client = RecordingLLMClient([*[_react_finish()] * 5, json.dumps(payload, ensure_ascii=False)])
         try:
             state = _state_with_industry_impacts(store)
 
@@ -159,7 +159,7 @@ def _react_finish() -> str:
 
 
 def _company_llm_client() -> RecordingLLMClient:
-    return RecordingLLMClient([_react_finish(), json.dumps(_company_payload(), ensure_ascii=False)])
+    return RecordingLLMClient([*[_react_finish()] * 5, json.dumps(_company_payload(), ensure_ascii=False)])
 
 
 def _fake_company_invoker() -> FakeMCPInvoker:

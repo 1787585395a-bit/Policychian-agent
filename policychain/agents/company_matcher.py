@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from datetime import datetime, timezone
+import os
 import re
 from typing import Any
 
 from policychain.mcp import MCPToolInvoker, consume_mcp_invoker_errors, is_unavailable_invoker
+from policychain.observability import record_event
 from policychain.safety import assert_no_investment_advice
 from policychain.schemas.agent_outputs import CompanyEvidence, CompanyMatch, CompanyMatchOutput
 from policychain.state import PolicyResearchState
@@ -77,6 +79,8 @@ def run_company_matcher(
 ) -> CompanyMatchOutput:
     """Run deterministic company-business matching from industry impacts."""
 
+    top_k_per_industry = resolve_company_match_limit(top_k_per_industry)
+
     output = match_companies_for_impacts(
         industry_impacts=state.industry_impacts,
         top_k_per_industry=top_k_per_industry,
@@ -111,6 +115,7 @@ def match_companies_for_impacts(
     top_k_per_industry: int = DEFAULT_MAX_COMPANIES_PER_IMPACT,
     mcp_invoker: MCPToolInvoker | None = None,
 ) -> CompanyMatchOutput:
+    top_k_per_industry = resolve_company_match_limit(top_k_per_industry)
     if not industry_impacts:
         return CompanyMatchOutput(uncertainties=["缺少行业影响分析，无法生成公司业务匹配清单。"])
 
@@ -161,6 +166,8 @@ def audit_company_match_output(
 ) -> CompanyMatchOutput:
     """Bind LLM company matches to concrete impact paths and audit relevance."""
 
+    top_k_per_industry = resolve_company_match_limit(top_k_per_industry)
+
     candidate_by_name = _candidate_index(candidate_records)
     audited: list[CompanyMatch] = []
     audit_logs: list[dict[str, Any]] = []
@@ -200,12 +207,15 @@ def match_candidate_records_to_impacts(
     candidate_records: list[dict[str, Any]],
     top_k_per_industry: int = DEFAULT_MAX_COMPANIES_PER_IMPACT,
 ) -> tuple[list[CompanyMatch], list[dict[str, Any]], list[dict[str, Any]]]:
+    top_k_per_industry = resolve_company_match_limit(top_k_per_industry)
     matches: list[CompanyMatch] = []
     audit_logs: list[dict[str, Any]] = []
 
     for impact_index, impact in enumerate(industry_impacts, start=1):
         scoped: list[CompanyMatch] = []
         for record in candidate_records:
+            if not _candidate_is_for_impact(record, _impact_id(impact_index)):
+                continue
             status = _audit_candidate_against_impact(record, impact)
             provisional = _build_company_match(record, impact_index, impact, status)
             audit_logs.append(_audit_log_entry(provisional, status, impact_index, impact))
@@ -416,9 +426,10 @@ def _build_coverage_matrix(
         impact_id = _impact_id(index)
         scoped_matches = [match for match in matches if match.impact_id == impact_id]
         scoped_audits = [item for item in audit_logs if item.get("impact_id") == impact_id]
+        scoped_candidates = [record for record in candidate_records if _candidate_is_for_impact(record, impact_id)]
         rejected_count = sum(1 for item in scoped_audits if item.get("decision") == "reject")
         no_match_reason = ""
-        if not candidate_records:
+        if not scoped_candidates:
             no_match_reason = "CNFinancial 未返回可用于该路径的 A 股候选公司。"
         elif not scoped_matches:
             no_match_reason = "候选公司未通过业务相关性审查，或缺少主营业务/产品服务证据。"
@@ -431,7 +442,7 @@ def _build_coverage_matrix(
                 "chain_segment": str(impact.get("chain_segment") or ""),
                 "business_variables": list(impact.get("business_variables") or []),
                 "affected_company_types": list(impact.get("affected_company_types") or []),
-                "candidate_count": len(candidate_records),
+                "candidate_count": len(scoped_candidates),
                 "passed_count": len(scoped_matches),
                 "rejected_count": rejected_count,
                 "company_names": [match.company_name for match in scoped_matches],
@@ -447,7 +458,7 @@ def _audit_log_entry(
     impact_index: int,
     impact: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
+    entry = {
         "time": datetime.now(timezone.utc).isoformat(),
         "impact_id": _impact_id(impact_index),
         "industry": str(impact.get("industry") or ""),
@@ -460,6 +471,8 @@ def _audit_log_entry(
         "shared_terms": list(status.get("shared_terms") or []),
         "reason": status["reason"],
     }
+    record_event("rule.company_audit", stage="company_matcher", status=str(status["decision"]), **entry)
+    return entry
 
 
 def _audit_tool_logs(coverage: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -552,6 +565,16 @@ def _candidate_index(candidate_records: list[dict[str, Any]]) -> dict[tuple[str,
     return output
 
 
+def _candidate_is_for_impact(record: dict[str, Any], impact_id: str) -> bool:
+    impact_ids = {str(value) for value in record.get("impact_ids") or [] if value}
+    impact_ids.update(
+        str(item.get("impact_id") or "")
+        for item in record.get("provenance") or []
+        if isinstance(item, dict) and item.get("impact_id")
+    )
+    return not impact_ids or impact_id in impact_ids
+
+
 def _company_key(name: str, code: str) -> tuple[str, str]:
     return (re.sub(r"\s+", "", name), re.sub(r"\s+", "", code))
 
@@ -636,6 +659,16 @@ def _match_level(confidence: float) -> str:
     return "low"
 
 
+def resolve_company_match_limit(requested: int = DEFAULT_MAX_COMPANIES_PER_IMPACT) -> int:
+    raw = os.getenv("POLICYCHAIN_MAX_COMPANY_MATCHES_PER_IMPACT")
+    if raw and raw.strip():
+        try:
+            return max(int(raw), 1)
+        except ValueError:
+            pass
+    return max(int(requested), 1)
+
+
 def _dedupe_matches(matches: list[CompanyMatch]) -> list[CompanyMatch]:
     seen: set[tuple[str, str, str]] = set()
     output: list[CompanyMatch] = []
@@ -651,6 +684,8 @@ def _merge_external_evidence(existing: list[dict[str, Any]], new_items: list[dic
     merged: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for item in [*existing, *new_items]:
+        if str(item.get("tool_name") or "") in {"get_industry_list", "get_concept_list"}:
+            continue
         key = (
             str(item.get("server_name") or item.get("stock_code") or ""),
             str(item.get("tool_name") or item.get("data_date") or ""),

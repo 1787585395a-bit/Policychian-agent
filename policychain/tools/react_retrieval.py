@@ -5,6 +5,8 @@ import json
 from typing import Any, Callable, Protocol
 
 from policychain.mcp import MCPToolInvoker
+from policychain.llm import observed_llm_generate
+from policychain.observability import record_event
 
 
 class ReActLLMClient(Protocol):
@@ -76,6 +78,7 @@ def run_react_retrieval(
         try:
             raw_observation = tool_map[action].run(arguments)
             tool_evidence = _evidence_items(raw_observation)
+            tool_evidence = _tag_react_evidence(tool_evidence, action=action, step=step_index)
             evidence.extend(tool_evidence)
             observation_summary = _observation_summary(raw_observation)
             observations.append(f"{action}: {observation_summary}")
@@ -101,6 +104,13 @@ def run_react_retrieval(
             )
             break
 
+    for trace in traces:
+        record_event(
+            "react.step",
+            stage="react_retrieval",
+            status="error" if trace.get("error") else "ok",
+            **trace,
+        )
     return ReActRun(evidence=_dedupe_evidence(evidence), traces=traces)
 
 
@@ -182,8 +192,6 @@ def run_impact_react_search(
         return normalize_mcp_evidence(raw, query=query, server_name=CNFINANCIAL_SERVER, tool_name=tool_name)
 
     tools = [
-        ReActTool("cnfinancial.get_industry_list", "List A-share industries available through CNFinancial.", lambda args: cnfinancial("get_industry_list", {})),
-        ReActTool("cnfinancial.get_concept_list", "List A-share concepts available through CNFinancial.", lambda args: cnfinancial("get_concept_list", {})),
         ReActTool("cnfinancial.search_news", "Search industry news through CNFinancial.", lambda args: cnfinancial("search_news", {"keyword": str(args.get("query") or query), "num_results": int(args.get("top_k") or top_k)})),
         ReActTool("web.search", "Search government, statistics, association, and authoritative industry evidence.", lambda args: search_web(str(args.get("query") or query), source_priority=INDUSTRY_SOURCE_PRIORITY, top_k=int(args.get("top_k") or top_k), invoker=invoker)),
     ]
@@ -191,8 +199,6 @@ def run_impact_react_search(
         goal=query,
         tools=tools,
         required_actions=[
-            ("cnfinancial.get_industry_list", {}),
-            ("cnfinancial.get_concept_list", {}),
             ("cnfinancial.search_news", {"query": query, "top_k": top_k}),
         ],
     )
@@ -211,32 +217,96 @@ def run_company_react_search(
     llm_client: ReActLLMClient,
     top_k: int = 3,
     max_steps: int = 3,
+    impact: dict[str, Any] | None = None,
+    impact_id: str = "",
+    tool_logs: list[dict[str, Any]] | None = None,
 ) -> ReActRun:
     from policychain.tools.mcp_tools import (
         CNFINANCIAL_SERVER,
         COMPANY_SOURCE_PRIORITY,
         normalize_mcp_evidence,
         search_web,
-        _invoke_or_empty,
+        _invoke_with_log,
+        _append_sector_selection_log,
+        _industry_terms,
         _load_cnfinancial_sector_catalogs,
         _sector_search_terms,
         _select_cnfinancial_sectors,
         _selected_sector_names,
     )
 
-    industry_catalog, concept_catalog = _load_cnfinancial_sector_catalogs(invoker)
+    industry_catalog, concept_catalog = _load_cnfinancial_sector_catalogs(invoker, tool_logs)
+    if tool_logs is not None:
+        for log in tool_logs[-2:]:
+            log["internal_only"] = True
+            log["impact_id"] = impact_id
+    scoped_impact = impact or {"industry": query, "chain_segment": query}
+    terms = _industry_terms({}, [scoped_impact]) or [query]
     sector_selection = _select_cnfinancial_sectors(
-        terms=[query],
-        industry_impacts=[],
+        terms=terms,
+        industry_impacts=[scoped_impact],
         industry_catalog=industry_catalog,
         concept_catalog=concept_catalog,
     )
+    sector_selection["impact_id"] = impact_id
+    _append_sector_selection_log(tool_logs, sector_selection, impact_id=impact_id)
     legal_industries = _selected_sector_names(sector_selection, "selected_industries")
     search_terms = _sector_search_terms(sector_selection, [query])
 
     def cnfinancial(tool_name: str, arguments: dict[str, Any]) -> list[dict[str, Any]]:
-        raw = _invoke_or_empty(invoker, CNFINANCIAL_SERVER, tool_name, arguments)
-        return normalize_mcp_evidence(raw, query=query, server_name=CNFINANCIAL_SERVER, tool_name=tool_name)
+        raw, call_log = _invoke_with_log(
+            invoker,
+            CNFINANCIAL_SERVER,
+            tool_name,
+            arguments,
+            tool_logs=tool_logs,
+            log_context={"stage": "company_matcher", "impact_id": impact_id, "source_type": "react"},
+        )
+        call_query = str(arguments.get("keyword") or arguments.get("industry") or query)
+        evidence = [
+            {
+                **item,
+                "impact_id": impact_id,
+                "source_type": "cnfinancial_react",
+                "tool_call_id": str(call_log.get("tool_call_id") or ""),
+            }
+            for item in normalize_mcp_evidence(raw, query=call_query, server_name=CNFINANCIAL_SERVER, tool_name=tool_name)
+        ]
+        for item in evidence:
+            raw_item = item.get("raw_payload") if isinstance(item.get("raw_payload"), dict) else {}
+            company_name = str(
+                raw_item.get("company_name")
+                or raw_item.get("name")
+                or raw_item.get("stock_name")
+                or raw_item.get("名称")
+                or raw_item.get("股票简称")
+                or raw_item.get("证券简称")
+                or item.get("title")
+                or ""
+            )
+            stock_code = str(
+                raw_item.get("stock_code")
+                or raw_item.get("code")
+                or raw_item.get("symbol")
+                or raw_item.get("代码")
+                or raw_item.get("股票代码")
+                or raw_item.get("证券代码")
+                or ""
+            )
+            item["company_name"] = company_name
+            item["stock_code"] = stock_code
+            record_event(
+                "mcp.call",
+                stage="company_matcher",
+                status="result",
+                impact_id=impact_id,
+                company_name=company_name,
+                stock_code=stock_code,
+                tool=tool_name,
+                tool_call_id=str(call_log.get("tool_call_id") or ""),
+                source_type="cnfinancial_react",
+            )
+        return evidence
 
     def industry_stocks(arguments: dict[str, Any]) -> list[dict[str, Any]]:
         industry = str(arguments.get("industry") or arguments.get("query") or "")
@@ -265,7 +335,12 @@ def run_company_react_search(
         llm_client=llm_client,
         max_steps=max_steps,
     )
-    return _merge_react_runs(required_run, planned_run)
+    merged = _merge_react_runs(required_run, planned_run)
+    for item in merged.evidence:
+        item.setdefault("impact_id", impact_id)
+        if str(item.get("server_name") or "") == "web-search":
+            item.setdefault("source_type", "web_react")
+    return merged
 
 
 def _run_required_tools(
@@ -290,7 +365,11 @@ def _run_required_tools(
             continue
         try:
             raw_observation = tool.run(arguments)
-            tool_evidence = _evidence_items(raw_observation)
+            tool_evidence = _tag_react_evidence(
+                _evidence_items(raw_observation),
+                action=action,
+                step=f"required-{index}",
+            )
             evidence.extend(tool_evidence)
             traces.append(
                 {
@@ -312,6 +391,13 @@ def _run_required_tools(
                     "error": str(exc),
                 }
             )
+    for trace in traces:
+        record_event(
+            "react.step",
+            stage="react_retrieval",
+            status="error" if trace.get("error") else "ok",
+            **trace,
+        )
     return ReActRun(evidence=_dedupe_evidence(evidence), traces=traces)
 
 
@@ -320,6 +406,10 @@ def _merge_react_runs(first: ReActRun, second: ReActRun) -> ReActRun:
         evidence=_dedupe_evidence([*first.evidence, *second.evidence]),
         traces=[*first.traces, *second.traces],
     )
+
+
+def _tag_react_evidence(items: list[dict[str, Any]], *, action: str, step: str | int) -> list[dict[str, Any]]:
+    return [{**item, "react_action": action, "react_step": step} for item in items]
 
 
 def _next_decision(
@@ -341,7 +431,7 @@ def _next_decision(
         f"Previous observations:\n{json.dumps(observations, ensure_ascii=False, indent=2)}\n\n"
         "Return the next retrieval decision as JSON."
     )
-    raw = llm_client.generate(system_prompt, user_prompt)
+    raw = observed_llm_generate(llm_client, system_prompt, user_prompt, agent="react_retrieval")
     return _parse_json_object(raw)
 
 
@@ -408,9 +498,17 @@ def _dedupe_evidence(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     for item in items:
         key = (
-            str(item.get("server_name") or item.get("source_name") or ""),
+            str(item.get("impact_id") or item.get("server_name") or item.get("source_name") or ""),
             str(item.get("tool_name") or ""),
-            str(item.get("source_url") or item.get("title") or item.get("company_name") or item.get("query") or ""),
+            str(
+                item.get("stock_code")
+                or (item.get("raw_payload") or {}).get("stock_code")
+                or item.get("source_url")
+                or item.get("title")
+                or item.get("company_name")
+                or item.get("query")
+                or ""
+            ),
         )
         if key not in seen:
             seen.add(key)
