@@ -5,6 +5,7 @@ import re
 from typing import Any, Callable, TypeVar
 
 from policychain.safety import assert_no_investment_advice
+from policychain.observability import record_event
 from policychain.schemas.agent_outputs import (
     CompanyEvidence,
     CompanyMatch,
@@ -52,10 +53,21 @@ def parse_json_object(text: str) -> dict[str, Any]:
 def parse_structured_output(text: str, schema_name: str) -> Any:
     """Parse and validate an LLM response against a supported output schema."""
 
-    assert_no_investment_advice(text, context=f"{schema_name} raw output")
-    payload = parse_json_object(text)
-    output = validate_structured_payload(payload, schema_name)
-    assert_no_investment_advice(output.to_dict(), context=schema_name)
+    try:
+        assert_no_investment_advice(text, context=f"{schema_name} raw output")
+        payload = parse_json_object(text)
+        output = validate_structured_payload(payload, schema_name)
+        assert_no_investment_advice(output.to_dict(), context=schema_name)
+    except Exception as exc:
+        record_event(
+            "schema.validation",
+            stage=schema_name,
+            status="error",
+            schema=schema_name,
+            error=f"{exc.__class__.__name__}: {str(exc)[:300]}",
+        )
+        raise
+    record_event("schema.validation", stage=schema_name, status="ok", schema=schema_name)
     return output
 
 

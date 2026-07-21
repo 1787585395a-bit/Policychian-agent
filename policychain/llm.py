@@ -5,11 +5,13 @@ import json
 import os
 from pathlib import Path
 import socket
+from time import perf_counter
 from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from policychain.safety import assert_no_investment_advice
+from policychain.observability import record_event
 
 
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -191,6 +193,66 @@ def create_llm_client(provider: str | None = None) -> LLMClient:
     if selected_provider == "deepseek":
         return DeepSeekClient.from_env()
     raise LLMConfigurationError(f"Unsupported LLM provider: {selected_provider}")
+
+
+def observed_llm_generate(
+    client: LLMClient,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    agent: str,
+    prompt_version: str = "v1",
+) -> str:
+    provider = _llm_provider_name(client)
+    model = str(getattr(client, "model", client.__class__.__name__))
+    started = perf_counter()
+    record_event(
+        "llm.call.start",
+        stage=agent,
+        status="running",
+        agent=agent,
+        provider=provider,
+        model=model,
+        prompt_version=prompt_version,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+    )
+    try:
+        response = client.generate(system_prompt, user_prompt)
+    except Exception as exc:
+        record_event(
+            "llm.call.end",
+            stage=agent,
+            status="error",
+            agent=agent,
+            provider=provider,
+            model=model,
+            prompt_version=prompt_version,
+            duration_ms=round((perf_counter() - started) * 1000, 3),
+            error=f"{exc.__class__.__name__}: {str(exc)[:300]}",
+        )
+        raise
+    record_event(
+        "llm.call.end",
+        stage=agent,
+        status="ok",
+        agent=agent,
+        provider=provider,
+        model=model,
+        prompt_version=prompt_version,
+        duration_ms=round((perf_counter() - started) * 1000, 3),
+        response=response,
+    )
+    return response
+
+
+def _llm_provider_name(client: LLMClient) -> str:
+    name = client.__class__.__name__.lower()
+    if "deepseek" in name:
+        return "deepseek"
+    if "mock" in name:
+        return "mock"
+    return client.__class__.__name__
 
 
 def load_local_env(path: str | Path = LOCAL_ENV_PATH) -> None:

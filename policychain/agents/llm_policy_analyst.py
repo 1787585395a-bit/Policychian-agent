@@ -5,8 +5,9 @@ from datetime import datetime, timezone
 import json
 from typing import Iterable
 
-from policychain.llm import LLMClient, create_llm_client
+from policychain.llm import LLMClient, create_llm_client, observed_llm_generate
 from policychain.mcp import MCPToolInvoker, consume_mcp_invoker_errors, is_unavailable_invoker
+from policychain.observability import record_event
 from policychain.prompts import render_prompt
 from policychain.schemas.agent_outputs import PolicyAnalysisOutput, StrengthAssessment
 from policychain.source_policy import (
@@ -78,7 +79,7 @@ def run_llm_policy_analyst(
         similar_policy_matches=_json_for_prompt(similar_results),
         web_evidence=_json_for_prompt(web_evidence),
     )
-    raw_output = client.generate(prompt["system"], prompt["user"])
+    raw_output = observed_llm_generate(client, prompt["system"], prompt["user"], agent="policy_analyst")
     output = parse_structured_output(raw_output, prompt["output_schema_name"])
     if not isinstance(output, PolicyAnalysisOutput):
         raise LLMPolicyAnalysisError("LLM Policy Analyst returned an unexpected output schema")
@@ -204,6 +205,7 @@ def _emit_progress(
         "message": message,
     }
     state.progress_events.append(event)
+    record_event("workflow.progress", stage=stage, status="ok", progress=progress, message=message)
     if callback:
         callback(progress, stage, message)
 
