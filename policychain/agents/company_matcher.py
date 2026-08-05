@@ -105,6 +105,22 @@ def run_company_matcher(
 
     top_k_per_industry = resolve_company_match_limit(top_k_per_industry)
 
+    if resolve_company_discovery_mode() == "web_first":
+        output = CompanyMatchOutput(
+            uncertainties=[
+                "默认 Web-first 公司发现需要 DeepSeek discovery；当前确定性/fallback 路径未调用旧 CNFinancial-first 候选召回。",
+                "公司部分仅表示业务相关性研究清单，不构成任何投资建议。",
+            ]
+        )
+        coverage = _build_web_first_unavailable_coverage(state.industry_impacts)
+        payload = output.to_dict()
+        state.company_candidates = []
+        state.company_matches = []
+        state.company_coverage = coverage
+        state.company_match_audit = []
+        state.uncertainties = _unique([*state.uncertainties, *payload["uncertainties"]])
+        return output
+
     output = match_companies_for_impacts(
         industry_impacts=state.industry_impacts,
         top_k_per_industry=top_k_per_industry,
@@ -222,7 +238,10 @@ def audit_company_match_output(
             audited_match = _apply_audit(match, impact_index, impact, status)
             audit_logs.append(_audit_log_entry(audited_match, status, impact_index, impact))
             continue
-        impact_index, impact = _best_impact_for_match(match, record or {}, industry_impacts)
+        if allowed_impact_ids:
+            impact_index, impact = _impact_for_claimed_id(match.impact_id, industry_impacts)
+        else:
+            impact_index, impact = _best_impact_for_match(match, record or {}, industry_impacts)
         status = _audit_candidate_against_impact(record or _company_match_as_record(match), impact)
         audited_match = _apply_audit(match, impact_index, impact, status)
         audit_logs.append(_audit_log_entry(audited_match, status, impact_index, impact))
@@ -259,13 +278,14 @@ def match_candidate_records_to_impacts(
     audit_logs: list[dict[str, Any]] = []
 
     for impact_index, impact in enumerate(industry_impacts, start=1):
+        scoped_impact = {**impact, "impact_id": str(impact.get("impact_id") or _impact_id(impact_index))}
         scoped: list[CompanyMatch] = []
         for record in candidate_records:
             if not _candidate_is_for_impact(record, _impact_id(impact_index)):
                 continue
-            status = _audit_candidate_against_impact(record, impact)
-            provisional = _build_company_match(record, impact_index, impact, status)
-            audit_logs.append(_audit_log_entry(provisional, status, impact_index, impact))
+            status = _audit_candidate_against_impact(record, scoped_impact)
+            provisional = _build_company_match(record, impact_index, scoped_impact, status)
+            audit_logs.append(_audit_log_entry(provisional, status, impact_index, scoped_impact))
             if status["decision"] == "reject":
                 continue
             scoped.append(provisional)
@@ -334,7 +354,14 @@ def _build_company_match(
 def _audit_candidate_against_impact(record: dict[str, Any], impact: dict[str, Any]) -> dict[str, Any]:
     impact_text = _impact_context(impact)
     company_text = _company_context(record)
+    impact_id = str(impact.get("impact_id") or "")
+    web_fallback = bool(record.get("web_fallback_verified")) and (
+        not record.get("web_fallback_impacts") or impact_id in (record.get("web_fallback_impacts") or [])
+    )
     shared_terms = _shared_terms(company_text, impact_text)
+    if web_fallback:
+        verified_terms = (record.get("verified_path_terms_by_impact") or {}).get(impact_id) or []
+        shared_terms = _unique([*shared_terms, *verified_terms])
     specific_shared_terms = [term for term in shared_terms if not _is_generic_shared_term(term)]
     has_business_evidence = bool(str(record.get("business_evidence") or record.get("matched_business") or "").strip())
     source_tool = str(record.get("candidate_source_tool") or "")
@@ -409,6 +436,18 @@ def _audit_candidate_against_impact(record: dict[str, Any], impact: dict[str, An
             "negative_evidence": negative_evidence,
         }
 
+    if web_fallback:
+        negative_evidence.append("CNFinancial 未完成交叉验证；当前仅有两处独立 Web 证据。")
+        return {
+            "decision": "keep_low",
+            "reason_code": "web_fallback",
+            "match_level": "low",
+            "confidence": min(confidence, 0.55),
+            "reason": "CNFinancial 技术失败后由两处独立 Web 证据支持，固定保留为低置信匹配。",
+            "shared_terms": shared_terms,
+            "negative_evidence": negative_evidence,
+        }
+
     return {
         "decision": "passed",
         "match_level": _match_level(confidence),
@@ -442,7 +481,12 @@ def _confidence(
         score += 0.05
     if record.get("candidate_source_tool") == "get_industry_stocks":
         score += 0.04
-    return round(min(score, 0.92), 2)
+    configured_cap = record.get("confidence_cap")
+    try:
+        confidence_cap = min(float(configured_cap), 0.92) if configured_cap not in (None, "") else 0.92
+    except (TypeError, ValueError):
+        confidence_cap = 0.92
+    return round(min(score, confidence_cap), 2)
 
 
 def _apply_audit(
@@ -503,9 +547,9 @@ def _build_coverage_matrix(
         retrieval_status = str(retrieval.get("status") or ("ok" if scoped_candidates else "empty"))
         no_match_reason = ""
         if not scoped_candidates:
-            if retrieval_status == "unavailable":
+            if retrieval_status in {"unavailable", "cnfinancial_unavailable"}:
                 no_match_reason = "CNFinancial 工具不可用或已熔断，未能完成该路径候选查询；这不等于真实返回空。"
-            elif retrieval_status == "error":
+            elif retrieval_status in {"error", "cnfinancial_error", "discovery_error"}:
                 no_match_reason = "CNFinancial 候选查询失败，未能判断该路径是否存在候选；这不等于真实返回空。"
             else:
                 no_match_reason = "CNFinancial 查询成功但真实返回空，暂未形成该路径的 A 股候选公司。"
@@ -613,7 +657,8 @@ def _best_impact_for_match(
     best_score = -1.0
     candidate_record = record or _company_match_as_record(match)
     for index, impact in enumerate(industry_impacts, start=1):
-        status = _audit_candidate_against_impact(candidate_record, impact)
+        scoped_impact = {**impact, "impact_id": str(impact.get("impact_id") or _impact_id(index))}
+        status = _audit_candidate_against_impact(candidate_record, scoped_impact)
         score = float(status["confidence"])
         if status["decision"] == "reject":
             score -= 0.2
@@ -745,6 +790,8 @@ def _is_generic_shared_term(value: str) -> bool:
 
 
 def _is_web_only_candidate(record: dict[str, Any]) -> bool:
+    if record.get("web_fallback_verified") is True:
+        return False
     provenance = [item for item in record.get("provenance") or [] if isinstance(item, dict)]
     explicit_sources: list[str] = []
     for item in provenance:
@@ -795,6 +842,33 @@ def resolve_company_match_limit(requested: int = DEFAULT_MAX_COMPANIES_PER_IMPAC
         except ValueError:
             pass
     return min(max(int(requested), 1), MAX_COMPANIES_PER_IMPACT)
+
+
+def resolve_company_discovery_mode() -> str:
+    raw = os.getenv("POLICYCHAIN_COMPANY_DISCOVERY_MODE", "web_first").strip().lower()
+    return "legacy_cnfinancial" if raw == "legacy_cnfinancial" else "web_first"
+
+
+def _build_web_first_unavailable_coverage(
+    industry_impacts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "impact_id": str(impact.get("impact_id") or f"IMP-{index:03d}"),
+            "industry": str(impact.get("industry") or ""),
+            "chain_segment": str(impact.get("chain_segment") or ""),
+            "business_variables": list(impact.get("business_variables") or []),
+            "affected_company_types": list(impact.get("affected_company_types") or []),
+            "candidate_count": 0,
+            "passed_count": 0,
+            "rejected_count": 0,
+            "company_names": [],
+            "retrieval_status": "discovery_error",
+            "coverage_status": "discovery_error",
+            "no_match_reason": "Web-first discovery 未执行；为避免静默切换候选语义，未调用旧 CNFinancial-first 召回。",
+        }
+        for index, impact in enumerate(industry_impacts, start=1)
+    ]
 
 
 def _dedupe_matches(matches: list[CompanyMatch]) -> list[CompanyMatch]:

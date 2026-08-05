@@ -7,6 +7,7 @@ from policychain.tools.company_tools import (
 )
 from policychain.tools.mcp_tools import (
     collect_company_candidates,
+    collect_company_discovery_web_evidence,
     collect_company_web_evidence,
     collect_impact_research,
     collect_policy_web_evidence,
@@ -34,6 +35,7 @@ __all__ = [
     "ReActTool",
     "build_langchain_tools",
     "collect_company_candidates",
+    "collect_company_discovery_web_evidence",
     "collect_company_web_evidence",
     "collect_impact_research",
     "collect_policy_web_evidence",
