@@ -9,7 +9,14 @@ class PromptTests(unittest.TestCase):
     def test_all_core_agent_templates_exist(self) -> None:
         self.assertEqual(
             set(PROMPT_TEMPLATES),
-            {"policy_analyst", "impact_analyst", "company_seed", "company_matcher", "report_writer"},
+            {
+                "policy_analyst",
+                "impact_analyst",
+                "company_discovery",
+                "company_seed",
+                "company_matcher",
+                "report_writer",
+            },
         )
 
     def test_policy_analyst_prompt_renders_inputs_and_boundaries(self) -> None:
@@ -47,6 +54,9 @@ class PromptTests(unittest.TestCase):
         self.assertIn("逐条绑定到行业路径", rendered["user"])
         self.assertIn("合理性审查", rendered["system"])
         self.assertIn('"impact_id"', rendered["user"])
+        self.assertIn("verification_status=web_fallback", rendered["system"])
+        self.assertIn("confidence 不得超过 0.55", rendered["user"])
+        self.assertIn("公司名称、代码和 impact_id 组合", rendered["user"])
 
     def test_company_seed_prompt_marks_every_proposal_unverified_and_path_scoped(self) -> None:
         rendered = render_prompt(
@@ -70,6 +80,24 @@ class PromptTests(unittest.TestCase):
         self.assertIn("remaining_deficit", rendered["user"])
         self.assertIn('"historical_names"', rendered["user"])
         self.assertEqual(rendered["output_schema_name"], "CompanySeedOutput")
+
+    def test_company_discovery_prompt_is_web_first_path_scoped_and_bounded(self) -> None:
+        rendered = render_prompt(
+            "company_discovery",
+            industry_impact={
+                "impact_id": "IMP-001",
+                "chain_segment": "反渗透膜组件",
+                "business_variables": ["膜组件需求"],
+            },
+        )
+
+        self.assertIn("Web-first", rendered["system"])
+        self.assertIn("不得调用或依赖行业/概念目录", rendered["system"])
+        self.assertIn("最多 2 条", rendered["user"])
+        self.assertIn("最多 6 个", rendered["user"])
+        self.assertIn('"web_queries"', rendered["user"])
+        self.assertIn('"impact_id"', rendered["user"])
+        self.assertEqual(rendered["output_schema_name"], "CompanyDiscoveryOutput")
 
     def test_report_writer_prompt_requires_detail_and_full_path_coverage(self) -> None:
         rendered = render_prompt(

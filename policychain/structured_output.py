@@ -7,6 +7,7 @@ from typing import Any, Callable, TypeVar
 from policychain.safety import assert_no_investment_advice
 from policychain.observability import record_event
 from policychain.schemas.agent_outputs import (
+    CompanyDiscoveryOutput,
     CompanyEvidence,
     CompanyMatch,
     CompanyMatchOutput,
@@ -33,6 +34,7 @@ SCHEMA_BUILDERS: dict[str, Callable[[dict[str, Any]], Any]] = {
     "ImpactAnalysisOutput": lambda payload: _build_impact_analysis(payload),
     "CompanyMatchOutput": lambda payload: _build_company_match_output(payload),
     "CompanySeedOutput": lambda payload: _build_company_seed_output(payload),
+    "CompanyDiscoveryOutput": lambda payload: _build_company_discovery_output(payload),
 }
 
 
@@ -164,6 +166,32 @@ def _build_company_seed_output(payload: dict[str, Any]) -> CompanySeedOutput:
         if counts[seed.impact_id] > 6:
             raise StructuredOutputError(f"CompanySeedOutput permits at most 6 seeds per impact: {seed.impact_id}")
     return CompanySeedOutput(
+        seeds=seeds,
+        uncertainties=_coerce_explanatory_list(payload, "uncertainties"),
+    )
+
+
+def _build_company_discovery_output(payload: dict[str, Any]) -> CompanyDiscoveryOutput:
+    fields = ("impact_id", "web_queries", "seeds", "uncertainties")
+    _require_fields(payload, "CompanyDiscoveryOutput", fields)
+    _reject_extra_fields(payload, "CompanyDiscoveryOutput", fields)
+    impact_id = _require_str(payload, "impact_id")
+    if not re.fullmatch(r"IMP-\d{3}", impact_id):
+        raise StructuredOutputError("CompanyDiscoveryOutput.impact_id must use IMP-001 format")
+    web_queries = _require_list_of_str(payload, "web_queries")
+    if len(web_queries) > 2:
+        raise StructuredOutputError("CompanyDiscoveryOutput permits at most 2 web queries")
+    seeds = [
+        _build_company_seed(item, f"seeds[{index}]")
+        for index, item in enumerate(_require_list(payload, "seeds"))
+    ]
+    if len(seeds) > 6:
+        raise StructuredOutputError("CompanyDiscoveryOutput permits at most 6 seeds")
+    if any(seed.impact_id != impact_id for seed in seeds):
+        raise StructuredOutputError("CompanyDiscoveryOutput seeds must match the top-level impact_id")
+    return CompanyDiscoveryOutput(
+        impact_id=impact_id,
+        web_queries=web_queries,
         seeds=seeds,
         uncertainties=_coerce_explanatory_list(payload, "uncertainties"),
     )

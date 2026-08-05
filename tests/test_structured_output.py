@@ -5,6 +5,7 @@ import unittest
 
 from policychain.safety import SafetyViolation
 from policychain.schemas.agent_outputs import (
+    CompanyDiscoveryOutput,
     CompanyMatchOutput,
     CompanySeedOutput,
     ImpactAnalysisOutput,
@@ -81,6 +82,32 @@ class StructuredOutputTests(unittest.TestCase):
         self.assertEqual(output.seeds[0].impact_id, "IMP-001")
         self.assertEqual(output.seeds[0].proposed_stock_code, "300123")
         self.assertEqual(output.seeds[0].historical_names, ["示例旧名"])
+
+    def test_company_discovery_output_enforces_path_queries_and_seed_budget(self) -> None:
+        payload = {
+            "impact_id": "IMP-001",
+            "web_queries": ["反渗透膜 A股 公司 主营业务", "海水淡化设备 证券代码 公告"],
+            "seeds": _company_seed_payload()["seeds"],
+            "uncertainties": [],
+        }
+
+        output = validate_structured_payload(payload, "CompanyDiscoveryOutput")
+
+        self.assertIsInstance(output, CompanyDiscoveryOutput)
+        self.assertEqual(output.impact_id, "IMP-001")
+        self.assertEqual(len(output.web_queries), 2)
+
+        payload["web_queries"].append("第三条查询")
+        with self.assertRaisesRegex(StructuredOutputError, "at most 2"):
+            validate_structured_payload(payload, "CompanyDiscoveryOutput")
+
+        mismatch = {
+            **payload,
+            "web_queries": [],
+            "seeds": [{**_company_seed_payload()["seeds"][0], "impact_id": "IMP-002"}],
+        }
+        with self.assertRaisesRegex(StructuredOutputError, "match the top-level"):
+            validate_structured_payload(mismatch, "CompanyDiscoveryOutput")
 
     def test_company_seed_output_enforces_six_per_impact_and_three_historical_names(self) -> None:
         too_many = _company_seed_payload()

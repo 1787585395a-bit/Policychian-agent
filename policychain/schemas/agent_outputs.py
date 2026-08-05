@@ -155,6 +155,22 @@ class CompanySeedOutput:
 
 
 @dataclass
+class CompanyDiscoveryOutput:
+    impact_id: str
+    web_queries: list[str] = field(default_factory=list)
+    seeds: list[CompanySeed] = field(default_factory=list)
+    uncertainties: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "impact_id": self.impact_id,
+            "web_queries": list(self.web_queries),
+            "seeds": [seed.to_dict() for seed in self.seeds],
+            "uncertainties": list(self.uncertainties),
+        }
+
+
+@dataclass
 class CompanyEvidence:
     source_name: str
     source_url: str | None

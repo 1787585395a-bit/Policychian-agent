@@ -128,7 +128,7 @@ COMPANY_MATCH_JSON_CONTRACT = """必须只输出一个 JSON 对象，顶层字�
   ],
   "uncertainties": []
 }
-company_name 必须从给定公司资料中选择，不得编造公司。必须逐条对应 Impact Analyst 的行业路径，不得把某个公司的业务泛化到所有路径。候选资料含 impact_ids 或 provenance.impact_id 时，它们是该候选可绑定路径的白名单，输出 impact_id 必须属于该白名单，不得改绑到其他路径。不得仅因为公司属于某个概念板块就判断符合政策实施路径；只有主营业务、产品服务、公告/官网描述或 CNFinancial 主营数据与产业链环节或经营变量存在明确交集时，才能给出中高置信。Web 资料只能补充已存在的 CNFinancial 候选，Web-only 公司不得进入白名单。“服务”“制造”“电力”“能源”“新能源”“企业”“行业”等泛词不能单独支撑通过，必须存在路径特异的产品、设备、业务或经营变量交集。所有 data_date 字段不得为空，缺失时写 "unknown"。confidence 必须是 0 到 1 的数字且不得超过 0.92。不得输出额外字段。"""
+company_name 必须从给定公司资料中选择，不得编造公司。必须逐条对应 Impact Analyst 的行业路径，不得把某个公司的业务泛化到所有路径。候选资料含 impact_ids 或 provenance.impact_id 时，它们是该候选可绑定路径的白名单，输出 impact_id 必须属于该白名单，不得改绑到其他路径。不得仅因为公司属于某个概念板块就判断符合政策实施路径；只有主营业务、产品服务、公告/官网描述或 CNFinancial 主营数据与产业链环节或经营变量存在明确交集时，才能给出中高置信。未经系统核验的 Web-only 公司不得进入白名单；verification_status=web_fallback 表示系统已在 CNFinancial 技术失败后完成严格双独立来源审核，是唯一例外，但只能输出 low 且 confidence 不得超过 0.55。“服务”“制造”“电力”“能源”“新能源”“企业”“行业”等泛词不能单独支撑通过，必须存在路径特异的产品、设备、业务或经营变量交集。所有 data_date 字段不得为空，缺失时写 "unknown"。普通候选 confidence 不得超过 0.92。不得输出额外字段。"""
 
 
 COMPANY_SEED_JSON_CONTRACT = """必须只输出一个 JSON 对象，顶层字段必须完全使用以下 key：
@@ -149,10 +149,31 @@ COMPANY_SEED_JSON_CONTRACT = """必须只输出一个 JSON 对象，顶层字段
 不得伪造当前 A 股身份、代码、更名链、业务或证据。不得输出额外字段。"""
 
 
+COMPANY_DISCOVERY_JSON_CONTRACT = """必须只输出一个 JSON 对象，顶层字段必须完全使用以下 key：
+{
+  "impact_id": "必须复制输入路径编号，如 IMP-001",
+  "web_queries": ["用于发现或核对 A 股公司身份及路径特异业务的 Web 查询，最多 2 条"],
+  "seeds": [
+    {
+      "impact_id": "必须等于顶层 impact_id",
+      "proposed_name": "明确的当前或历史公司名称，不得是行业、概念或公司类型",
+      "historical_names": ["可能的历史名称，最多 3 个"],
+      "proposed_stock_code": "可能的 6 位 A 股代码，缺失时为空字符串",
+      "seed_reason": "该公司可能与本路径的具体产品、设备、材料、服务或经营变量交集",
+      "origin_channels": ["llm"]
+    }
+  ],
+  "uncertainties": []
+}
+每条路径只执行一次 discovery；web_queries 最多 2 条；seeds 最多 6 个。seed 只是未验证线索，不能声称已完成 A 股身份、上市状态、主营业务或政策匹配核验。
+不得把行业目录、概念板块、泛化公司类型或路径描述本身当成公司。不得输出额外字段。"""
+
+
 POLICY_ANALYSIS_JSON_CONTRACT_TEMPLATE = POLICY_ANALYSIS_JSON_CONTRACT.replace("{", "{{").replace("}", "}}")
 IMPACT_ANALYSIS_JSON_CONTRACT_TEMPLATE = IMPACT_ANALYSIS_JSON_CONTRACT.replace("{", "{{").replace("}", "}}")
 COMPANY_MATCH_JSON_CONTRACT_TEMPLATE = COMPANY_MATCH_JSON_CONTRACT.replace("{", "{{").replace("}", "}}")
 COMPANY_SEED_JSON_CONTRACT_TEMPLATE = COMPANY_SEED_JSON_CONTRACT.replace("{", "{{").replace("}", "}}")
+COMPANY_DISCOVERY_JSON_CONTRACT_TEMPLATE = COMPANY_DISCOVERY_JSON_CONTRACT.replace("{", "{{").replace("}", "}}")
 
 
 PROMPT_TEMPLATES: dict[str, PromptTemplate] = {
@@ -219,24 +240,45 @@ PROMPT_TEMPLATES: dict[str, PromptTemplate] = {
             "只输出一个合法 JSON 对象，不要输出 Markdown 或解释文字。"
         ),
     ),
+    "company_discovery": PromptTemplate(
+        name="company_discovery",
+        output_schema_name="CompanyDiscoveryOutput",
+        system=(
+            "你是 PolicyChain 的 Web-first A 股公司发现器。每条 impact 只进行一次发现规划。"
+            "你只输出尚未验证的明确公司身份 seed 和最多两条 Web 查询；不得调用或依赖行业/概念目录，也不得把路径泛词当作公司。"
+            "公司进入清单前仍需 CNFinancial 精确身份/业务核验或严格的双 Web 独立证据审核。"
+            "禁止输出买入、卖出、目标价、推荐股票或确定性投资建议。"
+        ),
+        user_template=(
+            "本次行业影响路径：\n{industry_impact}\n\n"
+            "请基于路径中的具体产品、设备、材料、服务和经营变量，提出明确的 A 股公司身份线索及用于发现/核对的 Web 查询。"
+            "不要复述路径泛词，不要使用行业/概念目录，不得声称 seed 已验证。\n\n"
+            f"{COMPANY_DISCOVERY_JSON_CONTRACT_TEMPLATE}\n\n"
+            "只输出一个合法 JSON 对象，不要输出 Markdown 或解释文字。"
+        ),
+    ),
     "company_matcher": PromptTemplate(
         name="company_matcher",
         output_schema_name="CompanyMatchOutput",
         system=(
             "你是 PolicyChain 的 Company Matcher。你的职责是把行业影响和公司公开资料做业务相关性匹配。"
+            "输入公司资料是系统在身份核验和逐路径确定性预审后允许评价的 evidence bundle；"
+            "只能原样使用其中的公司名称、股票代码和 impact_id，绝对不得新增、改绑或猜测公司身份与路径。"
             "你必须按行业路径逐项匹配，并在输出前做合理性审查：公司业务是否真实对应该路径的产业链环节或经营变量。"
-            "Web-only 候选必须拒绝；服务、制造、电力等泛词不能单独作为业务匹配依据。"
+            "未经系统核验的 Web-only 候选必须拒绝；verification_status=web_fallback 是严格双独立来源审核后的唯一例外，"
+            "且只能给出 low、confidence 不超过 0.55。服务、制造、电力等泛词不能单独作为业务匹配依据。"
             "只能输出公司业务匹配或 A 股公司关注清单，必须保留资料日期、证据、置信度、反面证据和不确定性。"
             "禁止输出买入、卖出、目标价、推荐股票或确定性投资建议。"
         ),
         user_template=(
             "行业影响：\n{industry_impacts}\n\n"
-            "公司资料：\n{company_records}\n\n"
-            "Web Search 公司补充证据：\n{web_evidence}\n\n"
+            "验证后、逐路径绑定的公司 evidence bundles：\n{company_records}\n\n"
+            "独立 Web 补充证据（Web-first 评价阶段应为空，Web 证据已封装在对应 bundle 内）：\n{web_evidence}\n\n"
             "请按 CompanyMatchOutput 结构输出公司业务匹配，不得把业务相关性写成投资结论。"
             "CNFinancial 候选公司用于筛选和补充主营、财务、公告、新闻证据；Web Search 可补充官网、公告和权威网页资料。"
             "必须逐条绑定到行业路径；如果某公司只具备行业/概念板块标签但缺少业务证据，应降为 low 或不输出。"
-            "公司资料中的 provenance 用于核对 impact_id、查询词和工具来源；反面证据不得省略。"
+            "每个 bundle 中的 identity、impact_id、tool_status、tool_call_id 和 provenance 是强白名单；"
+            "只能输出同一 bundle 的公司名称、代码和 impact_id 组合。反面证据不得省略。"
             "如果某条路径没有可靠公司匹配，不要硬凑公司；在 uncertainties 中说明候选不足、证据不足或路径过宽。\n\n"
             f"{COMPANY_MATCH_JSON_CONTRACT_TEMPLATE}\n\n"
             "只输出一个合法 JSON 对象，不要输出 Markdown 或解释文字。"
