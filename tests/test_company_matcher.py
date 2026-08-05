@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from policychain.agents import (
     match_companies_for_impacts,
@@ -8,8 +9,13 @@ from policychain.agents import (
     run_impact_analyst,
     run_policy_analyst,
 )
-from policychain.mcp import FakeMCPInvoker
-from policychain.schemas import CompanyMatchOutput
+from policychain.agents.company_matcher import (
+    audit_company_match_output,
+    match_candidate_records_to_impacts,
+    resolve_company_match_limit,
+)
+from policychain.mcp import FakeMCPInvoker, MCPToolError
+from policychain.schemas import CompanyMatch, CompanyMatchOutput
 from policychain.state import PolicyResearchState
 from policychain.tools.mcp_tools import CNFINANCIAL_SERVER
 from tests.helpers import build_sample_store
@@ -174,6 +180,218 @@ class CompanyMatcherTests(unittest.TestCase):
                 self.assertNotIn(term, rendered)
         finally:
             store.close()
+
+    def test_generic_service_manufacturing_and_power_terms_are_rejected(self) -> None:
+        impact = {
+            "industry": "电力服务行业",
+            "chain_segment": "设备制造服务",
+            "transmission_logic": "企业获得电力服务和制造服务",
+            "business_variables": ["服务规模"],
+            "affected_company_types": ["制造企业"],
+        }
+        candidate = {
+            "company_name": "泛化业务公司",
+            "stock_code": "300999",
+            "matched_business": "提供电力服务、设备制造和企业综合服务",
+            "business_evidence": "主营业务为电力服务与设备制造服务",
+            "candidate_source_tool": "get_industry_stocks",
+            "impact_ids": ["IMP-001"],
+            "provenance": [
+                {
+                    "impact_id": "IMP-001",
+                    "tool": "get_industry_stocks",
+                    "source_type": "cnfinancial_recall",
+                    "tool_call_id": "tool-generic",
+                }
+            ],
+        }
+
+        matches, coverage, audit = match_candidate_records_to_impacts([impact], [candidate])
+
+        self.assertEqual(matches, [])
+        self.assertEqual(audit[0]["decision"], "reject")
+        self.assertIn("泛化词", audit[0]["reason"])
+        self.assertEqual(coverage[0]["passed_count"], 0)
+
+    def test_llm_match_cannot_rebind_candidate_outside_retrieval_provenance(self) -> None:
+        impacts = [
+            {
+                "industry": "算力基础设施",
+                "chain_segment": "液冷服务器",
+                "transmission_logic": "数据中心建设拉动液冷服务器需求",
+            },
+            {
+                "industry": "天然气供应",
+                "chain_segment": "天然气管网服务",
+                "transmission_logic": "管网建设影响天然气服务需求",
+            },
+        ]
+        record = {
+            "company_name": "路径二候选",
+            "stock_code": "300777",
+            "matched_business": "天然气管网运营服务",
+            "business_evidence": "主营天然气管网运营服务",
+            "impact_ids": ["IMP-002"],
+            "provenance": [{"impact_id": "IMP-002", "tool": "search_stock"}],
+        }
+        llm_output = CompanyMatchOutput(
+            companies=[
+                CompanyMatch(
+                    company_name="路径二候选",
+                    stock_code="300777",
+                    industry_segment="算力基础设施",
+                    matched_business="天然气能源服务",
+                    match_level="medium",
+                    impact_id="IMP-001",
+                    confidence=0.7,
+                )
+            ]
+        )
+
+        audited = audit_company_match_output(llm_output, impacts, [record])
+
+        self.assertEqual(audited.companies, [])
+        audit = getattr(audited, "_audit_logs")[0]
+        self.assertEqual(audit["decision"], "reject")
+        self.assertEqual(audit["reason_code"], "path_provenance_mismatch")
+        self.assertIn("IMP-002", audit["reason"])
+
+    def test_llm_match_without_candidate_provenance_keeps_legacy_path_compatibility(self) -> None:
+        impact = {
+            "industry": "算力基础设施",
+            "chain_segment": "液冷服务器",
+            "transmission_logic": "数据中心建设拉动液冷服务器需求",
+        }
+        record = {
+            "company_name": "兼容候选",
+            "stock_code": "300778",
+            "matched_business": "液冷服务器和数据中心设备",
+            "business_evidence": "主营液冷服务器和数据中心设备",
+        }
+        llm_output = CompanyMatchOutput(
+            companies=[
+                CompanyMatch(
+                    company_name="兼容候选",
+                    stock_code="300778",
+                    industry_segment="算力基础设施",
+                    matched_business="液冷服务器和数据中心设备",
+                    match_level="medium",
+                    impact_id="IMP-001",
+                    confidence=0.7,
+                )
+            ]
+        )
+
+        audited = audit_company_match_output(llm_output, [impact], [record])
+
+        self.assertEqual([item.company_name for item in audited.companies], ["兼容候选"])
+
+    def test_energy_umbrella_and_generic_service_cannot_match_compute_path(self) -> None:
+        impact = {
+            "industry": "算力基础设施",
+            "chain_segment": "数据中心能源系统",
+            "transmission_logic": "数据中心建设影响能源与电力服务需求",
+            "business_variables": ["单位算力能耗"],
+            "affected_company_types": ["数据中心运营商"],
+        }
+        weak = {
+            "company_name": "天然气服务候选",
+            "stock_code": "300779",
+            "matched_business": "天然气、新能源和电力综合服务",
+            "business_evidence": "主营天然气能源服务和电力服务",
+            "impact_ids": ["IMP-001"],
+        }
+        specific = {
+            "company_name": "液冷设备候选",
+            "stock_code": "300780",
+            "matched_business": "液冷服务器和数据中心制冷设备",
+            "business_evidence": "主营液冷服务器及数据中心制冷设备",
+            "impact_ids": ["IMP-001"],
+        }
+
+        matches, _coverage, audit = match_candidate_records_to_impacts([impact], [weak, specific])
+
+        self.assertEqual([item.company_name for item in matches], ["液冷设备候选"])
+        weak_audit = next(item for item in audit if item["company_name"] == "天然气服务候选")
+        self.assertEqual(weak_audit["decision"], "reject")
+        self.assertIn("泛化词", weak_audit["reason"])
+
+    def test_web_only_candidate_is_rejected_even_with_specific_business_text(self) -> None:
+        impact = {
+            "industry": "海水淡化设备",
+            "chain_segment": "反渗透膜组件",
+            "transmission_logic": "海水淡化项目增加反渗透膜组件需求",
+            "business_variables": ["膜组件需求"],
+            "affected_company_types": ["膜组件供应商"],
+        }
+        candidate = {
+            "company_name": "网页公司",
+            "stock_code": "300888",
+            "matched_business": "生产反渗透膜组件",
+            "business_evidence": "网页称公司生产海水淡化反渗透膜组件",
+            "impact_ids": ["IMP-001"],
+            "provenance": [
+                {
+                    "impact_id": "IMP-001",
+                    "tool": "search",
+                    "source_type": "web_search",
+                    "tool_call_id": "tool-web",
+                }
+            ],
+        }
+
+        matches, _coverage, audit = match_candidate_records_to_impacts([impact], [candidate])
+
+        self.assertEqual(matches, [])
+        self.assertEqual(audit[0]["decision"], "reject")
+        self.assertIn("Web", audit[0]["reason"])
+
+    def test_coverage_distinguishes_query_error_from_successful_empty(self) -> None:
+        impact = {
+            "industry": "动力电池",
+            "chain_segment": "动力电池制造",
+            "transmission_logic": "动力电池装机需求增加",
+            "business_variables": ["装机量"],
+            "affected_company_types": ["动力电池制造商"],
+        }
+
+        def disconnected(**_kwargs):
+            raise MCPToolError("RemoteDisconnected: remote end closed connection without response")
+
+        error_invoker = FakeMCPInvoker(
+            {
+                (CNFINANCIAL_SERVER, "get_industry_list"): [{"名称": "动力电池"}],
+                (CNFINANCIAL_SERVER, "get_concept_list"): [],
+                (CNFINANCIAL_SERVER, "get_industry_stocks"): disconnected,
+                (CNFINANCIAL_SERVER, "search_stock"): [],
+            }
+        )
+        empty_invoker = FakeMCPInvoker(
+            {
+                (CNFINANCIAL_SERVER, "get_industry_list"): [],
+                (CNFINANCIAL_SERVER, "get_concept_list"): [],
+                (CNFINANCIAL_SERVER, "search_stock"): [],
+            }
+        )
+
+        error_output = match_companies_for_impacts([impact], mcp_invoker=error_invoker)
+        empty_output = match_companies_for_impacts([impact], mcp_invoker=empty_invoker)
+        error_coverage = getattr(error_output, "_company_coverage")[0]
+        empty_coverage = getattr(empty_output, "_company_coverage")[0]
+
+        self.assertEqual(error_coverage["retrieval_status"], "error")
+        self.assertIn("查询失败", error_coverage["no_match_reason"])
+        self.assertEqual(empty_coverage["retrieval_status"], "empty")
+        self.assertIn("真实返回空", empty_coverage["no_match_reason"])
+
+    def test_company_match_limit_defaults_to_three_and_never_exceeds_four(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(resolve_company_match_limit(), 3)
+            self.assertEqual(resolve_company_match_limit(9), 4)
+        with patch.dict("os.environ", {"POLICYCHAIN_MAX_COMPANY_MATCHES_PER_IMPACT": "4"}):
+            self.assertEqual(resolve_company_match_limit(), 4)
+        with patch.dict("os.environ", {"POLICYCHAIN_MAX_COMPANY_MATCHES_PER_IMPACT": "9"}):
+            self.assertEqual(resolve_company_match_limit(), 4)
 
 
 def _multi_path_company_invoker() -> FakeMCPInvoker:

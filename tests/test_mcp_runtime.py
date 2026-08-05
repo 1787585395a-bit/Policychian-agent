@@ -8,6 +8,8 @@ from unittest.mock import patch
 
 from policychain.mcp import (
     FakeMCPInvoker,
+    MCPToolCircuitOpen,
+    MCPToolError,
     MCPToolUnavailable,
     StdioMCPInvoker,
     cache_mcp_invoker,
@@ -16,6 +18,8 @@ from policychain.mcp import (
     load_mcp_config,
     mcp_diagnostics_have_errors,
     mcp_payload_error_message,
+    mcp_server_is_unavailable,
+    runtime_mcp_invoker,
     _mcp_child_env,
     unwrap_mcp_result,
 )
@@ -83,6 +87,82 @@ class MCPRuntimeTests(unittest.TestCase):
         self.assertEqual(len(fake.calls), 1)
         self.assertEqual(cached.cache_info()["hits"], 1)
         self.assertEqual(cached.cache_info()["misses"], 1)
+
+    def test_remote_disconnect_opens_only_failing_tool_circuit(self) -> None:
+        def disconnected(**_kwargs):
+            raise MCPToolError("RemoteDisconnected: remote end closed connection without response")
+
+        fake = FakeMCPInvoker(
+            {
+                ("cn-financial", "get_industry_stocks"): disconnected,
+                ("cn-financial", "search_stock"): [{"名称": "设备公司", "代码": "300001"}],
+            }
+        )
+        runtime = runtime_mcp_invoker(fake)
+
+        with self.assertRaises(MCPToolError):
+            runtime.invoke("cn-financial", "get_industry_stocks", {"industry": "专用设备"})
+        with self.assertRaises(MCPToolCircuitOpen):
+            runtime.invoke("cn-financial", "get_industry_stocks", {"industry": "专用设备"})
+        search_result = runtime.invoke("cn-financial", "search_stock", {"keyword": "海水淡化设备"})
+
+        self.assertEqual(len(search_result), 1)
+        self.assertEqual(len([call for call in fake.calls if call["tool_name"] == "get_industry_stocks"]), 1)
+        self.assertEqual(len([call for call in fake.calls if call["tool_name"] == "search_stock"]), 1)
+        snapshot = runtime.status_snapshot()
+        self.assertTrue(snapshot["tools"]["cn-financial.get_industry_stocks"]["circuit_open"])
+        self.assertFalse(mcp_server_is_unavailable(fake, "cn-financial"))
+
+    def test_winerror_five_opens_service_circuit(self) -> None:
+        def denied(**_kwargs):
+            raise OSError("[WinError 5] Access is denied")
+
+        fake = FakeMCPInvoker(
+            {
+                ("cn-financial", "get_industry_list"): denied,
+                ("cn-financial", "search_stock"): [{"名称": "不应调用", "代码": "300001"}],
+            }
+        )
+        runtime = runtime_mcp_invoker(fake)
+
+        with self.assertRaises(MCPToolError):
+            runtime.invoke("cn-financial", "get_industry_list", {})
+        with self.assertRaises(MCPToolCircuitOpen):
+            runtime.invoke("cn-financial", "search_stock", {"keyword": "海水淡化设备"})
+
+        self.assertTrue(mcp_server_is_unavailable(fake, "cn-financial"))
+        self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(runtime.call_metadata()["circuit_scope"], "service")
+
+    def test_consecutive_generic_failures_open_tool_circuit_at_threshold(self) -> None:
+        def temporary_failure(**_kwargs):
+            raise MCPToolError("temporary upstream failure")
+
+        fake = FakeMCPInvoker({("cn-financial", "search_stock"): temporary_failure})
+        runtime = runtime_mcp_invoker(fake)
+
+        with self.assertRaises(MCPToolError):
+            runtime.invoke("cn-financial", "search_stock", {"keyword": "膜组件"})
+        with self.assertRaises(MCPToolError):
+            runtime.invoke("cn-financial", "search_stock", {"keyword": "高压泵"})
+        with self.assertRaises(MCPToolCircuitOpen):
+            runtime.invoke("cn-financial", "search_stock", {"keyword": "海水淡化设备"})
+
+        self.assertEqual(len(fake.calls), 2)
+        self.assertEqual(runtime.call_metadata()["failure_count"], 2)
+        self.assertEqual(runtime.call_metadata()["circuit_scope"], "tool")
+
+    def test_runtime_catalog_is_loaded_once_and_returns_copies(self) -> None:
+        fake = FakeMCPInvoker({("cn-financial", "get_industry_list"): [{"名称": "专用设备"}]})
+        runtime = runtime_mcp_invoker(fake)
+
+        first = runtime.invoke("cn-financial", "get_industry_list", {})
+        first[0]["名称"] = "mutated"
+        second = runtime.invoke("cn-financial", "get_industry_list", {})
+
+        self.assertEqual(second[0]["名称"], "专用设备")
+        self.assertEqual(len(fake.calls), 1)
+        self.assertTrue(runtime.call_metadata()["cache_hit"])
 
     def test_diagnose_mcp_config_reports_ok_for_existing_local_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

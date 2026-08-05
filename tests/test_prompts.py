@@ -9,7 +9,7 @@ class PromptTests(unittest.TestCase):
     def test_all_core_agent_templates_exist(self) -> None:
         self.assertEqual(
             set(PROMPT_TEMPLATES),
-            {"policy_analyst", "impact_analyst", "company_matcher", "report_writer"},
+            {"policy_analyst", "impact_analyst", "company_seed", "company_matcher", "report_writer"},
         )
 
     def test_policy_analyst_prompt_renders_inputs_and_boundaries(self) -> None:
@@ -48,6 +48,29 @@ class PromptTests(unittest.TestCase):
         self.assertIn("合理性审查", rendered["system"])
         self.assertIn('"impact_id"', rendered["user"])
 
+    def test_company_seed_prompt_marks_every_proposal_unverified_and_path_scoped(self) -> None:
+        rendered = render_prompt(
+            "company_seed",
+            industry_impact={"impact_id": "IMP-001", "chain_segment": "反渗透膜"},
+            seed_context={
+                "existing_verified_identities": [
+                    {"company_name": "既有验证公司", "stock_code": "300123"}
+                ],
+                "remaining_deficit": 3,
+                "verified_shortlist_target": 4,
+            },
+            web_seed_evidence=[{"title": "示例设备企业公开资料"}],
+        )
+
+        self.assertIn("seed 永远不等于 candidate", rendered["system"])
+        self.assertIn("每条路径最多 6 个", rendered["system"])
+        self.assertIn("当前 A 股身份", rendered["system"])
+        self.assertIn("不得重复已有名称或代码", rendered["user"])
+        self.assertIn("既有验证公司", rendered["user"])
+        self.assertIn("remaining_deficit", rendered["user"])
+        self.assertIn('"historical_names"', rendered["user"])
+        self.assertEqual(rendered["output_schema_name"], "CompanySeedOutput")
+
     def test_report_writer_prompt_requires_detail_and_full_path_coverage(self) -> None:
         rendered = render_prompt(
             "report_writer",
@@ -61,6 +84,11 @@ class PromptTests(unittest.TestCase):
         self.assertIn("较完整的政策研究说明", rendered["system"])
         self.assertIn("必须覆盖所有行业影响路径", rendered["system"])
         self.assertIn("没有可靠公司匹配的路径也要说明原因", rendered["system"])
+        self.assertIn("不得新增任何公司", rendered["system"])
+        self.assertIn("最终公司章节由系统确定性生成", rendered["system"])
+        self.assertIn("不得输出公司章节", rendered["user"])
+        self.assertIn("对于投资者而言", rendered["system"])
+        self.assertIn("确定性趋势", rendered["system"])
 
     def test_impact_analyst_prompt_includes_exact_json_contract(self) -> None:
         rendered = render_prompt(

@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from policychain.mcp import FakeMCPInvoker
+from policychain.mcp import FakeMCPInvoker, MCPToolError
 from policychain.tools.mcp_tools import (
     CNFINANCIAL_SERVER,
     OPEN_WEBSEARCH_SEARCH_TOOL,
@@ -11,9 +11,12 @@ from policychain.tools.mcp_tools import (
     collect_company_candidates,
     collect_company_web_evidence,
     collect_impact_research,
+    candidate_retrieval_statuses,
     fetch_web_content,
     merge_react_company_candidates,
+    resolve_company_seeds,
     search_web,
+    _candidate_stock_search_terms,
 )
 
 
@@ -417,6 +420,334 @@ class MCPToolsTests(unittest.TestCase):
         self.assertIn("Web", audit[1]["reason"])
         self.assertEqual(len([call for call in invoker.calls if call["tool_name"] == "get_company_profile"]), 1)
 
+    def test_candidate_pipeline_distinguishes_unavailable_from_true_empty(self) -> None:
+        unavailable_logs: list[dict[str, object]] = []
+        unavailable_candidates = collect_company_candidates(
+            [_battery_impact()],
+            invoker=None,
+            tool_logs=unavailable_logs,
+        )
+        empty_invoker = FakeMCPInvoker(
+            {
+                (CNFINANCIAL_SERVER, "get_industry_list"): [],
+                (CNFINANCIAL_SERVER, "get_concept_list"): [],
+                (CNFINANCIAL_SERVER, "search_stock"): [],
+            }
+        )
+        empty_logs: list[dict[str, object]] = []
+        empty_candidates = collect_company_candidates(
+            [_battery_impact()],
+            invoker=empty_invoker,
+            tool_logs=empty_logs,
+        )
+
+        self.assertEqual(unavailable_candidates, [])
+        self.assertEqual(empty_candidates, [])
+        self.assertEqual(candidate_retrieval_statuses(unavailable_logs)["IMP-001"]["status"], "unavailable")
+        self.assertEqual(candidate_retrieval_statuses(empty_logs)["IMP-001"]["status"], "empty")
+        self.assertFalse(candidate_retrieval_statuses(empty_logs)["IMP-001"]["error"])
+
+    def test_mixed_recall_channel_keeps_success_and_records_partial_failure(self) -> None:
+        def disconnected(**_kwargs):
+            raise MCPToolError("RemoteDisconnected: remote end closed connection without response")
+
+        invoker = FakeMCPInvoker(
+            {
+                (CNFINANCIAL_SERVER, "get_industry_list"): [{"名称": "海水淡化设备"}],
+                (CNFINANCIAL_SERVER, "get_concept_list"): [{"名称": "海水淡化"}],
+                (CNFINANCIAL_SERVER, "get_industry_stocks"): disconnected,
+                (CNFINANCIAL_SERVER, "search_stock"): [
+                    {"名称": "淡化设备公司", "代码": "300123", "主营业务": "海水淡化膜组件与高压泵"}
+                ],
+                (CNFINANCIAL_SERVER, "get_company_profile"): [],
+            }
+        )
+        logs: list[dict[str, object]] = []
+        impact = {
+            "industry": "海水淡化设备",
+            "chain_segment": "海水淡化膜组件",
+            "transmission_logic": "政策推动海水淡化项目形成膜组件和高压泵需求",
+            "business_variables": ["膜组件需求"],
+            "affected_company_types": ["海水淡化设备供应商"],
+        }
+
+        candidates = collect_company_candidates([impact], invoker=invoker, tool_logs=logs)
+        status = candidate_retrieval_statuses(logs)["IMP-001"]
+
+        self.assertEqual([item["company_name"] for item in candidates], ["淡化设备公司"])
+        self.assertEqual(status["status"], "ok")
+        self.assertGreaterEqual(status["partial_failure_count"], 1)
+        self.assertIn("error", status["channel_statuses"]["get_industry_stocks"])
+        self.assertIn("ok", status["channel_statuses"]["search_stock"])
+
+    def test_remote_disconnect_is_not_retried_for_each_impact(self) -> None:
+        def disconnected(**_kwargs):
+            raise MCPToolError("RemoteDisconnected: remote end closed connection without response")
+
+        invoker = FakeMCPInvoker(
+            {
+                (CNFINANCIAL_SERVER, "get_industry_list"): [{"名称": "动力电池"}],
+                (CNFINANCIAL_SERVER, "get_concept_list"): [],
+                (CNFINANCIAL_SERVER, "get_industry_stocks"): disconnected,
+                (CNFINANCIAL_SERVER, "search_stock"): [],
+            }
+        )
+        logs: list[dict[str, object]] = []
+
+        with patch("policychain.observability.record_event") as recorder:
+            collect_company_candidates(
+                [_battery_impact(), {**_battery_impact(), "impact_id": "IMP-002"}],
+                invoker=invoker,
+                tool_logs=logs,
+            )
+
+        industry_calls = [call for call in invoker.calls if call["tool_name"] == "get_industry_stocks"]
+        self.assertEqual(len(industry_calls), 1)
+        industry_logs = [log for log in logs if log["tool_name"] == "get_industry_stocks"]
+        self.assertEqual(industry_logs[0]["status"], "error")
+        self.assertTrue(any(log["status"] == "unavailable" and log.get("skipped") for log in industry_logs[1:]))
+        health_events = [call for call in recorder.call_args_list if call.args and call.args[0] == "mcp.health"]
+        candidate_events = [call for call in recorder.call_args_list if call.args and call.args[0] == "candidate.pipeline"]
+        self.assertEqual(len(health_events), 1)
+        self.assertEqual(health_events[0].kwargs["check"], "run_preflight")
+        self.assertEqual({call.kwargs["impact_id"] for call in candidate_events}, {"IMP-001", "IMP-002"})
+        self.assertTrue(all("channel_statuses" in call.kwargs for call in candidate_events))
+
+    def test_catalogs_are_loaded_once_across_impact_and_company_stages(self) -> None:
+        invoker = FakeMCPInvoker(
+            {
+                (CNFINANCIAL_SERVER, "get_industry_list"): [{"名称": "动力电池"}],
+                (CNFINANCIAL_SERVER, "get_concept_list"): [],
+                (CNFINANCIAL_SERVER, "get_industry_stocks"): [],
+                (CNFINANCIAL_SERVER, "search_stock"): [],
+            }
+        )
+
+        with patch.dict("os.environ", {"POLICYCHAIN_MCP_FAST_MODE": "1"}):
+            collect_impact_research({}, [_battery_impact()], invoker=invoker)
+            collect_company_candidates([_battery_impact()], invoker=invoker)
+
+        self.assertEqual(len([call for call in invoker.calls if call["tool_name"] == "get_industry_list"]), 1)
+        self.assertEqual(len([call for call in invoker.calls if call["tool_name"] == "get_concept_list"]), 1)
+
+    def test_stock_search_queries_are_short_specific_and_budgeted(self) -> None:
+        invoker = FakeMCPInvoker(
+            {
+                (CNFINANCIAL_SERVER, "get_industry_list"): [],
+                (CNFINANCIAL_SERVER, "get_concept_list"): [],
+                (CNFINANCIAL_SERVER, "search_stock"): [],
+            }
+        )
+        impact = {
+            "industry": "海水淡化设备",
+            "chain_segment": "反渗透膜组件",
+            "transmission_logic": "这是一段不应直接送入 search_stock 的超长政策传导描述" * 20,
+            "business_variables": ["膜组件需求", "项目服务", "电力"],
+            "affected_company_types": ["海水淡化设备供应商"],
+        }
+
+        with patch.dict("os.environ", {"POLICYCHAIN_MCP_MAX_SEARCH_TERMS": "2"}):
+            collect_company_candidates([impact], invoker=invoker)
+
+        queries = [str(call["arguments"]["keyword"]) for call in invoker.calls if call["tool_name"] == "search_stock"]
+        self.assertLessEqual(len(queries), 2)
+        self.assertTrue(queries)
+        self.assertTrue(all(len(query) <= 24 for query in queries))
+        self.assertFalse(any(query in {"服务", "制造", "电力", "企业", "行业"} for query in queries))
+        self.assertFalse(any("不应直接送入" in query for query in queries))
+
+    def test_candidate_stock_terms_do_not_forward_business_variables_wholesale(self) -> None:
+        impact = {
+            "industry": "海水淡化设备",
+            "chain_segment": "反渗透膜与高压泵",
+            "business_variables": [
+                "工程收入确认节奏",
+                "关键装备销量和单价",
+                "新增海水淡化设施投资额",
+                "能效与碳效指标",
+                "绿电交易量",
+                "运营效率",
+                "配套率",
+                "应用场景",
+            ],
+            "affected_company_types": ["海水淡化设备供应商"],
+        }
+
+        terms = _candidate_stock_search_terms(impact)
+
+        self.assertIn("反渗透膜与高压泵", terms)
+        self.assertFalse(set(impact["business_variables"]) & set(terms))
+
+    def test_resolve_company_seeds_dedupes_code_and_recovers_info_failure_with_official_identity(self) -> None:
+        def company_info(**_kwargs):
+            raise MCPToolError("company info temporarily failed")
+
+        invoker = FakeMCPInvoker(
+            {
+                (CNFINANCIAL_SERVER, "search_stock"): [
+                    {"company_name": "虚构膜科技", "stock_code": "300123"}
+                ],
+                (CNFINANCIAL_SERVER, "get_company_profile"): [
+                    {"main_business": "反渗透膜组件与海水淡化设备", "data_date": "2025"}
+                ],
+                (CNFINANCIAL_SERVER, "get_company_info"): company_info,
+                (OPEN_WEBSEARCH_SERVER, OPEN_WEBSEARCH_SEARCH_TOOL): [
+                    {
+                        "stock_name": "虚构膜科技",
+                        "title": "虚构膜科技公司概况",
+                        "description": "虚构膜科技，证券代码300123，当前正常上市。",
+                        "url": "https://www.cninfo.com.cn/fake/300123",
+                        "date": "2026-06-01",
+                    }
+                ],
+            }
+        )
+        seeds = [
+            _seed("seed-a", "IMP-001", "虚构膜科技", "300123"),
+            _seed("seed-b", "IMP-002", "虚构膜科技", "300123"),
+        ]
+
+        candidates, audit = resolve_company_seeds(
+            seeds,
+            [_desalination_impact("IMP-001"), _desalination_impact("IMP-002")],
+            invoker=invoker,
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["impact_ids"], ["IMP-001", "IMP-002"])
+        self.assertTrue(candidates[0]["identity_verified"])
+        self.assertEqual({item["status"] for item in audit}, {"verified"})
+        self.assertEqual(sum(call["tool_name"] == "get_company_profile" for call in invoker.calls), 1)
+        self.assertEqual(sum(call["tool_name"] == "get_company_info" for call in invoker.calls), 1)
+        self.assertEqual(sum(call["server_name"] == OPEN_WEBSEARCH_SERVER for call in invoker.calls), 1)
+
+    def test_resolve_company_seeds_supports_official_rename_chain_and_search_empty_profile_fallback(self) -> None:
+        def search_stock(*, arguments, **_kwargs):
+            if arguments["keyword"] == "虚构旧名":
+                return [{"company_name": "虚构新名", "stock_code": "000123"}]
+            return []
+
+        def web_search(*, arguments, **_kwargs):
+            code = "300321" if "300321" in arguments["query"] else "000123"
+            if code == "000123":
+                return [
+                    {
+                        "title": "证券简称变更公告",
+                        "description": "000123证券简称由虚构旧名变更为虚构新名，当前正常上市。",
+                        "url": "https://www.szse.cn/fake/000123",
+                        "date": "2026-01-01",
+                    }
+                ]
+            return [
+                {
+                    "stock_name": "虚构水务",
+                    "title": "虚构水务公司概况",
+                    "description": "虚构水务，证券代码300321，当前正常上市。",
+                    "url": "https://www.cninfo.com.cn/fake/300321",
+                    "date": "2026-02-01",
+                }
+            ]
+
+        invoker = FakeMCPInvoker(
+            {
+                (CNFINANCIAL_SERVER, "search_stock"): search_stock,
+                (CNFINANCIAL_SERVER, "get_company_profile"): [
+                    {"main_business": "反渗透膜与水处理设备", "data_date": "2025"}
+                ],
+                (CNFINANCIAL_SERVER, "get_company_info"): [],
+                (OPEN_WEBSEARCH_SERVER, OPEN_WEBSEARCH_SEARCH_TOOL): web_search,
+            }
+        )
+        seeds = [
+            _seed("seed-old", "IMP-001", "虚构旧名", "000123"),
+            _seed("seed-profile", "IMP-002", "虚构水务", "300321"),
+        ]
+
+        candidates, audit = resolve_company_seeds(
+            seeds,
+            [_desalination_impact("IMP-001"), _desalination_impact("IMP-002")],
+            invoker=invoker,
+        )
+
+        self.assertEqual({item["company_name"] for item in candidates}, {"虚构新名", "虚构水务"})
+        self.assertTrue(any(item["reason_code"] == "profile_found_search_empty" for item in audit))
+        self.assertTrue(all(item["status"] == "verified" for item in audit))
+
+    def test_resolve_company_seeds_rejects_conflicts_ambiguity_noncurrent_and_profile_only_identity(self) -> None:
+        def search_stock(*, arguments, **_kwargs):
+            keyword = arguments["keyword"]
+            if keyword == "一名多码":
+                return [
+                    {"company_name": keyword, "stock_code": "300111"},
+                    {"company_name": keyword, "stock_code": "300112"},
+                ]
+            if keyword == "代码冲突":
+                return [{"company_name": keyword, "stock_code": "300113"}]
+            if keyword == "已退市公司":
+                return [{"company_name": keyword, "stock_code": "300116"}]
+            if keyword == "同名公司":
+                return []
+            return [{"company_name": keyword, "stock_code": "300114"}]
+
+        def company_info(*, arguments, **_kwargs):
+            if arguments["symbol"] == "300116":
+                return [
+                    {
+                        "company_name": "已退市公司",
+                        "stock_code": "300116",
+                        "listing_status": "delisted",
+                    }
+                ]
+            return []
+
+        invoker = FakeMCPInvoker(
+            {
+                (CNFINANCIAL_SERVER, "search_stock"): search_stock,
+                (CNFINANCIAL_SERVER, "get_company_profile"): [
+                    {"main_business": "反渗透膜组件", "data_date": "2025"}
+                ],
+                (CNFINANCIAL_SERVER, "get_company_info"): company_info,
+                (OPEN_WEBSEARCH_SERVER, OPEN_WEBSEARCH_SEARCH_TOOL): [],
+            }
+        )
+        seeds = [
+            _seed("seed-ambiguous", "IMP-001", "一名多码", ""),
+            _seed("seed-conflict", "IMP-001", "代码冲突", "300999"),
+            _seed("seed-profile-only", "IMP-002", "仅有画像", "300114"),
+            _seed("seed-delisted", "IMP-002", "已退市公司", "300116"),
+            _seed("seed-same-name-a", "IMP-002", "同名公司", "300117"),
+            _seed("seed-same-name-b", "IMP-002", "同名公司", "300118"),
+            _seed("seed-non-a", "IMP-002", "非当前A股", "900901"),
+        ]
+
+        candidates, audit = resolve_company_seeds(
+            seeds,
+            [_desalination_impact("IMP-001"), _desalination_impact("IMP-002")],
+            invoker=invoker,
+        )
+
+        self.assertEqual(candidates, [])
+        reason_codes = {item["reason_code"] for item in audit}
+        self.assertIn("ambiguous_name_multiple_codes", reason_codes)
+        self.assertIn("name_code_conflict", reason_codes)
+        self.assertIn("current_identity_unverified", reason_codes)
+        self.assertIn("non_current_a_share_identity", reason_codes)
+        self.assertIn("non_current_a_share_code", reason_codes)
+        self.assertEqual(
+            sum(item["reason_code"] == "ambiguous_name_multiple_codes" for item in audit),
+            3,
+        )
+
+    def test_resolve_company_seed_keeps_unavailable_channels_unresolved(self) -> None:
+        candidates, audit = resolve_company_seeds(
+            [_seed("seed-unavailable", "IMP-001", "虚构设备", "300555")],
+            [_desalination_impact("IMP-001")],
+        )
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(audit[0]["status"], "unresolved")
+        self.assertEqual(audit[0]["reason_code"], "tool_unavailable")
+
 
 def _ai_impact() -> dict[str, object]:
     return {
@@ -451,6 +782,34 @@ def _battery_impact() -> dict[str, object]:
         "affected_company_types": ["动力电池制造商"],
         "conditions": [],
         "risks": [],
+    }
+
+
+def _desalination_impact(impact_id: str) -> dict[str, object]:
+    return {
+        "impact_id": impact_id,
+        "industry": "海水淡化设备",
+        "chain_segment": "反渗透膜组件",
+        "transmission_logic": "示范项目采购带动反渗透膜组件需求",
+        "business_variables": ["反渗透膜组件需求"],
+        "affected_company_types": ["海水淡化设备供应商"],
+        "conditions": [],
+        "risks": [],
+    }
+
+
+def _seed(seed_id: str, impact_id: str, name: str, code: str) -> dict[str, object]:
+    return {
+        "seed_id": seed_id,
+        "impact_id": impact_id,
+        "proposed_name": name,
+        "historical_names": [],
+        "proposed_stock_code": code,
+        "seed_reason": "可能提供反渗透膜组件",
+        "origin_channels": ["llm"],
+        "tool_call_id": f"llm-{seed_id}",
+        "time": "2026-07-22T00:00:00+00:00",
+        "status": "unverified",
     }
 
 

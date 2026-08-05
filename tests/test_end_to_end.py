@@ -27,6 +27,9 @@ class EndToEndWorkflowTests(unittest.TestCase):
             self.assertGreaterEqual(len(state.evidence), 1)
             self.assertTrue(state.uncertainties)
             self.assertTrue(any("候选公司" in item or "mock" in item for item in state.uncertainties))
+            self.assertTrue(all(item.get("retrieval_status") == "unavailable" for item in state.company_coverage))
+            self.assertIn("工具不可用", state.final_report)
+            self.assertNotIn("查询成功但真实返回空", state.final_report)
         finally:
             store.close()
 

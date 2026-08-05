@@ -10,6 +10,8 @@ from policychain.schemas.agent_outputs import (
     CompanyEvidence,
     CompanyMatch,
     CompanyMatchOutput,
+    CompanySeed,
+    CompanySeedOutput,
     EvidenceItem,
     ImpactAnalysisOutput,
     ImplementationStep,
@@ -30,6 +32,7 @@ SCHEMA_BUILDERS: dict[str, Callable[[dict[str, Any]], Any]] = {
     "PolicyAnalysisOutput": lambda payload: _build_policy_analysis(payload),
     "ImpactAnalysisOutput": lambda payload: _build_impact_analysis(payload),
     "CompanyMatchOutput": lambda payload: _build_company_match_output(payload),
+    "CompanySeedOutput": lambda payload: _build_company_seed_output(payload),
 }
 
 
@@ -144,6 +147,60 @@ def _build_company_match_output(payload: dict[str, Any]) -> CompanyMatchOutput:
             for index, item in enumerate(_require_list(payload, "companies"))
         ],
         uncertainties=_coerce_explanatory_list(payload, "uncertainties"),
+    )
+
+
+def _build_company_seed_output(payload: dict[str, Any]) -> CompanySeedOutput:
+    fields = ("seeds", "uncertainties")
+    _require_fields(payload, "CompanySeedOutput", fields)
+    _reject_extra_fields(payload, "CompanySeedOutput", fields)
+    seeds = [
+        _build_company_seed(item, f"seeds[{index}]")
+        for index, item in enumerate(_require_list(payload, "seeds"))
+    ]
+    counts: dict[str, int] = {}
+    for seed in seeds:
+        counts[seed.impact_id] = counts.get(seed.impact_id, 0) + 1
+        if counts[seed.impact_id] > 6:
+            raise StructuredOutputError(f"CompanySeedOutput permits at most 6 seeds per impact: {seed.impact_id}")
+    return CompanySeedOutput(
+        seeds=seeds,
+        uncertainties=_coerce_explanatory_list(payload, "uncertainties"),
+    )
+
+
+def _build_company_seed(payload: Any, field_name: str) -> CompanySeed:
+    if not isinstance(payload, dict):
+        raise StructuredOutputError(f"{field_name} must be an object")
+    fields = (
+        "impact_id",
+        "proposed_name",
+        "historical_names",
+        "proposed_stock_code",
+        "seed_reason",
+        "origin_channels",
+    )
+    _require_fields(payload, field_name, fields)
+    _reject_extra_fields(payload, field_name, fields)
+    impact_id = _require_str(payload, "impact_id", field_name)
+    if not re.fullmatch(r"IMP-\d{3}", impact_id):
+        raise StructuredOutputError(f"{field_name}.impact_id must use IMP-001 format")
+    historical_names = _require_list_of_str(payload, "historical_names", field_name)
+    if len(historical_names) > 3:
+        raise StructuredOutputError(f"{field_name}.historical_names permits at most 3 items")
+    proposed_stock_code = _optional_str(payload, "proposed_stock_code", field_name) or ""
+    if proposed_stock_code and not re.fullmatch(r"\d{6}", proposed_stock_code):
+        raise StructuredOutputError(f"{field_name}.proposed_stock_code must be empty or a six-digit code")
+    origin_channels = _require_list_of_str(payload, "origin_channels", field_name)
+    if not origin_channels:
+        raise StructuredOutputError(f"{field_name}.origin_channels must contain at least one source channel")
+    return CompanySeed(
+        impact_id=impact_id,
+        proposed_name=_require_str(payload, "proposed_name", field_name),
+        historical_names=historical_names,
+        proposed_stock_code=proposed_stock_code,
+        seed_reason=_require_str(payload, "seed_reason", field_name),
+        origin_channels=origin_channels,
     )
 
 
@@ -294,6 +351,12 @@ def _require_fields(payload: dict[str, Any], object_name: str, fields: tuple[str
     missing = [field for field in fields if field not in payload]
     if missing:
         raise StructuredOutputError(f"{object_name} missing required field(s): {', '.join(missing)}")
+
+
+def _reject_extra_fields(payload: dict[str, Any], object_name: str, fields: tuple[str, ...]) -> None:
+    extras = sorted(set(payload) - set(fields))
+    if extras:
+        raise StructuredOutputError(f"{object_name} contains unsupported field(s): {', '.join(extras)}")
 
 
 def _require_dict(payload: dict[str, Any], field_name: str, parent: str | None = None) -> dict[str, Any]:

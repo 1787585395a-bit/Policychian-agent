@@ -228,9 +228,10 @@ def run_company_react_search(
         search_web,
         _invoke_with_log,
         _append_sector_selection_log,
+        _candidate_stock_search_terms,
         _industry_terms,
+        _is_specific_stock_search_term,
         _load_cnfinancial_sector_catalogs,
-        _sector_search_terms,
         _select_cnfinancial_sectors,
         _selected_sector_names,
     )
@@ -251,7 +252,20 @@ def run_company_react_search(
     sector_selection["impact_id"] = impact_id
     _append_sector_selection_log(tool_logs, sector_selection, impact_id=impact_id)
     legal_industries = _selected_sector_names(sector_selection, "selected_industries")
-    search_terms = _sector_search_terms(sector_selection, [query])
+    search_terms: list[str] = []
+    for term in [
+        *_candidate_stock_search_terms(scoped_impact),
+        *_selected_sector_names(sector_selection, "selected_concepts"),
+        *legal_industries,
+    ]:
+        normalized = str(term or "").strip()
+        if _is_specific_stock_search_term(normalized) and normalized not in search_terms:
+            search_terms.append(normalized)
+    search_terms = search_terms[:2]
+    sanitized_goal = (
+        f"Find A-share company business evidence for impact {impact_id or 'unscoped'}. "
+        f"CNFinancial search_stock may use only these short terms: {json.dumps(search_terms, ensure_ascii=False)}."
+    )
 
     def cnfinancial(tool_name: str, arguments: dict[str, Any]) -> list[dict[str, Any]]:
         raw, call_log = _invoke_with_log(
@@ -315,22 +329,29 @@ def run_company_react_search(
         return cnfinancial("get_industry_stocks", {"industry": industry})
 
     tools = [
-        ReActTool("cnfinancial.search_stock", "Search A-share candidate companies by business or product keyword.", lambda args: cnfinancial("search_stock", {"keyword": str(args.get("query") or query)})),
+        ReActTool(
+            "cnfinancial.search_stock",
+            "Search A-share candidates with one specific 2-24 character product, equipment, or value-chain term.",
+            lambda args: cnfinancial(
+                "search_stock",
+                {"keyword": str(args.get("query") or (search_terms[0] if search_terms else ""))},
+            ),
+        ),
         ReActTool("cnfinancial.get_industry_stocks", "Fetch A-share companies in a legal CNFinancial industry board.", industry_stocks),
         ReActTool("web.search", "Search exchange filings, company announcements, and official company evidence.", lambda args: search_web(str(args.get("query") or query), source_priority=COMPANY_SOURCE_PRIORITY, top_k=int(args.get("top_k") or top_k), invoker=invoker)),
     ]
-    required_actions: list[tuple[str, dict[str, Any]]] = [
-        ("cnfinancial.search_stock", {"query": (search_terms[0] if search_terms else query)}),
-    ]
+    required_actions: list[tuple[str, dict[str, Any]]] = []
+    if search_terms:
+        required_actions.append(("cnfinancial.search_stock", {"query": search_terms[0]}))
     if legal_industries:
         required_actions.insert(0, ("cnfinancial.get_industry_stocks", {"industry": legal_industries[0]}))
     required_run = _run_required_tools(
-        goal=query,
+        goal=sanitized_goal,
         tools=tools,
         required_actions=required_actions,
     )
     planned_run = run_react_retrieval(
-        goal=f"Find A-share company business evidence for: {query}",
+        goal=sanitized_goal,
         tools=tools,
         llm_client=llm_client,
         max_steps=max_steps,

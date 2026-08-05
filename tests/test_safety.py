@@ -27,6 +27,28 @@ class SafetyTests(unittest.TestCase):
         for term in ("买入", "卖出", "目标价", "推荐股票", "确定性投资建议"):
             self.assertIn(term, PROHIBITED_INVESTMENT_TERMS)
 
+    def test_investor_directed_and_return_narrative_terms_are_rejected_with_spacing_or_punctuation(self) -> None:
+        phrases = (
+            "对于 投资者 而言",
+            "投资者，应重点关注",
+            "投资者 可 重点关注",
+            "应、重点关注",
+            "确定性，趋势",
+            "确定性 需求",
+            "构成利好",
+            "存在利空",
+            "成长-叙事",
+        )
+
+        for phrase in phrases:
+            with self.subTest(phrase=phrase):
+                self.assertTrue(contains_prohibited_terms(phrase))
+                with self.assertRaises(SafetyViolation):
+                    assert_no_investment_advice(phrase)
+
+    def test_neutral_company_watchlist_title_remains_allowed(self) -> None:
+        assert_no_investment_advice("## A 股公司关注清单\n仅用于公司业务匹配研究。")
+
 
 if __name__ == "__main__":
     unittest.main()

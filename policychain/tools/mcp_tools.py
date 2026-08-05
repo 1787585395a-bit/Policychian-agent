@@ -9,11 +9,12 @@ from typing import Any
 from uuid import uuid4
 
 from policychain.mcp import (
-    MCPToolError,
     MCPToolInvoker,
     MCPToolUnavailable,
+    RuntimeMCPInvoker,
     UnavailableMCPInvoker,
     mcp_payload_error_message,
+    runtime_mcp_invoker,
 )
 
 
@@ -56,12 +57,6 @@ CNFINANCIAL_INDUSTRY_TOOLS_WITH_TERM = {"get_industry_stocks", "get_industry_pe"
 CNFINANCIAL_LIST_TOOLS = {"get_industry_list", "get_concept_list", "get_sector_fund_flow"}
 CNFINANCIAL_MACRO_TOOLS = {"get_macro_gdp", "get_macro_cpi", "get_macro_pmi", "get_macro_money_supply"}
 
-DEFAULT_COMPANY_INDUSTRY_BOARDS = (
-    "\u8f6f\u4ef6\u5f00\u53d1",  # 软件开发
-    "\u4e92\u8054\u7f51\u670d\u52a1",  # 互联网服务
-    "\u8ba1\u7b97\u673a\u8bbe\u5907",  # 计算机设备
-)
-
 INDUSTRY_BOARD_MAPPINGS = (
     (
         (
@@ -97,8 +92,12 @@ INDUSTRY_BOARD_MAPPINGS = (
 
 COMPANY_NAME_KEYS = (
     "company_name",
+    "current_name",
     "name",
     "stock_name",
+    "sec_name",
+    "secName",
+    "security_name",
     "\u540d\u79f0",
     "\u80a1\u7968\u7b80\u79f0",
     "\u8bc1\u5238\u7b80\u79f0",
@@ -107,6 +106,9 @@ COMPANY_CODE_KEYS = (
     "stock_code",
     "code",
     "symbol",
+    "sec_code",
+    "secCode",
+    "security_code",
     "\u4ee3\u7801",
     "\u80a1\u7968\u4ee3\u7801",
     "\u8bc1\u5238\u4ee3\u7801",
@@ -176,6 +178,112 @@ COMPANY_BUSINESS_EVIDENCE_KEYWORDS = (
     "补贴",
     "资质",
     "政策风险",
+)
+
+GENERIC_STOCK_SEARCH_TERMS = {
+    "服务",
+    "制造",
+    "电力",
+    "企业",
+    "行业",
+    "产业",
+    "公司",
+    "业务",
+    "产品",
+    "设备",
+    "平台",
+    "技术",
+    "供应商",
+    "服务商",
+    "制造商",
+    "运营商",
+}
+COMPANY_SEARCH_STOCK_MAX_CALLS_PER_IMPACT = 2
+INVALID_STOCK_SEARCH_MARKERS = (
+    "->",
+    "=>",
+    "→",
+    "⇒",
+    "⟶",
+    "政策措施",
+    "政策要求",
+    "传导路径",
+    "影响路径",
+)
+INVALID_STOCK_SEARCH_ACTIONS = (
+    "推动",
+    "促进",
+    "支持",
+    "要求",
+    "实施",
+    "建设",
+    "形成",
+    "影响",
+    "带动",
+    "增加",
+    "降低",
+    "提升",
+    "采购",
+    "布局",
+    "开展",
+    "组织",
+)
+INVALID_STOCK_SEARCH_METRIC_TERMS = (
+    "收入确认",
+    "收入",
+    "营收",
+    "销量",
+    "单价",
+    "价格",
+    "投资额",
+    "金额",
+    "资本开支",
+    "成本",
+    "利润",
+    "毛利",
+    "产量",
+    "装机量",
+    "渗透率",
+    "利用率",
+    "交易量",
+    "运营效率",
+    "效率",
+    "能效",
+    "碳效",
+    "配套率",
+    "增长率",
+    "市占率",
+    "份额",
+    "确认节奏",
+    "节奏",
+    "应用场景",
+    "场景",
+    "指标",
+    "经营变量",
+)
+GENERIC_TERM_SUFFIXES = (
+    "需求",
+    "规模",
+    "成本",
+    "价格",
+    "收入",
+    "销量",
+    "产量",
+    "装机量",
+    "渗透率",
+    "利用率",
+    "资本开支",
+    "订单",
+    "能耗",
+    "企业",
+    "公司",
+    "供应商",
+    "服务商",
+    "制造商",
+    "运营商",
+    "机构",
+    "行业",
+    "产业",
 )
 
 
@@ -405,10 +513,11 @@ def collect_company_candidates(
     if top_k_per_industry <= 0:
         raise ValueError("top_k_per_industry must be positive")
     max_candidates_per_impact = _mcp_int_setting("POLICYCHAIN_MCP_MAX_COMPANY_CANDIDATES", 5, minimum=1)
-    industry_catalog, concept_catalog = _load_cnfinancial_sector_catalogs(invoker, tool_logs)
-    if tool_logs is not None:
-        for log in tool_logs[-2:]:
-            log["internal_only"] = True
+    active_logs = tool_logs if tool_logs is not None else []
+    industry_catalog, concept_catalog = _load_cnfinancial_sector_catalogs(invoker, active_logs)
+    catalog_logs = list(active_logs[-2:])
+    for log in catalog_logs:
+        log["internal_only"] = True
 
     path_candidates: list[dict[str, Any]] = []
     for impact_index, impact in enumerate(industry_impacts, start=1):
@@ -423,10 +532,11 @@ def collect_company_candidates(
             max_concepts=_mcp_int_setting("POLICYCHAIN_MCP_MAX_SELECTED_CONCEPTS", 3, minimum=0),
         )
         selection["impact_id"] = impact_id
-        _append_sector_selection_log(tool_logs, selection, impact_id=impact_id)
+        _append_sector_selection_log(active_logs, selection, impact_id=impact_id)
         legal_industries = _selected_sector_names(selection, "selected_industries")
         selected_concepts = _selected_sector_names(selection, "selected_concepts")
         recalled: list[dict[str, Any]] = []
+        recall_logs: list[dict[str, Any]] = []
 
         for industry in legal_industries:
             raw, call_log = _invoke_with_log(
@@ -434,9 +544,10 @@ def collect_company_candidates(
                 server_name=CNFINANCIAL_SERVER,
                 tool_name="get_industry_stocks",
                 arguments={"industry": industry},
-                tool_logs=tool_logs,
+                tool_logs=active_logs,
                 log_context={"impact_id": impact_id, "sector": industry, "source_type": "raw_recall"},
             )
+            recall_logs.append(call_log)
             items = _payload_items(raw)
             for item in items[:max_candidates_per_impact]:
                 candidate = _candidate_from_recall(
@@ -456,27 +567,31 @@ def collect_company_candidates(
             call_log["normalized_count"] = len(recalled)
             call_log["truncated"] = len(items) > max_candidates_per_impact
 
-        search_terms = _unique(
+        search_term_budget = _mcp_int_setting("POLICYCHAIN_MCP_MAX_SEARCH_TERMS", 2, minimum=0)
+        search_terms = _limited(
             [
-                *selected_concepts,
-                *_limited(
-                    _sector_search_terms(selection, impact_terms),
-                    _mcp_int_setting("POLICYCHAIN_MCP_MAX_SEARCH_TERMS", 2, minimum=1),
-                ),
-                *_candidate_stock_search_terms(impact)[:1],
-            ]
+                term
+                for term in _unique(
+                    [
+                        *_candidate_stock_search_terms(impact),
+                        *selected_concepts,
+                        *legal_industries,
+                    ]
+                )
+                if _is_specific_stock_search_term(term)
+            ],
+            search_term_budget,
         )
-        if not search_terms:
-            search_terms = [_impact_candidate_term(impact) or "A股"]
         for term in search_terms:
             raw, call_log = _invoke_with_log(
                 invoker=invoker,
                 server_name=CNFINANCIAL_SERVER,
                 tool_name="search_stock",
                 arguments={"keyword": term},
-                tool_logs=tool_logs,
+                tool_logs=active_logs,
                 log_context={"impact_id": impact_id, "keyword": term, "source_type": "raw_recall"},
             )
+            recall_logs.append(call_log)
             items = _payload_items(raw)
             accepted_before = len(recalled)
             for item in items[:max_candidates_per_impact]:
@@ -499,18 +614,22 @@ def collect_company_candidates(
 
         deduped = _dedupe_and_merge_companies(recalled)
         kept = deduped[:max_candidates_per_impact]
+        for candidate in kept:
+            candidate["retrieval_status"] = "ok"
         _append_candidate_summary_log(
-            tool_logs,
+            active_logs,
             impact_id=impact_id,
             raw_count=len(recalled),
             dedup_count=len(deduped),
             kept_count=len(kept),
+            recall_logs=recall_logs or catalog_logs,
+            query_terms=search_terms,
         )
         path_candidates.extend(kept)
 
     candidates = _dedupe_and_merge_companies(path_candidates)
     for candidate in candidates:
-        _enrich_company_candidate(candidate, invoker=invoker, tool_logs=tool_logs)
+        _enrich_company_candidate(candidate, invoker=invoker, tool_logs=active_logs)
         candidate["enriched"] = True
     return candidates
 
@@ -596,6 +715,613 @@ def merge_react_company_candidates(
             _enrich_company_candidate(candidate, invoker=invoker, tool_logs=tool_logs)
             candidate["enriched"] = True
     return merged, audit
+
+
+def resolve_company_seeds(
+    seeds: list[dict[str, Any]],
+    industry_impacts: list[dict[str, Any]],
+    invoker: MCPToolInvoker | None = None,
+    tool_logs: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Resolve untrusted LLM/Web seeds into identity-verified CNFinancial candidates.
+
+    Search results are clues only. A seed is promoted only when a current A-share
+    identity is confirmed by an explicit current-status company-info response or
+    by an official exchange/CNInfo/company disclosure. Company profile data may
+    enrich a known code, but never proves that the security is currently listed.
+    """
+
+    impacts = {
+        _impact_identifier(impact, index): impact
+        for index, impact in enumerate(industry_impacts, start=1)
+    }
+    active_logs = tool_logs if tool_logs is not None else []
+    audit: list[dict[str, Any]] = []
+    prepared: list[dict[str, Any]] = []
+    search_cache: dict[str, tuple[Any, dict[str, Any]]] = {}
+
+    for seed_index, seed in enumerate(seeds, start=1):
+        impact_id = str(seed.get("impact_id") or "")
+        seed_id = str(seed.get("seed_id") or f"seed-{seed_index:03d}")
+        proposed_name = str(seed.get("proposed_name") or "").strip()
+        historical_names = _unique(str(value).strip() for value in (seed.get("historical_names") or []))[:3]
+        proposed_code = _normalize_stock_code(str(seed.get("proposed_stock_code") or ""))
+        base = {
+            "time": datetime.now(timezone.utc).isoformat(),
+            "seed_id": seed_id,
+            "impact_id": impact_id,
+            "proposed_name": proposed_name,
+            "proposed_stock_code": proposed_code,
+            "source": ",".join(str(value) for value in (seed.get("origin_channels") or [])) or "llm",
+            "url": "",
+            "date": str(seed.get("time") or ""),
+            "tool_call_id": str(seed.get("tool_call_id") or ""),
+            "cache_hit": False,
+        }
+        if impact_id not in impacts:
+            _append_company_seed_audit(audit, base, "rejected", "invalid_impact_id")
+            continue
+        if not proposed_name:
+            _append_company_seed_audit(audit, base, "rejected", "missing_proposed_name")
+            continue
+        if proposed_code and not _is_current_a_share_code(proposed_code):
+            _append_company_seed_audit(audit, base, "rejected", "non_current_a_share_code")
+            continue
+
+        search_items: list[dict[str, Any]] = []
+        search_logs: list[dict[str, Any]] = []
+        for exact_name in _unique([proposed_name, *historical_names]):
+            cache_key = _normalize_company_name(exact_name)
+            cache_hit = cache_key in search_cache
+            if cache_hit:
+                raw, call_log = search_cache[cache_key]
+            else:
+                raw, call_log = _invoke_with_log(
+                    invoker=invoker,
+                    server_name=CNFINANCIAL_SERVER,
+                    tool_name="search_stock",
+                    arguments={"keyword": exact_name},
+                    tool_logs=active_logs,
+                    log_context={
+                        "impact_id": impact_id,
+                        "seed_id": seed_id,
+                        "source_type": "company_seed_identity_clue",
+                    },
+                )
+                search_cache[cache_key] = (raw, call_log)
+            search_items.extend(_payload_items(raw))
+            search_logs.append({**call_log, "cache_hit": cache_hit or bool(call_log.get("cache_hit"))})
+
+        search_codes = _unique(
+            _normalize_stock_code(str(_first_value(item, COMPANY_CODE_KEYS) or ""))
+            for item in search_items
+            if _normalize_stock_code(str(_first_value(item, COMPANY_CODE_KEYS) or ""))
+        )
+        search_names_by_code: dict[str, list[str]] = {}
+        for item in search_items:
+            item_code = _normalize_stock_code(str(_first_value(item, COMPANY_CODE_KEYS) or ""))
+            item_name = str(_first_value(item, COMPANY_NAME_KEYS) or "").strip()
+            if item_code and item_name:
+                search_names_by_code.setdefault(item_code, [])
+                search_names_by_code[item_code] = _unique([*search_names_by_code[item_code], item_name])
+
+        base["tool_call_id"] = str(search_logs[0].get("tool_call_id") or base["tool_call_id"]) if search_logs else base["tool_call_id"]
+        base["cache_hit"] = bool(search_logs and all(bool(item.get("cache_hit")) for item in search_logs))
+        if len(search_codes) > 1:
+            _append_company_seed_audit(audit, base, "rejected", "ambiguous_name_multiple_codes")
+            continue
+        search_code = search_codes[0] if search_codes else ""
+        if proposed_code and search_code and proposed_code != search_code:
+            _append_company_seed_audit(audit, base, "rejected", "name_code_conflict")
+            continue
+        resolved_code = proposed_code or search_code
+        if not resolved_code:
+            reason_code = _search_failure_reason(search_logs, fallback="identity_code_unresolved")
+            _append_company_seed_audit(audit, base, "unresolved", reason_code)
+            continue
+        if not _is_current_a_share_code(resolved_code):
+            _append_company_seed_audit(audit, base, "rejected", "non_current_a_share_code")
+            continue
+        prepared.append(
+            {
+                "seed": seed,
+                "base": base,
+                "code": resolved_code,
+                "search_items": search_items,
+                "search_names": search_names_by_code.get(resolved_code, []),
+                "search_empty": not search_items,
+                "search_logs": search_logs,
+            }
+        )
+
+    codes_by_name: dict[str, set[str]] = {}
+    for item in prepared:
+        name_key = _normalize_company_name(str(item["seed"].get("proposed_name") or ""))
+        codes_by_name.setdefault(name_key, set()).add(str(item["code"]))
+    ambiguous_seed_names = {name for name, codes in codes_by_name.items() if name and len(codes) > 1}
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in prepared:
+        name_key = _normalize_company_name(str(item["seed"].get("proposed_name") or ""))
+        if name_key in ambiguous_seed_names:
+            _append_company_seed_audit(
+                audit,
+                item["base"],
+                "rejected",
+                "ambiguous_name_multiple_codes",
+            )
+            continue
+        grouped.setdefault(str(item["code"]), []).append(item)
+
+    candidates: list[dict[str, Any]] = []
+    for code, group in grouped.items():
+        first = group[0]
+        first_seed = first["seed"]
+        first_base = first["base"]
+        profile_raw, profile_log = _invoke_with_log(
+            invoker=invoker,
+            server_name=CNFINANCIAL_SERVER,
+            tool_name="get_company_profile",
+            arguments={"symbol": code},
+            tool_logs=active_logs,
+            log_context={
+                "impact_id": str(first_seed.get("impact_id") or ""),
+                "seed_id": str(first_seed.get("seed_id") or ""),
+                "source_type": "company_seed_enrichment",
+            },
+        )
+        info_raw, info_log = _invoke_with_log(
+            invoker=invoker,
+            server_name=CNFINANCIAL_SERVER,
+            tool_name="get_company_info",
+            arguments={"symbol": code},
+            tool_logs=active_logs,
+            log_context={
+                "impact_id": str(first_seed.get("impact_id") or ""),
+                "seed_id": str(first_seed.get("seed_id") or ""),
+                "source_type": "company_seed_identity",
+            },
+        )
+        identity_query = (
+            f'{str(first_seed.get("proposed_name") or "")} {code} '
+            "证券简称 证券代码 当前上市 公司概况 更名 公告"
+        ).strip()
+        web_raw, web_log = _invoke_with_log(
+            invoker=invoker,
+            server_name=OPEN_WEBSEARCH_SERVER,
+            tool_name=OPEN_WEBSEARCH_SEARCH_TOOL,
+            arguments={"query": identity_query, "limit": 5},
+            tool_logs=active_logs,
+            log_context={
+                "impact_id": str(first_seed.get("impact_id") or ""),
+                "seed_id": str(first_seed.get("seed_id") or ""),
+                "source_type": "company_seed_official_identity",
+            },
+        )
+        web_evidence = normalize_mcp_evidence(
+            web_raw,
+            query=identity_query,
+            server_name=OPEN_WEBSEARCH_SERVER,
+            tool_name=OPEN_WEBSEARCH_SEARCH_TOOL,
+            source_priority=COMPANY_SOURCE_PRIORITY,
+        )
+        candidate_names = _unique(
+            [
+                *(name for item in group for name in item.get("search_names") or []),
+                *(str(item["seed"].get("proposed_name") or "") for item in group),
+                *(str(name) for item in group for name in (item["seed"].get("historical_names") or [])),
+            ]
+        )
+        identity = _resolve_current_company_identity(
+            code=code,
+            candidate_names=candidate_names,
+            company_info=info_raw,
+            web_evidence=web_evidence,
+        )
+        if str(identity.get("status") or "") == "unresolved":
+            identity["reason_code"] = _search_failure_reason(
+                [info_log, web_log],
+                fallback=str(identity.get("reason_code") or "current_identity_unverified"),
+            )
+
+        accepted: list[dict[str, Any]] = []
+        official_url = str(identity.get("source_url") or "")
+        official_date = str(identity.get("data_date") or "")
+        for group_index, item in enumerate(group):
+            seed = item["seed"]
+            base = {
+                **item["base"],
+                "stock_code": code,
+                "company_name": str(identity.get("company_name") or ""),
+                "tool_call_id": str(identity.get("tool_call_id") or info_log.get("tool_call_id") or web_log.get("tool_call_id") or ""),
+                "source": str(identity.get("source") or "official_identity"),
+                "url": official_url,
+                "date": official_date,
+                "cache_hit": group_index > 0 or bool(identity.get("cache_hit")),
+            }
+            enrichment_reason = (
+                "profile_enriched"
+                if _payload_items(profile_raw)
+                else _search_failure_reason([profile_log], fallback="profile_empty")
+            )
+            _record_company_stage_event(
+                "company.enrichment",
+                base={
+                    **base,
+                    "tool_call_id": str(profile_log.get("tool_call_id") or ""),
+                    "source": CNFINANCIAL_SERVER,
+                    "cache_hit": group_index > 0 or bool(profile_log.get("cache_hit")),
+                },
+                status="ok" if _payload_items(profile_raw) else str(profile_log.get("status") or "empty"),
+                reason_code=enrichment_reason,
+            )
+            if str(identity.get("status") or "") != "verified":
+                _append_company_seed_audit(
+                    audit,
+                    base,
+                    str(identity.get("status") or "unresolved"),
+                    str(identity.get("reason_code") or "current_identity_unverified"),
+                )
+                continue
+            proposed_name = str(seed.get("proposed_name") or "")
+            current_name = str(identity.get("company_name") or "")
+            if _normalize_company_name(proposed_name) != _normalize_company_name(current_name):
+                if not _official_rename_chain(
+                    code=code,
+                    old_name=proposed_name,
+                    current_name=current_name,
+                    evidence=web_evidence,
+                ):
+                    _append_company_seed_audit(audit, base, "rejected", "unverified_or_ambiguous_alias")
+                    continue
+            reason_code = "identity_verified"
+            if bool(item.get("search_empty")) and _payload_items(profile_raw):
+                reason_code = "profile_found_search_empty"
+            _append_company_seed_audit(audit, base, "verified", reason_code)
+            accepted.append(item)
+
+        if not accepted:
+            continue
+
+        impact_ids = _unique(str(item["seed"].get("impact_id") or "") for item in accepted)
+        first_impact = impacts[impact_ids[0]]
+        profile_evidence = normalize_mcp_evidence(
+            profile_raw,
+            query=code,
+            server_name=CNFINANCIAL_SERVER,
+            tool_name="get_company_profile",
+        )
+        info_evidence = normalize_mcp_evidence(
+            info_raw,
+            query=code,
+            server_name=CNFINANCIAL_SERVER,
+            tool_name="get_company_info",
+        )
+        business_values = _unique(
+            str(_first_value(raw_item, BUSINESS_KEYS) or "")
+            for raw_item in [*_payload_items(profile_raw), *_payload_items(info_raw)]
+        )
+        data_dates = _unique(
+            str(_first_value(raw_item, ("data_date", "date", "publish_date", "year")) or "")
+            for raw_item in [*_payload_items(profile_raw), *_payload_items(info_raw)]
+        )
+        candidate = {
+            "company_name": str(identity.get("company_name") or ""),
+            "stock_code": code,
+            "industry_segment": str(first_impact.get("chain_segment") or first_impact.get("industry") or ""),
+            "chain_segment": str(first_impact.get("chain_segment") or first_impact.get("industry") or ""),
+            "matched_business": " ".join(business_values),
+            "business_evidence": " ".join(business_values),
+            "business_keywords": _unique(
+                keyword
+                for impact_id in impact_ids
+                for keyword in _company_keywords(impacts[impact_id])
+            ),
+            "source_name": "CNFinancial MCP + official identity evidence",
+            "source_url": official_url,
+            "data_date": data_dates[0] if data_dates else official_date or "unknown",
+            "revenue_relevance": "unknown",
+            "candidate_source_tool": "get_company_profile",
+            "impact_ids": impact_ids,
+            "seed_reasons": _unique(str(item["seed"].get("seed_reason") or "") for item in accepted),
+            "identity_verified": True,
+            "provenance": [
+                {
+                    "impact_id": str(item["seed"].get("impact_id") or ""),
+                    "seed_id": str(item["seed"].get("seed_id") or ""),
+                    "seed_reason": str(item["seed"].get("seed_reason") or ""),
+                    "origin_channels": list(item["seed"].get("origin_channels") or []),
+                    "tool": "get_company_profile",
+                    "tool_call_id": str(profile_log.get("tool_call_id") or ""),
+                    "source_type": "llm_web_seed_cnfinancial_verified",
+                    "source_url": official_url,
+                    "data_date": official_date,
+                }
+                for item in accepted
+            ],
+            "mcp_evidence": _dedupe_evidence([*profile_evidence, *info_evidence, *web_evidence]),
+            "cnfinancial_raw": _payload_items(profile_raw)[0] if _payload_items(profile_raw) else {},
+        }
+        candidates.append(candidate)
+
+    return _dedupe_and_merge_companies(candidates), audit
+
+
+def _append_company_seed_audit(
+    audit: list[dict[str, Any]],
+    base: dict[str, Any],
+    status: str,
+    reason_code: str,
+) -> None:
+    entry = {**base, "status": status, "reason_code": reason_code}
+    audit.append(entry)
+    _record_company_stage_event("company.identity", base=base, status=status, reason_code=reason_code)
+
+
+def _record_company_stage_event(
+    event_type: str,
+    *,
+    base: dict[str, Any],
+    status: str,
+    reason_code: str,
+) -> None:
+    try:
+        from policychain.observability import record_event
+
+        record_event(
+            event_type,
+            stage="company_matcher",
+            status=status,
+            seed_id=str(base.get("seed_id") or ""),
+            impact_id=str(base.get("impact_id") or ""),
+            tool_call_id=str(base.get("tool_call_id") or ""),
+            reason_code=reason_code,
+            cache_hit=bool(base.get("cache_hit")),
+            source=str(base.get("source") or ""),
+            url=str(base.get("url") or ""),
+            date=str(base.get("date") or ""),
+            company_name=str(base.get("company_name") or ""),
+            stock_code=str(base.get("stock_code") or base.get("proposed_stock_code") or ""),
+        )
+    except Exception:
+        return
+
+
+def _resolve_current_company_identity(
+    *,
+    code: str,
+    candidate_names: list[str],
+    company_info: Any,
+    web_evidence: list[dict[str, Any]],
+) -> dict[str, Any]:
+    identities: list[dict[str, Any]] = []
+    non_current = False
+    for item in _payload_items(company_info):
+        item_code = _normalize_stock_code(str(_first_value(item, COMPANY_CODE_KEYS) or code))
+        if item_code != code:
+            continue
+        status_value = _first_value(
+            item,
+            (
+                "listing_status",
+                "list_status",
+                "listed_status",
+                "trade_status",
+                "market_status",
+                "status",
+                "is_listed",
+                "listed",
+                "上市状态",
+                "交易状态",
+            ),
+        )
+        if _is_non_current_listing_status(status_value):
+            non_current = True
+            continue
+        name = str(_first_value(item, COMPANY_NAME_KEYS) or "").strip()
+        if name and _is_current_listing_status(status_value):
+            identities.append(
+                {
+                    "company_name": name,
+                    "source": CNFINANCIAL_SERVER,
+                    "source_url": str(_first_value(item, ("source_url", "url", "link")) or ""),
+                    "data_date": str(_first_value(item, ("data_date", "date", "publish_date")) or ""),
+                    "tool_call_id": "",
+                }
+            )
+
+    for evidence in web_evidence:
+        raw_item = evidence.get("raw_payload") if isinstance(evidence.get("raw_payload"), dict) else {}
+        source_url = str(evidence.get("source_url") or "")
+        source_org = str(evidence.get("source_org") or "")
+        if not _is_official_company_identity_source(source_url, source_org):
+            continue
+        text = " ".join(
+            str(value or "")
+            for value in (
+                evidence.get("title"),
+                evidence.get("summary"),
+                raw_item.get("content"),
+                raw_item.get("description"),
+                raw_item.get("text"),
+                raw_item.get("stock_code"),
+                raw_item.get("secCode"),
+                raw_item.get("status"),
+                raw_item.get("listing_status"),
+                raw_item.get("current_name"),
+                raw_item.get("old_name"),
+                raw_item.get("former_name"),
+            )
+        )
+        raw_code = _normalize_stock_code(str(_first_value(raw_item, COMPANY_CODE_KEYS) or ""))
+        if raw_code and raw_code != code:
+            continue
+        if not raw_code and code not in text:
+            continue
+        raw_status = _first_value(
+            raw_item,
+            (
+                "listing_status",
+                "list_status",
+                "listed_status",
+                "trade_status",
+                "market_status",
+                "status",
+                "is_listed",
+                "listed",
+                "上市状态",
+                "交易状态",
+            ),
+        )
+        if _contains_non_current_listing_marker(text) or _is_non_current_listing_status(raw_status):
+            non_current = True
+            continue
+        if not _contains_current_identity_marker(text) and not _is_current_listing_status(raw_status):
+            continue
+        explicit_name = str(_first_value(raw_item, COMPANY_NAME_KEYS) or "").strip()
+        matched_names = [name for name in candidate_names if _normalize_company_name(name) in _normalize_company_name(text)]
+        name = explicit_name or _declared_current_name(text, matched_names)
+        if not name and len({_normalize_company_name(value) for value in matched_names}) == 1:
+            name = matched_names[0]
+        if name:
+            identities.append(
+                {
+                    "company_name": name,
+                    "source": source_org or "official_web",
+                    "source_url": source_url,
+                    "data_date": str(evidence.get("published_date") or ""),
+                    "tool_call_id": "",
+                }
+            )
+
+    if non_current:
+        return {"status": "rejected", "reason_code": "non_current_a_share_identity"}
+    by_name: dict[str, dict[str, Any]] = {}
+    for identity in identities:
+        normalized_name = _normalize_company_name(str(identity.get("company_name") or ""))
+        if normalized_name:
+            by_name.setdefault(normalized_name, identity)
+    if not by_name:
+        return {"status": "unresolved", "reason_code": "current_identity_unverified"}
+    if len(by_name) > 1:
+        return {"status": "rejected", "reason_code": "ambiguous_current_identity"}
+    return {"status": "verified", "reason_code": "identity_verified", **next(iter(by_name.values()))}
+
+
+def _official_rename_chain(
+    *,
+    code: str,
+    old_name: str,
+    current_name: str,
+    evidence: list[dict[str, Any]],
+) -> bool:
+    old_key = _normalize_company_name(old_name)
+    current_key = _normalize_company_name(current_name)
+    if not old_key or not current_key or old_key == current_key:
+        return old_key == current_key
+    for item in evidence:
+        if not _is_official_company_identity_source(str(item.get("source_url") or ""), str(item.get("source_org") or "")):
+            continue
+        raw_item = item.get("raw_payload") if isinstance(item.get("raw_payload"), dict) else {}
+        text = _normalize_company_name(
+            " ".join(
+                str(value or "")
+                for value in (
+                    item.get("title"),
+                    item.get("summary"),
+                    raw_item.get("content"),
+                    raw_item.get("description"),
+                    raw_item.get("text"),
+                    raw_item.get("stock_code"),
+                    raw_item.get("secCode"),
+                    raw_item.get("current_name"),
+                    raw_item.get("old_name"),
+                    raw_item.get("former_name"),
+                )
+            )
+        )
+        if code in text and old_key in text and current_key in text and re.search(r"更名|曾用名|原名|证券简称变更|股票简称变更", text):
+            return True
+    return False
+
+
+def _declared_current_name(text: str, candidate_names: list[str]) -> str:
+    normalized_text = _normalize_company_name(text)
+    declared = _unique(
+        name
+        for name in candidate_names
+        if any(
+            f"{marker}{_normalize_company_name(name)}" in normalized_text
+            for marker in ("变更为", "更名为", "现名为", "当前证券简称", "证券简称为", "股票简称为")
+        )
+    )
+    return declared[0] if len(declared) == 1 else ""
+
+
+def _is_official_company_identity_source(source_url: str, source_org: str) -> bool:
+    source_text = f"{source_url} {source_org}".lower()
+    return any(
+        marker in source_text
+        for marker in (
+            "cninfo.com.cn",
+            "sse.com.cn",
+            "szse.cn",
+            "bse.cn",
+            "巨潮资讯",
+            "上海证券交易所",
+            "深圳证券交易所",
+            "北京证券交易所",
+            "公司官网",
+            "official",
+        )
+    )
+
+
+def _contains_current_identity_marker(text: str) -> bool:
+    return bool(re.search(r"证券简称|股票简称|证券代码|股票代码|公司概况|当前上市|正常上市|上市公司|当前交易", text))
+
+
+def _contains_non_current_listing_marker(text: str) -> bool:
+    return bool(re.search(r"终止上市|退市|摘牌|暂停上市|已退市|delisted|terminated", text, re.IGNORECASE))
+
+
+def _is_current_listing_status(value: Any) -> bool:
+    if value is True:
+        return True
+    text = str(value or "").strip().lower()
+    if not text or _is_non_current_listing_status(text):
+        return False
+    return text in {"active", "listed", "normal", "trading", "上市", "正常", "交易", "正常上市"} or any(
+        marker in text for marker in ("正常交易", "当前上市", "正常上市")
+    )
+
+
+def _is_non_current_listing_status(value: Any) -> bool:
+    if value is False:
+        return True
+    text = str(value or "").strip().lower()
+    return any(marker in text for marker in ("delisted", "terminated", "inactive", "退市", "摘牌", "终止上市", "暂停上市"))
+
+
+def _is_current_a_share_code(code: str) -> bool:
+    if not re.fullmatch(r"\d{6}", code) or code.startswith(("200", "900")):
+        return False
+    return code.startswith(("0", "3", "4", "6", "8", "920"))
+
+
+def _normalize_company_name(value: str) -> str:
+    return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]", "", str(value or "")).lower()
+
+
+def _search_failure_reason(logs: list[dict[str, Any]], fallback: str) -> str:
+    statuses = {str(item.get("status") or "") for item in logs}
+    if "unavailable" in statuses:
+        return "tool_unavailable"
+    if "error" in statuses:
+        return "tool_error"
+    if "skipped" in statuses:
+        return "tool_skipped"
+    return fallback
 
 
 def _provenance_impact_ids(record: dict[str, Any]) -> list[str]:
@@ -711,25 +1437,133 @@ def _invoke_with_log(
     tool_logs: list[dict[str, Any]] | None = None,
     log_context: dict[str, Any] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
-    active_invoker = invoker or UnavailableMCPInvoker()
+    active_invoker: MCPToolInvoker = runtime_mcp_invoker(invoker) if invoker is not None else UnavailableMCPInvoker()
     log_entry = _new_tool_log(server_name=server_name, tool_name=tool_name, arguments=arguments)
     log_entry.update(log_context or {})
+    is_company_stock_search = server_name == CNFINANCIAL_SERVER and tool_name == "search_stock"
+    budget_scope = str(log_entry.get("impact_id") or "unscoped")
+    budget_reserved = False
+    if is_company_stock_search:
+        query = str(arguments.get("keyword") or arguments.get("query") or "").strip()
+        log_entry.update(
+            {
+                "impact_id": budget_scope,
+                "query": query,
+                "query_budget_limit": COMPANY_SEARCH_STOCK_MAX_CALLS_PER_IMPACT,
+                "actual_execution": False,
+            }
+        )
+        if not _is_specific_stock_search_term(query):
+            log_entry.update(
+                {
+                    "status": "skipped",
+                    "skip_reason": "invalid_query",
+                    "error": "Rejected non-specific or descriptive company search query",
+                    "duration_ms": 0.0,
+                    "query_budget_used": _query_budget_used(active_invoker, server_name, tool_name, budget_scope),
+                }
+            )
+            _append_tool_log(tool_logs, log_entry)
+            _record_mcp_event(log_entry)
+            return [], log_entry
+        if isinstance(active_invoker, RuntimeMCPInvoker):
+            allowed, used = active_invoker.reserve_query_budget(
+                server_name,
+                tool_name,
+                budget_scope,
+                limit=COMPANY_SEARCH_STOCK_MAX_CALLS_PER_IMPACT,
+            )
+            log_entry["query_budget_used"] = used
+            if not allowed:
+                log_entry.update(
+                    {
+                        "status": "skipped",
+                        "skip_reason": "query_budget",
+                        "error": "Per-impact company search query budget exhausted",
+                        "duration_ms": 0.0,
+                    }
+                )
+                _append_tool_log(tool_logs, log_entry)
+                _record_mcp_event(log_entry)
+                return [], log_entry
+            budget_reserved = True
+    if isinstance(active_invoker, RuntimeMCPInvoker):
+        health, first_check = active_invoker.preflight(server_name)
+        if first_check:
+            _record_mcp_health_event(server_name, health)
     started = perf_counter()
     try:
         raw = active_invoker.invoke(server_name, tool_name, arguments)
+        if is_company_stock_search:
+            log_entry["actual_execution"] = True
         error_message = mcp_payload_error_message(raw, server_name=server_name, tool_name=tool_name)
         if error_message:
-            log_entry.update({"status": "error", "error": error_message, "count": 0, "duration_ms": _elapsed_ms(started)})
+            log_entry.update(
+                {
+                    "status": "error",
+                    "error": error_message,
+                    "count": 0,
+                    "duration_ms": _elapsed_ms(started),
+                    **_runtime_call_metadata(active_invoker),
+                }
+            )
             _append_tool_log(tool_logs, log_entry)
             _record_invoker_error(active_invoker, error_message)
             _record_mcp_event(log_entry)
             return [], log_entry
-        log_entry.update({"status": "ok", "count": _payload_count(raw), "error": "", "duration_ms": _elapsed_ms(started)})
+        count = _payload_count(raw)
+        log_entry.update(
+            {
+                "status": "ok" if count else "empty",
+                "count": count,
+                "error": "",
+                "duration_ms": _elapsed_ms(started),
+                **_runtime_call_metadata(active_invoker),
+            }
+        )
         _append_tool_log(tool_logs, log_entry)
         _record_mcp_event(log_entry)
         return raw, log_entry
-    except (MCPToolError, MCPToolUnavailable) as exc:
-        log_entry.update({"status": "error", "error": str(exc), "count": 0, "duration_ms": _elapsed_ms(started)})
+    except MCPToolUnavailable as exc:
+        runtime_metadata = _runtime_call_metadata(active_invoker)
+        circuit_skipped = bool(runtime_metadata.get("skipped"))
+        if budget_reserved and circuit_skipped and isinstance(active_invoker, RuntimeMCPInvoker):
+            log_entry["query_budget_used"] = active_invoker.release_query_budget(
+                server_name, tool_name, budget_scope
+            )
+        log_entry.update(
+            {
+                "status": "unavailable",
+                "error": str(exc),
+                "count": 0,
+                "duration_ms": _elapsed_ms(started),
+                **runtime_metadata,
+            }
+        )
+        if is_company_stock_search:
+            log_entry["actual_execution"] = bool(invoker is not None and not circuit_skipped)
+        _append_tool_log(tool_logs, log_entry)
+        _record_invoker_error(active_invoker, str(exc))
+        _record_mcp_event(log_entry)
+        return [], log_entry
+    except Exception as exc:
+        runtime_metadata = _runtime_call_metadata(active_invoker)
+        circuit_skipped = bool(runtime_metadata.get("skipped"))
+        if budget_reserved and circuit_skipped and isinstance(active_invoker, RuntimeMCPInvoker):
+            log_entry["query_budget_used"] = active_invoker.release_query_budget(
+                server_name, tool_name, budget_scope
+            )
+        log_entry.update(
+            {
+                "status": "error",
+                "error": str(exc),
+                "count": 0,
+                "duration_ms": _elapsed_ms(started),
+                **runtime_metadata,
+            }
+        )
+        if is_company_stock_search:
+            log_entry["actual_execution"] = bool(invoker is not None and not circuit_skipped)
         _append_tool_log(tool_logs, log_entry)
         _record_invoker_error(active_invoker, str(exc))
         _record_mcp_event(log_entry)
@@ -760,6 +1594,43 @@ def _record_mcp_event(log_entry: dict[str, Any]) -> None:
         record_event("mcp.call", **log_entry)
     except Exception:
         return
+
+
+def _record_mcp_health_event(server_name: str, health: dict[str, Any]) -> None:
+    try:
+        from policychain.observability import record_event
+
+        record_event(
+            "mcp.health",
+            stage="mcp",
+            status=str(health.get("status") or "unknown"),
+            server_name=server_name,
+            check="run_preflight",
+            circuit_open=bool(health.get("circuit_open")),
+            circuit_reason=str(health.get("circuit_reason") or ""),
+        )
+    except Exception:
+        return
+
+
+def _runtime_call_metadata(invoker: MCPToolInvoker) -> dict[str, Any]:
+    metadata_reader = getattr(invoker, "call_metadata", None)
+    if not callable(metadata_reader):
+        return {}
+    metadata = dict(metadata_reader())
+    return {
+        key: metadata.get(key)
+        for key in (
+            "cache_hit",
+            "skipped",
+            "circuit_open",
+            "circuit_scope",
+            "failure_count",
+            "server_status",
+            "tool_status",
+        )
+        if key in metadata
+    }
 
 
 def _append_tool_log(tool_logs: list[dict[str, Any]] | None, log_entry: dict[str, Any]) -> None:
@@ -1023,31 +1894,29 @@ def _candidate_industry_terms(impact: dict[str, Any]) -> list[str]:
     raw_industry = str(impact.get("industry") or impact.get("chain_segment") or "").strip()
     if raw_industry and len(raw_industry) <= 12:
         terms.append(raw_industry)
-    if not terms:
-        terms.extend(DEFAULT_COMPANY_INDUSTRY_BOARDS)
     return _unique(terms)[:4]
 
 
 def _candidate_stock_search_terms(impact: dict[str, Any]) -> list[str]:
-    text = _impact_text(impact)
-    terms = [
-        str(impact.get("chain_segment") or ""),
-        str(impact.get("industry") or ""),
+    source_values = [
+        impact.get("chain_segment"),
+        impact.get("industry"),
+        *(impact.get("affected_company_types") or []),
     ]
-    for keyword in (
-        "\u4eba\u5de5\u667a\u80fd",
-        "\u7b97\u6cd5",
-        "\u6a21\u578b",
-        "\u6570\u636e",
-        "\u5b89\u5168",
-        "\u5408\u89c4",
-        "\u5185\u5bb9",
-    ):
-        if keyword in text:
-            terms.append(keyword)
-    if not any(term.strip() for term in terms):
-        terms.append("\u4eba\u5de5\u667a\u80fd")
-    return _unique([_clip(term, max_chars=24) for term in terms if term])[:4]
+    terms: list[str] = []
+    for value in source_values:
+        raw = re.sub(r"\s+", "", str(value or "")).strip("，。；;、/|：:")
+        if not raw or len(raw) > 24:
+            continue
+        reduced = raw
+        for suffix in GENERIC_TERM_SUFFIXES:
+            if reduced.endswith(suffix) and len(reduced) > len(suffix) + 1:
+                reduced = reduced[: -len(suffix)]
+                break
+        if reduced != raw:
+            terms.append(reduced)
+        terms.append(raw)
+    return _unique([term for term in terms if _is_specific_stock_search_term(term)])[:4]
 
 
 def _impact_text(impact: dict[str, Any]) -> str:
@@ -1062,8 +1931,37 @@ def _impact_text(impact: dict[str, Any]) -> str:
     return " ".join(values)
 
 
-def _impact_candidate_term(impact: dict[str, Any]) -> str:
-    return str(impact.get("chain_segment") or impact.get("industry") or impact.get("affected_company_types") or "")
+def _is_specific_stock_search_term(value: str) -> bool:
+    term = re.sub(r"\s+", "", str(value or "")).strip("，。；;、/|：:")
+    if not (2 <= len(term) <= 24):
+        return False
+    if term in GENERIC_STOCK_SEARCH_TERMS:
+        return False
+    if any(marker in term for marker in INVALID_STOCK_SEARCH_MARKERS):
+        return False
+    if re.search(r"[\r\n。！？!?；;：:,，、/|]", term):
+        return False
+    if any(action in term for action in INVALID_STOCK_SEARCH_ACTIONS):
+        return False
+    if any(metric in term for metric in INVALID_STOCK_SEARCH_METRIC_TERMS):
+        return False
+    if term.endswith("环节"):
+        return False
+    if any(term.endswith(suffix) for suffix in GENERIC_TERM_SUFFIXES):
+        return False
+    return True
+
+
+def _query_budget_used(
+    invoker: MCPToolInvoker,
+    server_name: str,
+    tool_name: str,
+    scope_id: str,
+) -> int:
+    if not isinstance(invoker, RuntimeMCPInvoker):
+        return 0
+    snapshot = invoker.status_snapshot().get("query_budgets") or {}
+    return int(snapshot.get(f"{server_name}.{tool_name}.{scope_id}") or 0)
 
 
 def _mcp_int_setting(name: str, default: int, minimum: int = 0) -> int:
@@ -1207,21 +2105,61 @@ def _append_candidate_summary_log(
     raw_count: int,
     dedup_count: int,
     kept_count: int,
+    recall_logs: list[dict[str, Any]],
+    query_terms: list[str],
 ) -> None:
     log_entry = _new_tool_log(
         server_name="policychain",
         tool_name="company_candidate_pipeline",
         arguments={"impact_id": impact_id},
     )
+    statuses = [str(item.get("status") or "") for item in recall_logs]
+    search_logs = [item for item in recall_logs if str(item.get("tool_name") or "") == "search_stock"]
+    executed_queries = [
+        str(item.get("query") or (item.get("arguments") or {}).get("keyword") or "")
+        for item in search_logs
+        if item.get("actual_execution") is True
+    ]
+    skipped_queries = [
+        {
+            "query": str(item.get("query") or (item.get("arguments") or {}).get("keyword") or ""),
+            "skip_reason": str(item.get("skip_reason") or ""),
+        }
+        for item in search_logs
+        if str(item.get("status") or "") == "skipped"
+    ]
+    errors = _unique([str(item.get("error") or "") for item in recall_logs if item.get("error")])
+    if kept_count:
+        status = "ok"
+    elif "error" in statuses:
+        status = "error"
+    elif "unavailable" in statuses:
+        status = "unavailable"
+    else:
+        status = "empty"
+    channel_statuses: dict[str, list[str]] = {}
+    for item in recall_logs:
+        tool_name = str(item.get("tool_name") or "unknown")
+        channel_statuses.setdefault(tool_name, [])
+        item_status = str(item.get("status") or "unknown")
+        if item_status not in channel_statuses[tool_name]:
+            channel_statuses[tool_name].append(item_status)
     log_entry.update(
         {
             "impact_id": impact_id,
-            "status": "ok" if kept_count else "empty",
+            "status": status,
             "count": kept_count,
             "raw_count": raw_count,
             "dedup_count": dedup_count,
             "truncated_count": max(dedup_count - kept_count, 0),
-            "error": "",
+            "error": " | ".join(errors[:3]),
+            "query_terms": executed_queries,
+            "query_count": len(executed_queries),
+            "requested_query_terms": list(query_terms),
+            "skipped_queries": skipped_queries,
+            "skipped_query_count": len(skipped_queries),
+            "channel_statuses": channel_statuses,
+            "partial_failure_count": sum(1 for value in statuses if value in {"error", "unavailable"}),
         }
     )
     _append_tool_log(tool_logs, log_entry)
@@ -1233,6 +2171,54 @@ def _append_candidate_summary_log(
         record_event("candidate.pipeline", stage="company_matcher", status=str(log_entry["status"]), **payload)
     except Exception:
         pass
+
+
+def candidate_retrieval_statuses(tool_logs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Return per-impact recall semantics without treating failures as true empties."""
+
+    output: dict[str, dict[str, Any]] = {}
+    for item in tool_logs:
+        if str(item.get("tool_name") or "") != "company_candidate_pipeline":
+            continue
+        impact_id = str(item.get("impact_id") or "")
+        if not impact_id:
+            continue
+        output[impact_id] = {
+            "status": str(item.get("status") or "empty"),
+            "error": str(item.get("error") or ""),
+            "query_terms": list(item.get("query_terms") or []),
+            "query_count": int(item.get("query_count") or 0),
+            "requested_query_terms": list(item.get("requested_query_terms") or []),
+            "skipped_queries": list(item.get("skipped_queries") or []),
+            "skipped_query_count": int(item.get("skipped_query_count") or 0),
+            "channel_statuses": dict(item.get("channel_statuses") or {}),
+            "partial_failure_count": int(item.get("partial_failure_count") or 0),
+        }
+    for impact_id, status in output.items():
+        search_logs = [
+            item
+            for item in tool_logs
+            if str(item.get("tool_name") or "") == "search_stock"
+            and str(item.get("impact_id") or "") == impact_id
+        ]
+        executed_queries = [
+            str(item.get("query") or (item.get("arguments") or {}).get("keyword") or "")
+            for item in search_logs
+            if item.get("actual_execution") is True
+        ]
+        skipped_queries = [
+            {
+                "query": str(item.get("query") or (item.get("arguments") or {}).get("keyword") or ""),
+                "skip_reason": str(item.get("skip_reason") or ""),
+            }
+            for item in search_logs
+            if str(item.get("status") or "") == "skipped"
+        ]
+        status["query_terms"] = executed_queries
+        status["query_count"] = len(executed_queries)
+        status["skipped_queries"] = skipped_queries
+        status["skipped_query_count"] = len(skipped_queries)
+    return output
 
 
 def _cnfinancial_company_arguments(tool_name: str, stock_code: str, candidate: dict[str, Any]) -> dict[str, Any]:

@@ -123,6 +123,38 @@ class ImpactAnalysisOutput:
 
 
 @dataclass
+class CompanySeed:
+    impact_id: str
+    proposed_name: str
+    historical_names: list[str] = field(default_factory=list)
+    proposed_stock_code: str = ""
+    seed_reason: str = ""
+    origin_channels: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "impact_id": self.impact_id,
+            "proposed_name": self.proposed_name,
+            "historical_names": list(self.historical_names),
+            "proposed_stock_code": self.proposed_stock_code,
+            "seed_reason": self.seed_reason,
+            "origin_channels": list(self.origin_channels),
+        }
+
+
+@dataclass
+class CompanySeedOutput:
+    seeds: list[CompanySeed] = field(default_factory=list)
+    uncertainties: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "seeds": [seed.to_dict() for seed in self.seeds],
+            "uncertainties": list(self.uncertainties),
+        }
+
+
+@dataclass
 class CompanyEvidence:
     source_name: str
     source_url: str | None

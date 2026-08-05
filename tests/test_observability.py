@@ -16,7 +16,7 @@ from policychain.llm import LLMConfigurationError
 from policychain.mcp import FakeMCPInvoker
 from policychain.observability import RunRecorder, load_run_artifact, record_event
 from policychain.state import PolicyResearchState
-from policychain.tools.mcp_tools import CNFINANCIAL_SERVER
+from policychain.tools.mcp_tools import CNFINANCIAL_SERVER, OPEN_WEBSEARCH_SEARCH_TOOL, OPEN_WEBSEARCH_SERVER
 from scripts.run_research import run_research
 from tests.helpers import build_sample_store
 
@@ -175,6 +175,7 @@ class ObservabilityTests(unittest.TestCase):
         client = _SequenceClient(
             [
                 json.dumps({"thought": "证据足够", "action": "finish", "arguments": {}}, ensure_ascii=False),
+                json.dumps({"seeds": [], "uncertainties": []}, ensure_ascii=False),
                 json.dumps(_company_match_payload(), ensure_ascii=False),
             ]
         )
@@ -224,6 +225,102 @@ class ObservabilityTests(unittest.TestCase):
             self.assertEqual(event["impact_id"], "IMP-001")
             self.assertEqual(event["company_name"], "电池公司")
             self.assertEqual(event["stock_code"], "300002")
+
+    def test_seed_identity_enrichment_and_rank_events_share_run_id_and_provenance(self) -> None:
+        invoker = FakeMCPInvoker(
+            {
+                (CNFINANCIAL_SERVER, "get_industry_list"): [],
+                (CNFINANCIAL_SERVER, "get_concept_list"): [],
+                (CNFINANCIAL_SERVER, "search_stock"): [],
+                (CNFINANCIAL_SERVER, "get_company_profile"): [
+                    {"主营业务": "动力电池制造与储能系统", "data_date": "2025"}
+                ],
+                (CNFINANCIAL_SERVER, "get_company_info"): [
+                    {
+                        "company_name": "电池公司",
+                        "stock_code": "300002",
+                        "listing_status": "active",
+                        "data_date": "2026-07-01",
+                    }
+                ],
+                (OPEN_WEBSEARCH_SERVER, OPEN_WEBSEARCH_SEARCH_TOOL): [
+                    {
+                        "title": "电池公司主营业务",
+                        "description": "公司主营动力电池制造与储能系统。",
+                        "url": "https://www.cninfo.com.cn/fake/300002",
+                        "date": "2026-07-01",
+                    }
+                ],
+            }
+        )
+        seed_payload = {
+            "seeds": [
+                {
+                    "impact_id": "IMP-001",
+                    "proposed_name": "电池公司",
+                    "historical_names": [],
+                    "proposed_stock_code": "300002",
+                    "seed_reason": "动力电池制造业务可能与路径相交",
+                    "origin_channels": ["llm"],
+                }
+            ],
+            "uncertainties": [],
+        }
+        client = _SequenceClient(
+            [
+                "not valid planner json",
+                json.dumps(seed_payload, ensure_ascii=False),
+                json.dumps(_company_match_payload(), ensure_ascii=False),
+            ]
+        )
+        state = PolicyResearchState(
+            user_query="动力电池政策",
+            industry_impacts=[
+                {
+                    "impact_id": "IMP-001",
+                    "industry": "动力电池",
+                    "chain_segment": "动力电池制造",
+                    "transmission_logic": "新能源汽车需求带动动力电池制造",
+                    "business_variables": ["电池装机量"],
+                    "affected_company_types": ["动力电池制造商"],
+                    "conditions": [],
+                    "risks": [],
+                }
+            ],
+        )
+
+        with TemporaryDirectory() as directory:
+            recorder = RunRecorder(log_root=directory, mode="llm")
+            with recorder.activate():
+                run_llm_company_matcher(state, llm_client=client, mcp_invoker=invoker)
+            recorder.finish("completed")
+            artifact = load_run_artifact(recorder.run_id, log_root=directory)
+
+        by_type = {
+            event_type: [item for item in artifact["events"] if item["event_type"] == event_type]
+            for event_type in ("company.seed", "company.identity", "company.enrichment", "company.rank")
+        }
+        self.assertTrue(all(by_type.values()))
+        failure = next(item for item in artifact["events"] if item["event_type"] == "react.failure")
+        self.assertEqual(failure["run_id"], recorder.run_id)
+        self.assertEqual(failure["stage"], "company_matcher")
+        self.assertEqual(failure["impact_id"], "IMP-001")
+        self.assertEqual(failure["reason_code"], "planner_invalid_json")
+        self.assertTrue(any("ReAct 可选检索失败" in item for item in state.uncertainties))
+        seed_id = state.company_candidates[0]["provenance"][0]["seed_id"]
+        for event_type, events in by_type.items():
+            event = next(item for item in events if item.get("seed_id") == seed_id)
+            self.assertEqual(event["run_id"], recorder.run_id, event_type)
+            self.assertEqual(event["impact_id"], "IMP-001")
+            self.assertIn("tool_call_id", event)
+            self.assertIn("reason_code", event)
+            self.assertIn("cache_hit", event)
+            self.assertIn("source", event)
+            self.assertIn("url", event)
+            self.assertIn("date", event)
+        llm_end_events = [item for item in artifact["events"] if item["event_type"] == "llm.call.end"]
+        self.assertTrue(llm_end_events)
+        self.assertTrue(all(isinstance(item.get("response"), dict) and item["response"].get("omitted") for item in llm_end_events))
 
     def test_wsgi_downloads_success_or_failure_artifact_by_run_id(self) -> None:
         with TemporaryDirectory() as directory:

@@ -12,11 +12,12 @@ from policychain.safety import assert_no_investment_advice
 from policychain.schemas.agent_outputs import CompanyEvidence, CompanyMatch, CompanyMatchOutput
 from policychain.state import PolicyResearchState
 from policychain.tools import collect_company_candidates, collect_company_web_evidence, read_company_source
-from policychain.tools.mcp_tools import mcp_unavailable_uncertainty
+from policychain.tools.mcp_tools import candidate_retrieval_statuses, mcp_unavailable_uncertainty
 
 
 MATCH_LEVELS = ("high", "medium", "low")
 DEFAULT_MAX_COMPANIES_PER_IMPACT = 3
+MAX_COMPANIES_PER_IMPACT = 4
 
 DOMAIN_TERMS = (
     "钢铁",
@@ -26,6 +27,7 @@ DOMAIN_TERMS = (
     "环保",
     "绿色",
     "低碳",
+    "能源",
     "新能源",
     "电池",
     "光伏",
@@ -66,6 +68,28 @@ DOMAIN_TERMS = (
 )
 
 WEAK_SOURCE_TOOLS = {"search_stock"}
+GENERIC_SHARED_TERMS = {
+    "能源",
+    "新能源",
+    "服务",
+    "制造",
+    "电力",
+    "企业",
+    "行业",
+    "产业",
+    "公司",
+    "业务",
+    "产品",
+    "设备",
+    "平台",
+    "技术",
+    "综合服务",
+    "技术服务",
+    "电力服务",
+    "设备制造",
+    "产品服务",
+}
+GENERIC_SHARED_TERMS_COMPACT = {re.sub(r"\s+", "", term).lower() for term in GENERIC_SHARED_TERMS}
 
 
 class CompanyMatchError(RuntimeError):
@@ -131,11 +155,13 @@ def match_companies_for_impacts(
         if candidate_records
         else []
     )
+    retrieval_by_impact = candidate_retrieval_statuses(tool_logs)
 
     companies, coverage, audit_logs = match_candidate_records_to_impacts(
         industry_impacts=industry_impacts,
         candidate_records=candidate_records,
         top_k_per_industry=top_k_per_industry,
+        retrieval_by_impact=retrieval_by_impact,
     )
     tool_logs.extend(_audit_tool_logs(coverage))
 
@@ -144,7 +170,7 @@ def match_companies_for_impacts(
         "公司部分仅表示业务相关性研究清单，不构成任何投资建议。",
     ]
     if not candidate_records:
-        uncertainties.append("未形成足够 CNFinancial A 股候选公司；请检查合法行业板块选择、CNFinancial 工具可用性和搜索关键词。")
+        uncertainties.extend(_candidate_retrieval_uncertainties(retrieval_by_impact))
     if candidate_records and not companies:
         uncertainties.append("CNFinancial 返回了候选公司，但未通过业务相关性审查；报告将按行业路径说明无可靠公司匹配原因。")
 
@@ -163,6 +189,7 @@ def audit_company_match_output(
     industry_impacts: list[dict[str, Any]],
     candidate_records: list[dict[str, Any]],
     top_k_per_industry: int = DEFAULT_MAX_COMPANIES_PER_IMPACT,
+    retrieval_by_impact: dict[str, dict[str, Any]] | None = None,
 ) -> CompanyMatchOutput:
     """Bind LLM company matches to concrete impact paths and audit relevance."""
 
@@ -177,6 +204,24 @@ def audit_company_match_output(
         record = candidate_by_name.get(_company_key(match.company_name, match.stock_code))
         if not record:
             record = candidate_by_name.get(_company_key(match.company_name, ""))
+        allowed_impact_ids = _candidate_impact_ids(record or {})
+        if allowed_impact_ids and match.impact_id not in allowed_impact_ids:
+            impact_index, impact = _impact_for_claimed_id(match.impact_id, industry_impacts)
+            status = {
+                "decision": "reject",
+                "reason_code": "path_provenance_mismatch",
+                "match_level": "low",
+                "confidence": 0.0,
+                "reason": (
+                    f"LLM 输出路径 {match.impact_id or 'empty'} 不在候选检索来源路径中；"
+                    f"允许路径为 {', '.join(sorted(allowed_impact_ids))}。"
+                ),
+                "shared_terms": [],
+                "negative_evidence": ["候选公司不得从检索来源路径自动改绑到其他行业影响路径。"],
+            }
+            audited_match = _apply_audit(match, impact_index, impact, status)
+            audit_logs.append(_audit_log_entry(audited_match, status, impact_index, impact))
+            continue
         impact_index, impact = _best_impact_for_match(match, record or {}, industry_impacts)
         status = _audit_candidate_against_impact(record or _company_match_as_record(match), impact)
         audited_match = _apply_audit(match, impact_index, impact, status)
@@ -195,6 +240,7 @@ def audit_company_match_output(
         candidate_records=candidate_records,
         matches=audited,
         audit_logs=audit_logs,
+        retrieval_by_impact=retrieval_by_impact,
     )
     audited_output = CompanyMatchOutput(companies=audited, uncertainties=list(output.uncertainties))
     setattr(audited_output, "_company_coverage", coverage)
@@ -206,6 +252,7 @@ def match_candidate_records_to_impacts(
     industry_impacts: list[dict[str, Any]],
     candidate_records: list[dict[str, Any]],
     top_k_per_industry: int = DEFAULT_MAX_COMPANIES_PER_IMPACT,
+    retrieval_by_impact: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[CompanyMatch], list[dict[str, Any]], list[dict[str, Any]]]:
     top_k_per_industry = resolve_company_match_limit(top_k_per_industry)
     matches: list[CompanyMatch] = []
@@ -232,6 +279,7 @@ def match_candidate_records_to_impacts(
         candidate_records=candidate_records,
         matches=deduped,
         audit_logs=audit_logs,
+        retrieval_by_impact=retrieval_by_impact,
     )
     return deduped, coverage, audit_logs
 
@@ -287,6 +335,7 @@ def _audit_candidate_against_impact(record: dict[str, Any], impact: dict[str, An
     impact_text = _impact_context(impact)
     company_text = _company_context(record)
     shared_terms = _shared_terms(company_text, impact_text)
+    specific_shared_terms = [term for term in shared_terms if not _is_generic_shared_term(term)]
     has_business_evidence = bool(str(record.get("business_evidence") or record.get("matched_business") or "").strip())
     source_tool = str(record.get("candidate_source_tool") or "")
     confidence = _confidence(record, impact, shared_terms, has_business_evidence)
@@ -302,12 +351,33 @@ def _audit_candidate_against_impact(record: dict[str, Any], impact: dict[str, An
             "negative_evidence": ["候选记录缺少公司名称。"],
         }
 
+    if _is_web_only_candidate(record):
+        return {
+            "decision": "reject",
+            "match_level": "low",
+            "confidence": min(confidence, 0.2),
+            "reason": "候选仅来自 Web 结果，不能进入 CNFinancial A 股候选白名单。",
+            "shared_terms": shared_terms,
+            "negative_evidence": ["Web 资料只能补充已验证候选的业务证据，不能单独形成候选公司。"],
+        }
+
     if not shared_terms:
         negative_evidence.append("未发现公司业务与该政策路径的产业链环节或经营变量存在明确交集。")
     if not has_business_evidence:
         negative_evidence.append("缺少主营业务、产品服务、公告或官网等业务证据。")
     if source_tool in WEAK_SOURCE_TOOLS and not has_business_evidence:
         negative_evidence.append("候选仅来自关键词搜索，缺少业务证据支撑。")
+
+    if shared_terms and not specific_shared_terms:
+        negative_evidence.append("公司与路径仅共享服务、制造、电力等泛化词，缺少路径特异产品或业务交集。")
+        return {
+            "decision": "reject",
+            "match_level": "low",
+            "confidence": min(confidence, 0.3),
+            "reason": "服务、制造、电力等泛化词不能单独支撑公司业务匹配。",
+            "shared_terms": shared_terms,
+            "negative_evidence": negative_evidence,
+        }
 
     if not shared_terms and not has_business_evidence:
         return {
@@ -420,6 +490,7 @@ def _build_coverage_matrix(
     candidate_records: list[dict[str, Any]],
     matches: list[CompanyMatch],
     audit_logs: list[dict[str, Any]],
+    retrieval_by_impact: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     coverage: list[dict[str, Any]] = []
     for index, impact in enumerate(industry_impacts, start=1):
@@ -428,9 +499,16 @@ def _build_coverage_matrix(
         scoped_audits = [item for item in audit_logs if item.get("impact_id") == impact_id]
         scoped_candidates = [record for record in candidate_records if _candidate_is_for_impact(record, impact_id)]
         rejected_count = sum(1 for item in scoped_audits if item.get("decision") == "reject")
+        retrieval = dict((retrieval_by_impact or {}).get(impact_id) or {})
+        retrieval_status = str(retrieval.get("status") or ("ok" if scoped_candidates else "empty"))
         no_match_reason = ""
         if not scoped_candidates:
-            no_match_reason = "CNFinancial 未返回可用于该路径的 A 股候选公司。"
+            if retrieval_status == "unavailable":
+                no_match_reason = "CNFinancial 工具不可用或已熔断，未能完成该路径候选查询；这不等于真实返回空。"
+            elif retrieval_status == "error":
+                no_match_reason = "CNFinancial 候选查询失败，未能判断该路径是否存在候选；这不等于真实返回空。"
+            else:
+                no_match_reason = "CNFinancial 查询成功但真实返回空，暂未形成该路径的 A 股候选公司。"
         elif not scoped_matches:
             no_match_reason = "候选公司未通过业务相关性审查，或缺少主营业务/产品服务证据。"
         coverage.append(
@@ -446,6 +524,13 @@ def _build_coverage_matrix(
                 "passed_count": len(scoped_matches),
                 "rejected_count": rejected_count,
                 "company_names": [match.company_name for match in scoped_matches],
+                "retrieval_status": retrieval_status,
+                "retrieval_error": str(retrieval.get("error") or ""),
+                "retrieval_queries": list(retrieval.get("query_terms") or []),
+                "retrieval_query_count": int(retrieval.get("query_count") or 0),
+                "retrieval_skipped_queries": list(retrieval.get("skipped_queries") or []),
+                "retrieval_skipped_query_count": int(retrieval.get("skipped_query_count") or 0),
+                "retrieval_channel_statuses": dict(retrieval.get("channel_statuses") or {}),
                 "no_match_reason": no_match_reason,
             }
         )
@@ -469,6 +554,7 @@ def _audit_log_entry(
         "match_level": status["match_level"],
         "confidence": status["confidence"],
         "shared_terms": list(status.get("shared_terms") or []),
+        "reason_code": str(status.get("reason_code") or ""),
         "reason": status["reason"],
     }
     record_event("rule.company_audit", stage="company_matcher", status=str(status["decision"]), **entry)
@@ -538,6 +624,16 @@ def _best_impact_for_match(
     return best_index, best_impact
 
 
+def _impact_for_claimed_id(
+    impact_id: str,
+    industry_impacts: list[dict[str, Any]],
+) -> tuple[int, dict[str, Any]]:
+    for index, impact in enumerate(industry_impacts, start=1):
+        if impact_id == _impact_id(index):
+            return index, impact
+    return (1, industry_impacts[0]) if industry_impacts else (1, {})
+
+
 def _company_match_as_record(match: CompanyMatch) -> dict[str, Any]:
     evidence_text = " ".join(item.text for item in match.business_evidence)
     return {
@@ -566,13 +662,18 @@ def _candidate_index(candidate_records: list[dict[str, Any]]) -> dict[tuple[str,
 
 
 def _candidate_is_for_impact(record: dict[str, Any], impact_id: str) -> bool:
+    impact_ids = _candidate_impact_ids(record)
+    return not impact_ids or impact_id in impact_ids
+
+
+def _candidate_impact_ids(record: dict[str, Any]) -> set[str]:
     impact_ids = {str(value) for value in record.get("impact_ids") or [] if value}
     impact_ids.update(
         str(item.get("impact_id") or "")
         for item in record.get("provenance") or []
         if isinstance(item, dict) and item.get("impact_id")
     )
-    return not impact_ids or impact_id in impact_ids
+    return impact_ids
 
 
 def _company_key(name: str, code: str) -> tuple[str, str]:
@@ -639,6 +740,33 @@ def _shared_terms(company_text: str, impact_text: str) -> list[str]:
     return _unique(terms)[:8]
 
 
+def _is_generic_shared_term(value: str) -> bool:
+    return _compact_match_text(value) in GENERIC_SHARED_TERMS_COMPACT
+
+
+def _is_web_only_candidate(record: dict[str, Any]) -> bool:
+    provenance = [item for item in record.get("provenance") or [] if isinstance(item, dict)]
+    explicit_sources: list[str] = []
+    for item in provenance:
+        explicit_sources.extend(
+            [
+                str(item.get("server_name") or "").lower(),
+                str(item.get("source_type") or "").lower(),
+                str(item.get("tool") or "").lower(),
+            ]
+        )
+    source_tool = str(record.get("candidate_source_tool") or "").lower()
+    source_type = str(record.get("source_type") or "").lower()
+    explicit_sources.extend([source_tool, source_type])
+    has_cnfinancial = any(
+        "cnfinancial" in value
+        or value in {"search_stock", "get_industry_stocks", "cn-financial"}
+        for value in explicit_sources
+    )
+    has_web = any("web" in value or value in {"search", "fetchwebcontent", "web-search"} for value in explicit_sources)
+    return bool(has_web and not has_cnfinancial)
+
+
 def _compact_match_text(value: str) -> str:
     return re.sub(r"\s+", "", str(value)).lower()
 
@@ -663,10 +791,10 @@ def resolve_company_match_limit(requested: int = DEFAULT_MAX_COMPANIES_PER_IMPAC
     raw = os.getenv("POLICYCHAIN_MAX_COMPANY_MATCHES_PER_IMPACT")
     if raw and raw.strip():
         try:
-            return max(int(raw), 1)
+            return min(max(int(raw), 1), MAX_COMPANIES_PER_IMPACT)
         except ValueError:
             pass
-    return max(int(requested), 1)
+    return min(max(int(requested), 1), MAX_COMPANIES_PER_IMPACT)
 
 
 def _dedupe_matches(matches: list[CompanyMatch]) -> list[CompanyMatch]:
@@ -706,3 +834,17 @@ def _unique(values: Iterable[str]) -> list[str]:
             seen.add(text)
             output.append(text)
     return output
+
+
+def _candidate_retrieval_uncertainties(retrieval_by_impact: dict[str, dict[str, Any]]) -> list[str]:
+    statuses = {str(item.get("status") or "empty") for item in retrieval_by_impact.values()}
+    uncertainties: list[str] = []
+    if "error" in statuses:
+        uncertainties.append("部分或全部 CNFinancial 候选公司查询失败，不能将查询失败解释为真实无候选。")
+    if "unavailable" in statuses:
+        uncertainties.append("部分或全部 CNFinancial 候选公司工具不可用或已熔断，本次未完成对应路径的候选检索。")
+    if statuses and statuses <= {"empty"}:
+        uncertainties.append("CNFinancial 候选查询成功但真实返回空，未形成足够 A 股公司候选。")
+    if not uncertainties:
+        uncertainties.append("未形成足够 CNFinancial A 股候选公司；请检查合法行业板块选择、工具状态和路径特异搜索词。")
+    return uncertainties
