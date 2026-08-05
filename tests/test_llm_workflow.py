@@ -42,6 +42,7 @@ class LLMWorkflowTests(unittest.TestCase):
             [
                 json.dumps(_policy_payload(), ensure_ascii=False),
                 json.dumps(_impact_payload(), ensure_ascii=False),
+                json.dumps(_company_discovery_payload(), ensure_ascii=False),
                 "# LLM 自由报告\n\n这是由 report_writer 生成的自然语言报告。",
             ]
         )
@@ -52,7 +53,7 @@ class LLMWorkflowTests(unittest.TestCase):
                 llm_client=client,
             )
 
-            self.assertEqual(len(client.calls), 3)
+            self.assertEqual(len(client.calls), 4)
             self.assertEqual(state.policy_analysis["policy_identity"]["policy_id"], "POL-2023-NAT-0048")
             self.assertEqual(state.industry_impacts[0]["industry"], "算法模型研发与评估")
             self.assertEqual(state.company_matches, [])
@@ -201,6 +202,15 @@ def _company_payload() -> dict[str, object]:
             }
         ],
         "uncertainties": ["公司资料来自本地 mock 数据，仅用于验证流程。"],
+    }
+
+
+def _company_discovery_payload() -> dict[str, object]:
+    return {
+        "impact_id": "IMP-001",
+        "web_queries": [],
+        "seeds": [],
+        "uncertainties": ["测试环境未配置外部公司发现通道。"],
     }
 
 

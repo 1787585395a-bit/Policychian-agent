@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
+from unittest.mock import patch
 
 from policychain.agents import (
     LLMCompanyMatchError,
@@ -12,7 +14,8 @@ from policychain.agents import (
 )
 from policychain.agents.llm_company_matcher import _generate_company_seeds, _render_company_prompt
 from policychain.schemas.agent_outputs import CompanyMatchOutput
-from policychain.mcp import FakeMCPInvoker
+from policychain.mcp import FakeMCPInvoker, MCPToolError
+from policychain.observability import RunRecorder
 from policychain.tools.mcp_tools import CNFINANCIAL_SERVER
 from policychain.state import PolicyResearchState
 from policychain.structured_output import StructuredOutputError
@@ -32,6 +35,16 @@ class RecordingLLMClient:
 
 
 class LLMCompanyMatcherTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._previous_discovery_mode = os.environ.get("POLICYCHAIN_COMPANY_DISCOVERY_MODE")
+        os.environ["POLICYCHAIN_COMPANY_DISCOVERY_MODE"] = "legacy_cnfinancial"
+
+    def tearDown(self) -> None:
+        if self._previous_discovery_mode is None:
+            os.environ.pop("POLICYCHAIN_COMPANY_DISCOVERY_MODE", None)
+        else:
+            os.environ["POLICYCHAIN_COMPANY_DISCOVERY_MODE"] = self._previous_discovery_mode
+
     def test_run_llm_company_matcher_writes_state_from_valid_json(self) -> None:
         store = build_sample_store()
         client = _company_llm_client()
@@ -486,6 +499,481 @@ class LLMCompanyMatcherTests(unittest.TestCase):
         self.assertIn("tool-1-1", rendered)
         self.assertNotIn("绝不能进入 prompt", rendered)
 
+    def test_web_first_discovers_each_impact_without_legacy_recall_and_caches_exact_identity(self) -> None:
+        impacts = [
+            {**_web_first_impact(), "impact_id": "IMP-001", "industry": "路径一反渗透膜"},
+            {**_web_first_impact(), "impact_id": "IMP-002", "industry": "路径二反渗透膜"},
+        ]
+        client = RecordingLLMClient(
+            [
+                json.dumps(_discovery_payload("IMP-001", ["路径一 反渗透膜 A股"]), ensure_ascii=False),
+                json.dumps(_discovery_payload("IMP-002", ["路径二 反渗透膜 A股"]), ensure_ascii=False),
+                json.dumps(_web_first_match_payload(["IMP-001", "IMP-002"]), ensure_ascii=False),
+            ]
+        )
+
+        def web_search(*, arguments, **_kwargs):
+            return [
+                {
+                    "company_name": "海膜科技",
+                    "stock_code": "300123",
+                    "title": "海膜科技反渗透膜业务",
+                    "description": f"海膜科技 300123 主营反渗透膜；{arguments['query']}",
+                    "url": f"https://exchange.example/{arguments['query']}",
+                    "source_org": "交易所资料",
+                    "date": "2026-08-01",
+                }
+            ]
+
+        invoker = FakeMCPInvoker(
+            {
+                ("web-search", "search"): web_search,
+                (CNFINANCIAL_SERVER, "search_stock"): [
+                    {"company_name": "海膜科技", "stock_code": "300123"}
+                ],
+                (CNFINANCIAL_SERVER, "get_company_profile"): [
+                    {"main_business": "反渗透膜", "data_date": "2025"}
+                ],
+                (CNFINANCIAL_SERVER, "get_company_info"): [
+                    {
+                        "company_name": "海膜科技",
+                        "stock_code": "300123",
+                        "listing_status": "active",
+                        "data_date": "2026-08-01",
+                    }
+                ],
+            }
+        )
+        state = PolicyResearchState(user_query="海水淡化政策", industry_impacts=impacts)
+
+        with patch.dict(os.environ, {"POLICYCHAIN_COMPANY_DISCOVERY_MODE": "web_first"}):
+            output = run_llm_company_matcher(state, llm_client=client, mcp_invoker=invoker)
+
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual({item.impact_id for item in output.companies}, {"IMP-001", "IMP-002"})
+        self.assertEqual(len(state.company_candidates), 1)
+        self.assertTrue(state.company_seeds)
+        self.assertTrue(state.company_discovery_audit)
+        self.assertTrue(state.company_identity_audit)
+        self.assertTrue(state.company_evidence_bundles)
+        tools = [call["tool_name"] for call in invoker.calls]
+        self.assertNotIn("get_industry_list", tools)
+        self.assertNotIn("get_concept_list", tools)
+        self.assertNotIn("get_industry_stocks", tools)
+        self.assertEqual(tools.count("search_stock"), 1)
+        self.assertEqual(tools.count("get_company_profile"), 1)
+        self.assertEqual(tools.count("get_company_info"), 1)
+        self.assertEqual(
+            [call["tool_name"] for call in invoker.calls if call["server_name"] == CNFINANCIAL_SERVER],
+            ["search_stock", "get_company_info", "get_company_profile"],
+        )
+        self.assertTrue(
+            all(call["arguments"] == {"keyword": "海膜科技"} for call in invoker.calls if call["tool_name"] == "search_stock")
+        )
+        self.assertTrue(all(item["coverage_status"] == "selected" for item in state.company_coverage))
+
+    def test_web_first_exact_identity_tries_current_name_once_then_one_historical_alias(self) -> None:
+        payload = _discovery_payload("IMP-001", ["反渗透膜 A股 公司公告"])
+        payload["seeds"][0].update(
+            {
+                "proposed_name": "新海膜",
+                "historical_names": ["海膜科技", "不得继续尝试的旧名称"],
+            }
+        )
+        client = RecordingLLMClient(
+            [
+                json.dumps(payload, ensure_ascii=False),
+                json.dumps(_web_first_match_payload(["IMP-001"], company_name="新海膜"), ensure_ascii=False),
+            ]
+        )
+
+        def search_stock(*, arguments, **_kwargs):
+            if arguments == {"keyword": "新海膜"}:
+                return []
+            if arguments == {"keyword": "海膜科技"}:
+                return [{"company_name": "新海膜", "stock_code": "300123"}]
+            self.fail(f"unexpected widened search: {arguments}")
+
+        invoker = FakeMCPInvoker(
+            {
+                ("web-search", "search"): [],
+                (CNFINANCIAL_SERVER, "search_stock"): search_stock,
+                (CNFINANCIAL_SERVER, "get_company_profile"): [
+                    {"main_business": "反渗透膜", "data_date": "2025"}
+                ],
+                (CNFINANCIAL_SERVER, "get_company_info"): [
+                    {
+                        "company_name": "新海膜",
+                        "stock_code": "300123",
+                        "listing_status": "active",
+                        "data_date": "2026-08-01",
+                    }
+                ],
+            }
+        )
+        state = PolicyResearchState(user_query="海水淡化政策", industry_impacts=[_web_first_impact()])
+
+        with patch.dict(os.environ, {"POLICYCHAIN_COMPANY_DISCOVERY_MODE": "web_first"}):
+            output = run_llm_company_matcher(state, llm_client=client, mcp_invoker=invoker)
+
+        search_calls = [call["arguments"] for call in invoker.calls if call["tool_name"] == "search_stock"]
+        self.assertEqual(search_calls, [{"keyword": "新海膜"}, {"keyword": "海膜科技"}])
+        self.assertEqual(len(output.companies), 1)
+        self.assertEqual(output.companies[0].stock_code, "300123")
+
+    def test_web_first_allows_only_two_independent_web_sources_after_cnfinancial_technical_failure(self) -> None:
+        client = RecordingLLMClient(
+            [
+                json.dumps(
+                    _discovery_payload(
+                        "IMP-001",
+                        ["海膜科技 300123 反渗透膜 公告", "海膜科技 300123 反渗透膜 官网"],
+                    ),
+                    ensure_ascii=False,
+                ),
+                json.dumps(_web_first_match_payload(["IMP-001"], confidence=0.99), ensure_ascii=False),
+            ]
+        )
+
+        def web_search(*, arguments, **_kwargs):
+            if "公告" in arguments["query"]:
+                return [
+                    {
+                        "company_name": "海膜科技",
+                        "stock_code": "300123",
+                        "title": "证券代码与主营业务公告",
+                        "description": "海膜科技 300123 为上市公司，主营反渗透膜。",
+                        "url": "https://one.example/notice/300123",
+                        "source_org": "第一交易所",
+                        "date": "2026-07-01",
+                    }
+                ]
+            return [
+                {
+                    "company_name": "海膜科技",
+                    "stock_code": "300123",
+                    "title": "公司业务介绍",
+                    "description": "海膜科技 股票代码300123，核心产品为反渗透膜。",
+                    "url": "https://two.example/company/profile",
+                    "source_org": "海膜科技官网",
+                    "date": "2026-07-02",
+                }
+            ]
+
+        def technical_failure(**_kwargs):
+            raise MCPToolError("simulated timeout")
+
+        invoker = FakeMCPInvoker(
+            {
+                ("web-search", "search"): web_search,
+                (CNFINANCIAL_SERVER, "search_stock"): technical_failure,
+                (CNFINANCIAL_SERVER, "get_company_profile"): technical_failure,
+                (CNFINANCIAL_SERVER, "get_company_info"): technical_failure,
+            }
+        )
+        state = PolicyResearchState(user_query="海水淡化", industry_impacts=[_web_first_impact()])
+        recorder = RunRecorder(mode="llm")
+
+        with patch.dict(os.environ, {"POLICYCHAIN_COMPANY_DISCOVERY_MODE": "web_first"}), recorder.activate():
+            output = run_llm_company_matcher(state, llm_client=client, mcp_invoker=invoker)
+
+        self.assertEqual(len(output.companies), 1)
+        self.assertEqual(output.companies[0].match_level, "low")
+        self.assertLessEqual(output.companies[0].confidence, 0.55)
+        self.assertEqual(state.company_coverage[0]["coverage_status"], "web_fallback")
+        self.assertIn("CNFinancial 未完成交叉验证", " ".join(output.uncertainties))
+        events = [json.loads(line) for line in recorder.events_path.read_text(encoding="utf-8").splitlines()]
+        event_types = [event["event_type"] for event in events]
+        for required in (
+            "company.discovery",
+            "company.seed",
+            "company.identity",
+            "company.enrichment",
+            "company.audit",
+            "company.rank",
+        ):
+            self.assertIn(required, event_types)
+        for event in events:
+            if event["event_type"] in {
+                "company.discovery",
+                "company.seed",
+                "company.identity",
+                "company.enrichment",
+                "company.audit",
+                "company.rank",
+            }:
+                self.assertEqual(event["run_id"], recorder.run_id)
+                for field in ("impact_id", "seed_id", "tool_call_id", "source", "reason_code", "cache_hit"):
+                    self.assertIn(field, event)
+
+    def test_web_first_single_or_duplicate_web_source_stays_unresolved(self) -> None:
+        client = RecordingLLMClient(
+            json.dumps(
+                _discovery_payload("IMP-001", ["海膜科技 300123 公告", "海膜科技 300123 官网"]),
+                ensure_ascii=False,
+            )
+        )
+
+        def duplicated_web(**_kwargs):
+            return [
+                {
+                    "company_name": "海膜科技",
+                    "stock_code": "300123",
+                    "title": "同源转载",
+                    "description": "海膜科技 300123 主营反渗透膜。",
+                    "url": "https://same.example/article",
+                    "source_org": "同一来源",
+                }
+            ]
+
+        def technical_failure(**_kwargs):
+            raise MCPToolError("circuit open")
+
+        invoker = FakeMCPInvoker(
+            {
+                ("web-search", "search"): duplicated_web,
+                (CNFINANCIAL_SERVER, "search_stock"): technical_failure,
+                (CNFINANCIAL_SERVER, "get_company_profile"): technical_failure,
+                (CNFINANCIAL_SERVER, "get_company_info"): technical_failure,
+            }
+        )
+        state = PolicyResearchState(user_query="海水淡化", industry_impacts=[_web_first_impact()])
+
+        with patch.dict(os.environ, {"POLICYCHAIN_COMPANY_DISCOVERY_MODE": "web_first"}):
+            output = run_llm_company_matcher(state, llm_client=client, mcp_invoker=invoker)
+
+        self.assertEqual(output.companies, [])
+        self.assertEqual(state.company_candidates, [])
+        self.assertEqual(len(client.calls), 1)
+        self.assertTrue(
+            any(item.get("reason_code") == "web_fallback_insufficient_independent_sources" for item in state.company_identity_audit)
+        )
+
+    def test_web_first_successful_cnfinancial_empty_does_not_use_web_fallback(self) -> None:
+        client = RecordingLLMClient(
+            json.dumps(
+                _discovery_payload("IMP-001", ["海膜科技 300123 公告", "海膜科技 300123 官网"]),
+                ensure_ascii=False,
+            )
+        )
+
+        def web_search(*, arguments, **_kwargs):
+            domain = "one.example" if "公告" in arguments["query"] else "two.example"
+            return [
+                {
+                    "company_name": "海膜科技",
+                    "stock_code": "300123",
+                    "description": "海膜科技 300123 主营反渗透膜。",
+                    "url": f"https://{domain}/evidence",
+                    "source_org": domain,
+                }
+            ]
+
+        def technical_failure(**_kwargs):
+            raise MCPToolError("simulated timeout")
+
+        invoker = FakeMCPInvoker(
+            {
+                ("web-search", "search"): web_search,
+                (CNFINANCIAL_SERVER, "search_stock"): [],
+                (CNFINANCIAL_SERVER, "get_company_profile"): technical_failure,
+                (CNFINANCIAL_SERVER, "get_company_info"): technical_failure,
+            }
+        )
+        state = PolicyResearchState(user_query="海水淡化", industry_impacts=[_web_first_impact()])
+
+        with patch.dict(os.environ, {"POLICYCHAIN_COMPANY_DISCOVERY_MODE": "web_first"}):
+            output = run_llm_company_matcher(state, llm_client=client, mcp_invoker=invoker)
+
+        self.assertEqual(output.companies, [])
+        self.assertEqual(state.company_coverage[0]["coverage_status"], "cnfinancial_empty")
+        self.assertEqual(len(client.calls), 1)
+        self.assertFalse(any(item.get("reason_code") == "web_fallback" for item in state.company_identity_audit))
+
+    def test_web_first_identity_conflict_is_permanently_rejected(self) -> None:
+        client = RecordingLLMClient(json.dumps(_discovery_payload("IMP-001", []), ensure_ascii=False))
+        invoker = FakeMCPInvoker(
+            {
+                (CNFINANCIAL_SERVER, "search_stock"): [
+                    {"company_name": "海膜科技", "stock_code": "300999"}
+                ],
+            }
+        )
+        state = PolicyResearchState(user_query="海水淡化", industry_impacts=[_web_first_impact()])
+
+        with patch.dict(os.environ, {"POLICYCHAIN_COMPANY_DISCOVERY_MODE": "web_first"}):
+            output = run_llm_company_matcher(state, llm_client=client, mcp_invoker=invoker)
+
+        self.assertEqual(output.companies, [])
+        self.assertTrue(any(item.get("reason_code") == "identity_conflict" for item in state.company_identity_audit))
+        self.assertNotIn("get_company_profile", [call["tool_name"] for call in invoker.calls])
+        self.assertEqual(state.company_coverage[0]["coverage_status"], "identity_conflict")
+        self.assertEqual(len(client.calls), 1)
+
+    def test_web_first_schema_failure_does_not_silently_call_legacy_recall(self) -> None:
+        client = RecordingLLMClient("not json")
+        invoker = FakeMCPInvoker({})
+        state = PolicyResearchState(user_query="海水淡化", industry_impacts=[_web_first_impact()])
+
+        with patch.dict(os.environ, {"POLICYCHAIN_COMPANY_DISCOVERY_MODE": "web_first"}):
+            output = run_llm_company_matcher(state, llm_client=client, mcp_invoker=invoker)
+
+        self.assertEqual(output.companies, [])
+        self.assertEqual(invoker.calls, [])
+        self.assertEqual(state.company_coverage[0]["coverage_status"], "discovery_error")
+        self.assertIn("未回退到旧 CNFinancial-first", " ".join(state.uncertainties))
+
+    def test_web_first_evaluation_runs_after_enrichment_and_prompt_contains_only_verified_bundles(self) -> None:
+        timeline: list[str] = []
+        discovery = _discovery_payload("IMP-001", ["反渗透膜 A股 公司业务"])
+        discovery["seeds"].append(
+            {
+                "impact_id": "IMP-001",
+                "proposed_name": "拒绝泄漏公司",
+                "historical_names": [],
+                "proposed_stock_code": "999999",
+                "seed_reason": "不得进入评价 prompt",
+                "origin_channels": ["llm"],
+            }
+        )
+
+        class OrderedClient(RecordingLLMClient):
+            def generate(self, system_prompt: str, user_prompt: str) -> str:
+                timeline.append("llm:company_matcher" if "Company Matcher" in system_prompt else "llm:discovery")
+                return super().generate(system_prompt, user_prompt)
+
+        client = OrderedClient(
+            [
+                json.dumps(discovery, ensure_ascii=False),
+                json.dumps(_web_first_match_payload(["IMP-001"], confidence=0.99), ensure_ascii=False),
+            ]
+        )
+
+        def web_search(**_kwargs):
+            timeline.append("web:search")
+            return [
+                {
+                    "company_name": "海膜科技",
+                    "stock_code": "300123",
+                    "description": "海膜科技 300123 主营反渗透膜。",
+                    "url": "https://verified.example/company/300123",
+                    "source_org": "验证来源",
+                    "date": "2026-08-01",
+                },
+                {
+                    "company_name": "拒绝泄漏公司",
+                    "stock_code": "999999",
+                    "description": "拒绝泄漏公司 999999 的无效资料。",
+                    "url": "https://rejected.example/company/999999",
+                    "source_org": "拒绝来源",
+                    "date": "2026-08-01",
+                },
+            ]
+
+        def search_stock(**_kwargs):
+            timeline.append("cnfinancial:search_stock")
+            return [{"company_name": "海膜科技", "stock_code": "300123"}]
+
+        def company_info(**_kwargs):
+            timeline.append("cnfinancial:get_company_info")
+            return [
+                {
+                    "company_name": "海膜科技",
+                    "stock_code": "300123",
+                    "listing_status": "active",
+                    "data_date": "2026-08-01",
+                }
+            ]
+
+        def company_profile(**_kwargs):
+            timeline.append("cnfinancial:get_company_profile")
+            return [{"main_business": "反渗透膜", "data_date": "2025"}]
+
+        invoker = FakeMCPInvoker(
+            {
+                ("web-search", "search"): web_search,
+                (CNFINANCIAL_SERVER, "search_stock"): search_stock,
+                (CNFINANCIAL_SERVER, "get_company_info"): company_info,
+                (CNFINANCIAL_SERVER, "get_company_profile"): company_profile,
+            }
+        )
+        state = PolicyResearchState(user_query="海水淡化", industry_impacts=[_web_first_impact()])
+
+        with patch.dict(os.environ, {"POLICYCHAIN_COMPANY_DISCOVERY_MODE": "web_first"}):
+            output = run_llm_company_matcher(state, llm_client=client, mcp_invoker=invoker)
+
+        self.assertEqual(
+            timeline,
+            [
+                "llm:discovery",
+                "web:search",
+                "cnfinancial:search_stock",
+                "cnfinancial:get_company_info",
+                "cnfinancial:get_company_profile",
+                "llm:company_matcher",
+            ],
+        )
+        evaluation_prompt = client.calls[-1][1]
+        for expected in (
+            "海膜科技",
+            "300123",
+            "IMP-001",
+            "path_specific_business",
+            "tool_status",
+            "tool_call_id",
+            "cnfinancial_info_evidence",
+            "cnfinancial_profile_evidence",
+            "web_evidence",
+        ):
+            self.assertIn(expected, evaluation_prompt)
+        self.assertNotIn("拒绝泄漏公司", evaluation_prompt)
+        self.assertNotIn("999999", evaluation_prompt)
+        self.assertEqual(len(output.companies), 1)
+        self.assertLessEqual(output.companies[0].confidence, 0.92)
+
+    def test_web_first_evaluation_rejects_invented_company_and_path_before_deterministic_audit(self) -> None:
+        evaluation = _web_first_match_payload(["IMP-001"], confidence=0.99)
+        invented_company = dict(evaluation["companies"][0])
+        invented_company.update({"company_name": "虚构公司", "stock_code": "300999"})
+        invented_path = dict(evaluation["companies"][0])
+        invented_path["impact_id"] = "IMP-999"
+        evaluation["companies"].extend([invented_company, invented_path])
+        client = RecordingLLMClient(
+            [
+                json.dumps(_discovery_payload("IMP-001", []), ensure_ascii=False),
+                json.dumps(evaluation, ensure_ascii=False),
+            ]
+        )
+        invoker = FakeMCPInvoker(
+            {
+                (CNFINANCIAL_SERVER, "search_stock"): [
+                    {"company_name": "海膜科技", "stock_code": "300123"}
+                ],
+                (CNFINANCIAL_SERVER, "get_company_info"): [
+                    {
+                        "company_name": "海膜科技",
+                        "stock_code": "300123",
+                        "listing_status": "active",
+                        "data_date": "2026-08-01",
+                    }
+                ],
+                (CNFINANCIAL_SERVER, "get_company_profile"): [
+                    {"main_business": "反渗透膜", "data_date": "2025"}
+                ],
+            }
+        )
+        state = PolicyResearchState(user_query="海水淡化", industry_impacts=[_web_first_impact()])
+
+        with patch.dict(os.environ, {"POLICYCHAIN_COMPANY_DISCOVERY_MODE": "web_first"}):
+            output = run_llm_company_matcher(state, llm_client=client, mcp_invoker=invoker)
+
+        self.assertEqual([(item.company_name, item.impact_id) for item in output.companies], [("海膜科技", "IMP-001")])
+        self.assertLessEqual(output.companies[0].confidence, 0.92)
+        reason_codes = {str(item.get("reason_code") or "") for item in state.company_match_audit}
+        self.assertIn("llm_company_not_whitelisted", reason_codes)
+        self.assertIn("llm_path_not_whitelisted", reason_codes)
+        self.assertNotIn("虚构公司", json.dumps(state.company_matches, ensure_ascii=False))
+
 
 def _state_with_industry_impacts(store) -> PolicyResearchState:
     state = PolicyResearchState(user_query="生成式人工智能服务提供者有哪些管理要求")
@@ -603,6 +1091,70 @@ def _seed_payload(seeds: list[dict[str, object]] | None = None) -> dict[str, obj
     return {"seeds": list(seeds or []), "uncertainties": []}
 
 
+def _discovery_payload(impact_id: str, web_queries: list[str]) -> dict[str, object]:
+    return {
+        "impact_id": impact_id,
+        "web_queries": web_queries,
+        "seeds": [
+            {
+                "impact_id": impact_id,
+                "proposed_name": "海膜科技",
+                "historical_names": [],
+                "proposed_stock_code": "300123",
+                "seed_reason": "公司可能提供反渗透膜。",
+                "origin_channels": ["llm"],
+            }
+        ],
+        "uncertainties": [],
+    }
+
+
+def _web_first_match_payload(
+    impact_ids: list[str],
+    *,
+    company_name: str = "海膜科技",
+    stock_code: str = "300123",
+    confidence: float = 0.9,
+) -> dict[str, object]:
+    return {
+        "companies": [
+            {
+                "company_name": company_name,
+                "stock_code": stock_code,
+                "industry_segment": "海水淡化反渗透膜",
+                "impact_id": impact_id,
+                "impact_industry": "海水淡化反渗透膜",
+                "chain_segment": "反渗透膜",
+                "matched_business": "公司主营反渗透膜。",
+                "related_product_or_business": "反渗透膜",
+                "match_level": "high",
+                "revenue_or_ratio": "",
+                "source_url": "https://verified.example/company/300123",
+                "match_conditions": ["需持续核对公开业务资料。"],
+                "negative_evidence": [],
+                "business_evidence": [
+                    {
+                        "source_name": "验证后 evidence bundle",
+                        "source_url": "https://verified.example/company/300123",
+                        "text": "公司主营反渗透膜。",
+                        "data_date": "2026-08-01",
+                    }
+                ],
+                "policy_link": "示范项目采购带动反渗透膜需求。",
+                "revenue_relevance": "unknown",
+                "conditions": ["政策项目实际落地。"],
+                "risks": ["需求传导存在不确定性。"],
+                "data_date": "2026-08-01",
+                "confidence": confidence,
+                "audit_status": "pending",
+                "audit_reason": "等待系统确定性后审计。",
+            }
+            for impact_id in impact_ids
+        ],
+        "uncertainties": [],
+    }
+
+
 def _seed_test_impact() -> dict[str, object]:
     return {
         "impact_id": "IMP-001",
@@ -611,6 +1163,19 @@ def _seed_test_impact() -> dict[str, object]:
         "transmission_logic": "项目采购带动环保膜材料需求",
         "business_variables": ["环保材料需求"],
         "affected_company_types": ["环保材料供应商"],
+        "conditions": [],
+        "risks": [],
+    }
+
+
+def _web_first_impact() -> dict[str, object]:
+    return {
+        "impact_id": "IMP-001",
+        "industry": "海水淡化反渗透膜",
+        "chain_segment": "反渗透膜",
+        "transmission_logic": "示范项目采购带动反渗透膜需求",
+        "business_variables": ["反渗透膜"],
+        "affected_company_types": ["反渗透膜供应商"],
         "conditions": [],
         "risks": [],
     }

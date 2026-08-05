@@ -22,6 +22,16 @@ from tests.helpers import build_sample_store
 
 
 class ObservabilityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._prior_company_discovery_mode = os.environ.get("POLICYCHAIN_COMPANY_DISCOVERY_MODE")
+        os.environ["POLICYCHAIN_COMPANY_DISCOVERY_MODE"] = "legacy_cnfinancial"
+
+    def tearDown(self) -> None:
+        if self._prior_company_discovery_mode is None:
+            os.environ.pop("POLICYCHAIN_COMPANY_DISCOVERY_MODE", None)
+        else:
+            os.environ["POLICYCHAIN_COMPANY_DISCOVERY_MODE"] = self._prior_company_discovery_mode
+
     def test_recorder_writes_loadable_redacted_summary_and_events(self) -> None:
         with TemporaryDirectory() as directory:
             recorder = RunRecorder(log_root=directory, mode="llm")

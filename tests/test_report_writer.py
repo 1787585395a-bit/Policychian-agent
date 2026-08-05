@@ -61,6 +61,67 @@ class ReportWriterTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_web_fallback_match_explicitly_discloses_missing_cnfinancial_cross_check(self) -> None:
+        state = PolicyResearchState(user_query="海水淡化政策")
+        state.policy_analysis = {
+            "policy_identity": {"title": "海水淡化测试政策", "issuing_agencies": []},
+            "strength_assessment": {"level": "medium"},
+        }
+        state.industry_impacts = [
+            {
+                "impact_id": "IMP-001",
+                "industry": "反渗透膜",
+                "chain_segment": "反渗透膜",
+                "business_variables": ["反渗透膜需求"],
+                "implementation_action": "示范项目采购",
+                "conditions": [],
+                "risks": [],
+            }
+        ]
+        state.company_matches = [
+            {
+                "company_name": "海膜科技",
+                "stock_code": "300123",
+                "impact_id": "IMP-001",
+                "industry_segment": "反渗透膜",
+                "chain_segment": "反渗透膜",
+                "matched_business": "反渗透膜",
+                "match_level": "low",
+                "confidence": 0.55,
+                "audit_reason": "CNFinancial 技术失败后由两处独立 Web 证据支持，固定保留为低置信匹配。",
+                "negative_evidence": ["CNFinancial 未完成交叉验证；当前仅有两处独立 Web 证据。"],
+                "business_evidence": [
+                    {
+                        "source_name": "两处独立 Web 证据",
+                        "source_url": "https://one.example/notice",
+                        "text": "公司主营反渗透膜。",
+                        "data_date": "2026-07-01",
+                    }
+                ],
+            }
+        ]
+        state.company_coverage = [
+            {
+                "impact_id": "IMP-001",
+                "industry": "反渗透膜",
+                "chain_segment": "反渗透膜",
+                "business_variables": ["反渗透膜需求"],
+                "candidate_count": 1,
+                "passed_count": 1,
+                "rejected_count": 0,
+                "coverage_status": "web_fallback",
+                "retrieval_status": "web_fallback",
+                "no_match_reason": "CNFinancial 未完成交叉验证；仅由两处独立 Web 证据形成低置信业务匹配。",
+            }
+        ]
+        state.uncertainties.append("部分低置信公司仅由两处独立 Web 证据支持，CNFinancial 未完成交叉验证。")
+
+        report = write_research_report(state)
+
+        self.assertIn("CNFinancial 未完成交叉验证", report)
+        self.assertIn("固定保留为低置信匹配", report)
+        self.assertIn("low / 0.55", report)
+
     def test_reference_appendix_limits_evidence_and_tool_logs(self) -> None:
         state = PolicyResearchState(user_query="测试")
         state.evidence = [
