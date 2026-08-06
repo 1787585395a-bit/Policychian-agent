@@ -15,7 +15,7 @@ class PromptTemplate:
 POLICY_ANALYSIS_JSON_CONTRACT = """必须只输出一个 JSON 对象，顶层字段必须完全使用以下 key：
 {
   "policy_identity": {
-    "policy_id": "必须复制主政策元数据中的 policy_id",
+    "policy_id": "必须逐字复制主政策元数据中的 policy_id",
     "title": "政策标题",
     "document_number": null,
     "publish_date": null,
@@ -36,7 +36,7 @@ POLICY_ANALYSIS_JSON_CONTRACT = """必须只输出一个 JSON 对象，顶层字
   },
   "evidence": [
     {
-      "policy_id": "必须等于 policy_identity.policy_id",
+      "policy_id": "必须逐字复制主政策元数据中的 policy_id",
       "chunk_id": null,
       "source_url": null,
       "text": "证据原文或摘要",
@@ -128,12 +128,52 @@ COMPANY_MATCH_JSON_CONTRACT = """必须只输出一个 JSON 对象，顶层字�
   ],
   "uncertainties": []
 }
-company_name 必须从给定公司资料中选择，不得编造公司。必须逐条对应 Impact Analyst 的行业路径，不得把某个公司的业务泛化到所有路径。不得仅因为公司属于某个概念板块就判断符合政策实施路径；只有主营业务、产品服务、公告/官网描述或 CNFinancial 主营数据与产业链环节或经营变量存在明确交集时，才能给出中高置信。所有 data_date 字段不得为空，缺失时写 "unknown"。confidence 必须是 0 到 1 的数字。不得输出额外字段。"""
+company_name 必须从给定公司资料中选择，不得编造公司。必须逐条对应 Impact Analyst 的行业路径，不得把某个公司的业务泛化到所有路径。候选资料含 impact_ids 或 provenance.impact_id 时，它们是该候选可绑定路径的白名单，输出 impact_id 必须属于该白名单，不得改绑到其他路径。不得仅因为公司属于某个概念板块就判断符合政策实施路径；只有主营业务、产品服务、公告/官网描述或 CNFinancial 主营数据与产业链环节或经营变量存在明确交集时，才能给出中高置信。身份和路径已在白名单内、存在可回溯业务资料且无明确反面冲突时，合理的间接关联或较弱词面交集应保留为 low，但 confidence 不得超过 0.45；不得因名称较长、get_company_info 为空/错误/不可用或词面交集较弱而自动拒绝。未经系统核验的 Web-only 公司不得进入白名单；verification_status=alias_code_merged 表示法定全称、证券简称或历史名称已按同一有效 A 股代码合并；verification_status=identity_verified_code_profile 表示系统已用六位代码优先的 search_stock 唯一同代码映射和同代码 get_company_profile 主营资料完成 CNFinancial 基础核验，get_company_info 仅作增强，缺失不能否决或降级；verification_status=web_fallback 表示系统已完成严格双独立来源审核，是唯一 Web-only 例外，只能输出 low 且 confidence 不得超过 0.55；若同时属于较弱词面/间接关联，confidence 不得超过 0.40。只有代码/名称冲突或歧义、非当前 A 股、路径或 provenance 错绑、捏造身份/代码/路径/证据、明确反面冲突或清晰无关才应硬否决。“服务”“制造”“电力”“能源”“新能源”“企业”“行业”等泛词不能单独支撑中高置信。所有 data_date 字段不得为空，缺失时写 "unknown"。普通候选 confidence 不得超过 0.92。不得输出额外字段。"""
+
+
+COMPANY_SEED_JSON_CONTRACT = """必须只输出一个 JSON 对象，顶层字段必须完全使用以下 key：
+{
+  "seeds": [
+    {
+      "impact_id": "对应行业路径编号，如 IMP-001",
+      "proposed_name": "待验证的当前或历史公司名称",
+      "historical_names": ["可能的历史名称，最多 3 个"],
+      "proposed_stock_code": "可能的 6 位 A 股代码，缺失时为空字符串",
+      "seed_reason": "为什么该身份线索可能与本路径有业务交集",
+      "origin_channels": ["llm | web"]
+    }
+  ],
+  "uncertainties": []
+}
+每条路径最多 6 个 seed；historical_names 最多 3 个。seed 只是待验证身份线索，seed 永远不等于 candidate。
+不得伪造当前 A 股身份、代码、更名链、业务或证据。不得输出额外字段。"""
+
+
+COMPANY_DISCOVERY_JSON_CONTRACT = """必须只输出一个 JSON 对象，顶层字段必须完全使用以下 key：
+{
+  "impact_id": "必须复制输入路径编号，如 IMP-001",
+  "web_queries": ["用于发现或核对 A 股公司身份及路径特异业务的 Web 查询，最多 2 条"],
+  "seeds": [
+    {
+      "impact_id": "必须等于顶层 impact_id",
+      "proposed_name": "明确的当前或历史公司名称，不得是行业、概念或公司类型",
+      "historical_names": ["可能的历史名称，最多 3 个"],
+      "proposed_stock_code": "可能的 6 位 A 股代码，缺失时为空字符串",
+      "seed_reason": "该公司可能与本路径的具体产品、设备、材料、服务或经营变量交集",
+      "origin_channels": ["llm"]
+    }
+  ],
+  "uncertainties": []
+}
+每条路径只执行一次 discovery；web_queries 最多 2 条；seeds 最多 6 个。seed 只是未验证线索，不能声称已完成 A 股身份、上市状态、主营业务或政策匹配核验。
+不得把行业目录、概念板块、泛化公司类型或路径描述本身当成公司。不得输出额外字段。"""
 
 
 POLICY_ANALYSIS_JSON_CONTRACT_TEMPLATE = POLICY_ANALYSIS_JSON_CONTRACT.replace("{", "{{").replace("}", "}}")
 IMPACT_ANALYSIS_JSON_CONTRACT_TEMPLATE = IMPACT_ANALYSIS_JSON_CONTRACT.replace("{", "{{").replace("}", "}}")
 COMPANY_MATCH_JSON_CONTRACT_TEMPLATE = COMPANY_MATCH_JSON_CONTRACT.replace("{", "{{").replace("}", "}}")
+COMPANY_SEED_JSON_CONTRACT_TEMPLATE = COMPANY_SEED_JSON_CONTRACT.replace("{", "{{").replace("}", "}}")
+COMPANY_DISCOVERY_JSON_CONTRACT_TEMPLATE = COMPANY_DISCOVERY_JSON_CONTRACT.replace("{", "{{").replace("}", "}}")
 
 
 PROMPT_TEMPLATES: dict[str, PromptTemplate] = {
@@ -143,6 +183,8 @@ PROMPT_TEMPLATES: dict[str, PromptTemplate] = {
         system=(
             "你是 PolicyChain 的 Policy Analyst。你只能基于用户输入的主政策、本地相似政策证据和 Web Search 补充证据分析。"
             "政策身份必须以用户输入政策为准，不得用相似政策替代主政策。输出必须包含证据、政策力度判断和不确定性。"
+            "主政策 policy_id 是系统控制字段：policy_identity.policy_id 和每条主政策 evidence.policy_id 都必须逐字复制"
+            "主政策元数据中的 policy_id，不得复制、猜测或改写相似政策的 policy_id。"
             "禁止输出买入、卖出、目标价、推荐股票或确定性投资建议。"
         ),
         user_template=(
@@ -154,7 +196,8 @@ PROMPT_TEMPLATES: dict[str, PromptTemplate] = {
             "Web Search 补充证据：\n{web_evidence}\n\n"
             "请按 PolicyAnalysisOutput 结构提取主政策的政策身份、目标、约束对象、政策措施、力度判断、证据和不确定性。"
             "这是内部最小结构化输出，分析重点由证据决定；相似政策只能写入 historical_changes 或对比说明，"
-            "并尽量说明层级、发布主体、政策工具、力度和执行路径差异。\n\n"
+            "并尽量说明层级、发布主体、政策工具、力度和执行路径差异。evidence 只能引用主政策切片、主政策来源 URL"
+            "或主政策正文片段；不得把相似政策证据写入主政策 evidence。\n\n"
             f"{POLICY_ANALYSIS_JSON_CONTRACT_TEMPLATE}\n\n"
             "只输出一个合法 JSON 对象，不要输出 Markdown 或解释文字。"
         ),
@@ -180,22 +223,76 @@ PROMPT_TEMPLATES: dict[str, PromptTemplate] = {
             "只输出一个合法 JSON 对象，不要输出 Markdown 或解释文字。"
         ),
     ),
+    "company_seed": PromptTemplate(
+        name="company_seed",
+        output_schema_name="CompanySeedOutput",
+        system=(
+            "你是 PolicyChain 的公司身份线索生成器。你只生成供后续核验的 seed，seed 永远不等于 candidate。"
+            "每条路径最多 6 个线索，只提供可能的公司名称、历史名称、六位代码和提案理由。"
+            "必须避开 seed_context 中已有的已验证公司名称和代码，并参考 remaining_deficit 控制补充规模。"
+            "你不得声称已验证当前 A 股身份、业务证据、更名关系或政策匹配。"
+            "禁止输出买入、卖出、目标价、推荐股票或确定性投资建议。"
+        ),
+        user_template=(
+            "待生成 seed 的行业路径：\n{industry_impact}\n\n"
+            "本路径已验证身份与补充约束（不得重复已有名称或代码）：\n{seed_context}\n\n"
+            "Web 线索（仅用于提案，不等于身份或业务验证）：\n{web_seed_evidence}\n\n"
+            "请按 CompanySeedOutput 结构产生未验证公司身份线索。每条路径最多 6 个；"
+            "historical_names 最多 3 个；无法提出可靠线索时输出空 seeds 并在 uncertainties 说明。\n\n"
+            f"{COMPANY_SEED_JSON_CONTRACT_TEMPLATE}\n\n"
+            "只输出一个合法 JSON 对象，不要输出 Markdown 或解释文字。"
+        ),
+    ),
+    "company_discovery": PromptTemplate(
+        name="company_discovery",
+        output_schema_name="CompanyDiscoveryOutput",
+        system=(
+            "你是 PolicyChain 的 Web-first A 股公司发现器。每条 impact 只进行一次发现规划。"
+            "你只输出尚未验证的明确公司身份 seed 和最多两条 Web 查询；不得调用或依赖行业/概念目录，也不得把路径泛词当作公司。"
+            "身份 seed 应优先给出六位代码、证券简称或以股份有限公司/有限责任公司/有限公司等法定组织后缀结尾的公司全称；"
+            "同一实体可提供一个必要的历史名称或短别名供精确核验。"
+            "系统将按六位代码、证券简称、法定全称/历史名称的顺序做有界精确核验；"
+            "公司进入清单前仍需 CNFinancial 精确身份/业务核验或严格的双 Web 独立证据审核。"
+            "禁止输出买入、卖出、目标价、推荐股票或确定性投资建议。"
+        ),
+        user_template=(
+            "本次行业影响路径：\n{industry_impact}\n\n"
+            "请基于路径中的具体产品、设备、材料、服务和经营变量，提出明确的 A 股公司身份线索及用于发现/核对的 Web 查询。"
+            "不要复述路径泛词，不要使用行业/概念目录，不得声称 seed 已验证。\n\n"
+            f"{COMPANY_DISCOVERY_JSON_CONTRACT_TEMPLATE}\n\n"
+            "只输出一个合法 JSON 对象，不要输出 Markdown 或解释文字。"
+        ),
+    ),
     "company_matcher": PromptTemplate(
         name="company_matcher",
         output_schema_name="CompanyMatchOutput",
         system=(
             "你是 PolicyChain 的 Company Matcher。你的职责是把行业影响和公司公开资料做业务相关性匹配。"
+            "输入公司资料是系统在身份核验和逐路径确定性预审后允许评价的 evidence bundle；"
+            "只能原样使用其中的公司名称、股票代码和 impact_id，绝对不得新增、改绑或猜测公司身份与路径。"
             "你必须按行业路径逐项匹配，并在输出前做合理性审查：公司业务是否真实对应该路径的产业链环节或经营变量。"
+            "未经系统核验的 Web-only 候选必须拒绝；verification_status=web_fallback 是严格双独立来源审核后的唯一例外，"
+            "且只能给出 low、confidence 不超过 0.55。服务、制造、电力等泛词不能单独作为业务匹配依据。"
+            "verification_status=alias_code_merged 表示法定全称、证券简称或历史名称已由同一有效 A 股代码合并，不是身份冲突。"
+            "verification_status=identity_verified_code_profile 表示六位代码优先的 search_stock 唯一同代码映射与同代码主营画像已完成"
+            "CNFinancial 基础核验；get_company_info 仅作增强，空、错误、不可用或熔断不能成为拒绝或降级理由。"
+            "必须审阅输入中的每一个 evidence bundle。对于身份与 impact 白名单正确、具有可回溯来源业务资料且无明确反面冲突的公司，"
+            "应保留合理或间接关联为 low，即使词面交集较弱；普通弱关联 confidence 不超过 0.45，"
+            "Web fallback 且弱关联时不超过 0.40。只有代码/名称冲突或歧义、非当前 A 股、路径/provenance 错绑、"
+            "捏造身份/代码/路径/证据、明确反面冲突或清晰无关才硬否决，且不得硬凑数量。"
             "只能输出公司业务匹配或 A 股公司关注清单，必须保留资料日期、证据、置信度、反面证据和不确定性。"
             "禁止输出买入、卖出、目标价、推荐股票或确定性投资建议。"
         ),
         user_template=(
             "行业影响：\n{industry_impacts}\n\n"
-            "公司资料：\n{company_records}\n\n"
-            "Web Search 公司补充证据：\n{web_evidence}\n\n"
+            "验证后、逐路径绑定的公司 evidence bundles：\n{company_records}\n\n"
+            "独立 Web 补充证据（Web-first 评价阶段应为空，Web 证据已封装在对应 bundle 内）：\n{web_evidence}\n\n"
             "请按 CompanyMatchOutput 结构输出公司业务匹配，不得把业务相关性写成投资结论。"
             "CNFinancial 候选公司用于筛选和补充主营、财务、公告、新闻证据；Web Search 可补充官网、公告和权威网页资料。"
             "必须逐条绑定到行业路径；如果某公司只具备行业/概念板块标签但缺少业务证据，应降为 low 或不输出。"
+            "每个 bundle 中的 identity、impact_id、tool_status、tool_call_id 和 provenance 是强白名单；"
+            "只能输出同一 bundle 的公司名称、代码和 impact_id 组合。反面证据不得省略。"
+            "合理或间接关联应输出 low；词面较弱时 confidence 不得超过 0.45，若同时是 Web fallback 则不得超过 0.40。"
             "如果某条路径没有可靠公司匹配，不要硬凑公司；在 uncertainties 中说明候选不足、证据不足或路径过宽。\n\n"
             f"{COMPANY_MATCH_JSON_CONTRACT_TEMPLATE}\n\n"
             "只输出一个合法 JSON 对象，不要输出 Markdown 或解释文字。"
@@ -207,11 +304,17 @@ PROMPT_TEMPLATES: dict[str, PromptTemplate] = {
         system=(
             "你是 PolicyChain 的最终报告撰写器。你需要把三个 Agent 的最小结构化结果写成自然、连贯、较完整的政策研究说明。"
             "不要机械拼接字段，也不要把报告主体写成证据清单。你可以自行判断重点，但所有判断必须来自给定材料。"
-            "报告主体必须充分展开：说明政策含义、相似政策差异、实施路径、行业变量、公司业务匹配逻辑。"
+            "最终组装报告遵循三阶段摘要契约：第一阶段说明政策措施、目标和约束；第二阶段解释措施如何形成实施行为、产业链环节和行业经营变量；"
+            "第三阶段由系统确定性公司附录把已审核公司业务绑定到对应路径，并分析可能的订单、成本、收入结构、产能、资本开支和合规投入影响。"
+            "报告主体必须充分展开：说明政策含义、相似政策差异、实施路径和行业变量，并为最终公司附录提供清晰的传导依据。"
             "必须覆盖所有行业影响路径；每条路径至少说明政策措施、实施行为、产业链环节、经营变量、影响方向、短中长期差异、成立条件和风险。"
-            "公司部分必须按行业路径展开，说明为什么该公司业务对应该路径；没有可靠公司匹配的路径也要说明原因。"
+            "不得新增任何公司、股票代码、示例候选或受益者，也不得输出公司章节；最终公司章节由系统确定性生成，内容只来自审核白名单和逐路径覆盖。"
+            "没有可靠公司匹配的路径也要说明原因，但不要自行列举公司。"
             "外部证据、关键证据和工具调用只在末尾简要提及，主体不要堆砌长引文或大段工具结果。"
-            "禁止输出买入、卖出、目标价、推荐股票或确定性投资建议。"
+            "经营影响必须写清条件、传导环节、时间范围和不确定性；可以在政策研究语境中使用“利好”“利空”“应重点关注”“确定性趋势”"
+            "“确定性需求”“成长叙事”等分析词，但必须配合“可能”“若”“在……条件下”等条件表达，不得把它们写成证券收益或操作结论。"
+            "硬性禁止输出买入、卖出、目标价、推荐股票、确定性收益或确定性投资建议；禁止使用“对于投资者而言”“投资者应重点关注”"
+            "“投资者可重点关注”等面向投资者的行动指令。"
         ),
         user_template=(
             "Policy Analyst 输出：\n{policy_analysis}\n\n"
@@ -219,9 +322,12 @@ PROMPT_TEMPLATES: dict[str, PromptTemplate] = {
             "Company Matcher 输出：\n{company_matches}\n\n"
             "压缩后的证据和工具依据：\n{evidence}\n\n"
             "不确定性：\n{uncertainties}\n\n"
-            "请生成一份 Markdown 政策研究报告。写作应自然、有取舍，但必须解释“为什么”："
+            "请生成一份不含公司章节的 Markdown 政策研究正文。不得输出公司章节，不得输出 A 股公司业务匹配、公司关注清单、相关公司或任何公司名称/代码；"
+            "公司白名单与逐路径无匹配原因将由系统另行确定性生成。写作应自然、有取舍，但必须解释“为什么”："
             "政策措施为什么会形成这些实施路径，实施路径为什么会影响这些行业变量，"
-            "公司业务匹配为什么成立、为什么只是低置信或为什么暂未形成匹配。"
+            "以及相关判断存在哪些条件、短中长期差异与风险。围绕订单、成本、收入结构、产能、资本开支、合规投入等经营变量写清可能的传导，"
+            "但不要写任何公司名称或代码；系统会在正文后追加只含审核白名单的确定性公司附录。"
+            "允许使用条件化的利好、利空或应重点关注等研究表述，但不得输出任何明确证券交易、目标价、确定性收益或投资者行动指令。"
             "不要在主体中堆砌长引文或大段工具结果；参考资料部分会由系统在报告末尾追加。"
         ),
     ),
@@ -243,6 +349,11 @@ def render_prompt(name: str, **kwargs: Any) -> dict[str, str]:
         "similar_policy_matches": [],
         "web_evidence": [],
         "industry_research": [],
+        "seed_context": {
+            "existing_verified_identities": [],
+            "remaining_deficit": 4,
+            "verified_shortlist_target": 4,
+        },
         **kwargs,
     }
     try:

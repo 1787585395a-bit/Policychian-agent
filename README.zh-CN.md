@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-分析结果示例：[《生成式人工智能服务管理暂行办法》政策研究报告](docs/analysis_result_example.zh-CN.md)
+最新真实示例：[《生成式人工智能服务管理暂行办法》政策研究报告](docs/analysis_result_example.zh-CN.md)。该报告来自运行 `run-20260806T110626-e72098de7073`，覆盖 5 条行业影响路径和 12 条经过审核的公司—路径匹配；网页中的“示例报告”读取同一份文件。
 
 PolicyChain 是一个面向政策研究的 Agentic RAG 系统。核心流程是：用户输入政策链接或政策正文，系统读取并校验政策内容，进行政策分析、相似政策对比、实施路径分析、行业影响分析，并生成 A 股公司业务匹配研究说明。
 
@@ -22,7 +22,7 @@ https://zengliao-policychain-agent.hf.space
 https://zengliao-policychain-agent.hf.space/healthz
 ```
 
-在线版本默认可以完成确定性分析流程。由于 Hugging Face 免费 CPU 对 stdio MCP 调用较慢，云端默认关闭 MCP。DeepSeek 需要在 Hugging Face Space 的 Secrets 中配置 `DEEPSEEK_API_KEY` 后才会启用模型增强。
+在线版本默认使用 DeepSeek 完成模型分析；必须在 Hugging Face Space 的 Secrets 中配置 `DEEPSEEK_API_KEY`。由于 Hugging Face 免费 CPU 对 stdio MCP 调用较慢，云端默认关闭 MCP。确定性流程仅在 DeepSeek 不可用时作为带日志记录的回退。
 
 ## 用户使用流程
 
@@ -31,7 +31,7 @@ https://zengliao-policychain-agent.hf.space/healthz
 3. 点击“运行分析”。
 4. 查看进度条和运行日志。
 5. 等待报告生成。
-6. 如需排查问题，可复制运行日志。
+6. 在终态查看 Run ID、实际运行模式、各 Agent 状态和 fallback 情况；成功或失败任务都可下载脱敏运行日志。
 
 输入应是政策链接或较完整的政策正文，不是普通问答问题。若链接无法公开访问、需要登录、验证码或页面正文过短，请改为粘贴政策正文。
 
@@ -47,6 +47,21 @@ https://zengliao-policychain-agent.hf.space/healthz
 - 参考资料、工具依据和不确定性说明。
 
 公司部分只表示业务匹配研究清单，不构成投资建议。
+
+## 公司匹配流程
+
+Company Matcher 默认采用 Web-first 流程：
+
+```text
+DeepSeek + Web Search 按 impact_id 发现具体公司
+→ CNFinancial 按股票代码、证券简称和法定名称精确核验
+→ 合并 Web 与主营业务证据
+→ DeepSeek 评价
+→ 固定规则复核
+→ 每条路径最多 3 家进入报告
+```
+
+每条路径最多生成 6 个未验证 Seed，候选评估池默认保留 5 家。只要公司身份有效、业务资料可追溯且没有明确冲突，弱相关或间接相关候选会以低置信保留；只有代码/名称冲突、非当前 A 股、路径错绑、证据伪造、业务明确相反或清晰无关时才会硬性剔除。CNFinancial 的空结果、报错或不可用会继续进入严格 Web fallback，而不会直接清空候选。
 
 ## 本地安装
 
@@ -137,7 +152,7 @@ python scripts/run_research.py --full-db --query "粘贴政策正文或政策问
 
 ## DeepSeek 配置
 
-本项目默认可以离线运行。启用 DeepSeek 时，请使用环境变量或平台 Secrets，不要把 API Key 写入代码。
+本项目默认使用 DeepSeek。请使用环境变量或平台 Secrets 配置 API Key，不要把 API Key 写入代码。确定性流程仅作为显式 `--no-llm` 模式或 DeepSeek 不可用时的回退。
 
 本地 PowerShell 示例：
 
@@ -171,8 +186,8 @@ $env:DEEPSEEK_USE_SYSTEM_PROXY='1'
 
 当前预留并支持两个 MCP 通道：
 
-- Open-WebSearch：用于政策、行业和公司外部资料搜索。
-- CNFinancial：用于行业板块、行业成分、公司资料和财务相关公开数据。
+- Open-WebSearch：用于政策、行业外部证据，以及 Company Matcher 按路径发现具体公司和业务资料。
+- CNFinancial：Impact Analyst 可使用行业和宏观资料；Company Matcher 只用具体公司名称或六位代码做身份、主营业务和增强资料核验，不再以宽泛行业关键词作为主要公司召回入口。
 
 本地准备 MCP：
 
@@ -211,7 +226,9 @@ POLICYCHAIN_MCP_FAST_MODE=1
 POLICYCHAIN_MCP_MAX_POLICY_WEB_TOPICS=1
 POLICYCHAIN_MCP_MAX_SELECTED_INDUSTRIES=2
 POLICYCHAIN_MCP_MAX_SEARCH_TERMS=2
-POLICYCHAIN_MCP_MAX_COMPANY_CANDIDATES=1
+POLICYCHAIN_COMPANY_DISCOVERY_MODE=web_first
+POLICYCHAIN_MCP_MAX_COMPANY_CANDIDATES=5
+POLICYCHAIN_MAX_COMPANY_MATCHES_PER_IMPACT=3
 POLICYCHAIN_MCP_COMPANY_ENRICH_TOOLS=get_company_profile
 ```
 
@@ -270,7 +287,7 @@ data/processed/    SQLite 数据库输出目录
 
 - Policy Analyst：识别政策标题、发布主体、发布日期、文号、政策目标、政策措施、约束对象、历史变化和政策力度。
 - Impact Analyst：从政策措施推导实施主体、实施行为、产业链环节、行业经营变量和影响公司类型。
-- Company Matcher：面向 A 股公司做业务匹配，保留业务证据、反面证据、风险和置信度。
+- Company Matcher：按行业影响路径使用 DeepSeek/Web 发现 A 股公司，以 CNFinancial 精确核验身份和主营资料，再融合证据、评价、固定复核和排序；保留业务证据、反面证据、风险、资料状态和置信度。
 
 本地政策知识库只用于相似政策、历史政策或可比政策检索，不会替代用户输入政策本身。
 
@@ -279,4 +296,4 @@ data/processed/    SQLite 数据库输出目录
 - 云端 MCP 默认关闭，避免 Hugging Face 免费 CPU 上任务超时。
 - CNINFO 年报下载暂未作为默认流程启用。
 - 当前公司部分是业务匹配研究清单，不做投资建议。
-- 任务日志保存在进程内存中，服务重启后历史任务日志会丢失。
+- 运行事件和摘要默认保存到 Git 忽略的 `artifacts/run-logs/<run_id>/`，并可按 job_id 或 run_id 下载；服务重启后内存中的 job 索引会重置，但已落盘的 run artifact 仍可按 run_id 读取。

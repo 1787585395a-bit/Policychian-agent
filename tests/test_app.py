@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import threading
 import time
 import unittest
@@ -25,7 +26,8 @@ from app import (
     render_page,
     run_query,
 )
-from policychain.llm import LLMConfigurationError
+from policychain.observability import RunRecorder
+from policychain.state import PolicyResearchState
 from tests.helpers import artifact_db_path
 
 
@@ -70,6 +72,17 @@ class AppTests(unittest.TestCase):
         self.assertIn('id="log-meta"', html)
         self.assertIn('id="copy-log"', html)
         self.assertIn('id="copy-log" type="button" disabled', html)
+        self.assertIn('id="run-summary"', html)
+        self.assertIn('id="run-id"', html)
+        self.assertIn('id="run-mode"', html)
+        self.assertIn('id="fallback-status"', html)
+        self.assertIn('aria-label="Agent 状态"', html)
+        self.assertIn("政策分析", html)
+        self.assertIn("行业影响", html)
+        self.assertIn("公司匹配", html)
+        self.assertIn("报告生成", html)
+        self.assertIn('id="download-log"', html)
+        self.assertIn("/api/run-log?job_id=", html)
         self.assertIn("/api/research", html)
         self.assertIn("/api/research-status", html)
         self.assertIn("查看示例报告", html)
@@ -118,8 +131,9 @@ class AppTests(unittest.TestCase):
         self.assertIn("示例报告", html)
         self.assertIn("生成式人工智能服务管理暂行办法", html)
         self.assertIn("不构成任何投资建议", html)
-        self.assertIn("<blockquote>", html)
-        self.assertNotIn("&gt; 本页用于展示", html)
+        self.assertIn("IMP-005：未成年人保护相关服务", html)
+        self.assertIn("三六零（601360）", html)
+        self.assertIn("安恒信息（688023）", html)
         self.assertIn('href="/"', html)
 
     def test_http_handler_serves_example_report_page(self) -> None:
@@ -173,20 +187,39 @@ class AppTests(unittest.TestCase):
         self.assertIn("数据库不可用", html)
         self.assertIn('class="error"', html)
 
-    def test_run_query_returns_report(self) -> None:
-        result = run_query(DEFAULT_POLICY_INPUT, db_path=artifact_db_path("app_query"))
+    def test_client_terminal_states_render_distinct_report_content(self) -> None:
+        html = render_page().decode("utf-8")
+
+        self.assertIn(
+            "report.innerHTML = '<div class=\"empty\">正在分析，请等待结果。</div>';",
+            html,
+        )
+        self.assertIn(
+            "report.innerHTML = payload.report_html || '<div class=\"empty\">报告为空。</div>';",
+            html,
+        )
+        show_error_script = html.split("function showError(message)", maxsplit=1)[1].split(
+            "function escapeHtml(value)", maxsplit=1
+        )[0]
+        self.assertIn("分析失败，未生成报告。", show_error_script)
+        self.assertNotIn("正在分析", show_error_script)
+
+    def test_run_query_can_explicitly_use_deterministic_fallback(self) -> None:
+        result = run_query(DEFAULT_POLICY_INPUT, db_path=artifact_db_path("app_query"), use_llm=False)
 
         self.assertIn("PolicyChain", result["report"])
         self.assertGreaterEqual(result["elapsed_seconds"], 0)
         self.assertFalse(result["use_llm"])
 
-    def test_run_query_can_request_llm_mode(self) -> None:
+    def test_run_query_defaults_to_llm_mode(self) -> None:
         with patch("app.run_research", return_value="# PolicyChain 政策研究报告") as fake_runner:
-            result = run_query("测试政策正文", db_path=":memory:", use_llm=True)
+            result = run_query("测试政策正文", db_path=":memory:")
 
         self.assertTrue(result["use_llm"])
         self.assertEqual(result["report"], "# PolicyChain 政策研究报告")
         self.assertTrue(fake_runner.call_args.kwargs["use_llm"])
+        self.assertTrue(fake_runner.call_args.kwargs["return_state"])
+        self.assertIsInstance(fake_runner.call_args.kwargs["run_recorder"], RunRecorder)
 
     def test_run_query_can_request_mcp_mode(self) -> None:
         class FakeClosableInvoker:
@@ -243,29 +276,40 @@ class AppTests(unittest.TestCase):
 
         self.assertFalse(result["use_mcp"])
         self.assertIn("运行环境提示", result["report"])
+        self.assertTrue(result["fallback_used"])
+        self.assertEqual(result["requested_run_mode"], "llm")
+        self.assertEqual(result["effective_run_mode"], "llm")
         self.assertTrue(any(stage == "MCP 初始化" for _, stage, _ in progress_events))
         self.assertIsNone(fake_runner.call_args.kwargs["mcp_invoker"])
 
     def test_run_query_falls_back_when_llm_is_unconfigured(self) -> None:
         progress_events: list[tuple[int, str, str]] = []
-        with patch(
-            "app.run_research",
-            side_effect=[
-                LLMConfigurationError("DEEPSEEK_API_KEY is required"),
-                "# PolicyChain 政策研究报告",
-            ],
-        ) as fake_runner:
+        recorder = RunRecorder(mode="llm")
+        recorder.mark_fallback("workflow", "DEEPSEEK_API_KEY is required", "deterministic")
+        recorder.mode = "deterministic"
+        state = PolicyResearchState(
+            user_query="测试政策正文",
+            final_report="# PolicyChain 政策研究报告",
+            run_id=recorder.run_id,
+            run_mode="deterministic",
+            fallback_used=True,
+        )
+        with patch("app.run_research", return_value=state) as fake_runner:
             result = run_query(
                 "测试政策正文",
                 db_path=":memory:",
                 use_llm=True,
+                run_recorder=recorder,
                 progress_callback=lambda progress, stage, message: progress_events.append((progress, stage, message)),
             )
 
         self.assertFalse(result["use_llm"])
-        self.assertEqual(fake_runner.call_count, 2)
-        self.assertIn("运行环境提示", result["report"])
-        self.assertTrue(any(stage == "模型初始化" for _, stage, _ in progress_events))
+        self.assertEqual(fake_runner.call_count, 1)
+        self.assertIn("PolicyChain", result["report"])
+        self.assertTrue(result["fallback_used"])
+        self.assertEqual(result["requested_run_mode"], "llm")
+        self.assertEqual(result["effective_run_mode"], "deterministic")
+        self.assertIs(fake_runner.call_args.kwargs["run_recorder"], recorder)
 
     def test_async_job_reports_done_status_and_progress_logs(self) -> None:
         def fake_run_query(query: str, **kwargs):
@@ -335,6 +379,136 @@ class AppTests(unittest.TestCase):
         self.assertIn("读取失败", view["error"])
         self.assertTrue(any(item["stage"] == "错误" for item in view["logs"]))
         self.assertTrue(any("读取失败" in item["message"] for item in view["logs"]))
+
+    def test_job_status_exposes_run_observability_without_serializing_recorder(self) -> None:
+        def fake_run_query(query: str, **kwargs):
+            recorder = kwargs["run_recorder"]
+            recorder.set_agent_status("policy_analyst", "completed")
+            recorder.set_agent_status("impact_analyst", "completed")
+            recorder.set_agent_status("company_matcher", "completed")
+            recorder.set_agent_status("report_writer", "completed")
+            recorder.mark_fallback("company_matcher", "上游工具不可用", "deterministic_company_matcher")
+            recorder.finish("completed")
+            return {
+                "query": query,
+                "report": "# PolicyChain 政策研究报告",
+                "use_llm": False,
+                "use_mcp": False,
+                "elapsed_seconds": 0.1,
+                "run_id": recorder.run_id,
+                "requested_run_mode": "llm",
+                "effective_run_mode": "deterministic",
+                "agent_status": recorder.agent_status,
+                "fallback_used": True,
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ,
+            {"POLICYCHAIN_SYNC_JOBS": "1", "POLICYCHAIN_RUN_LOG_DIR": temp_dir},
+        ), patch("app.run_query", side_effect=fake_run_query):
+            first_job_id = _create_job("政策正文一", use_llm=True, use_mcp=False)
+            second_job_id = _create_job("政策正文二", use_llm=True, use_mcp=False)
+            first = _job_view(first_job_id)
+            second = _job_view(second_job_id)
+
+            self.assertNotEqual(first["run_id"], second["run_id"])
+            self.assertEqual(first["requested_run_mode"], "llm")
+            self.assertEqual(first["effective_run_mode"], "deterministic")
+            self.assertEqual(
+                first["agent_status"],
+                {"policy": "completed", "impact": "completed", "company": "completed", "report": "completed"},
+            )
+            self.assertTrue(first["fallback_used"])
+            self.assertTrue(first["log_download_available"])
+            self.assertNotIn("run_recorder", first)
+            json.dumps(first, ensure_ascii=False)
+
+    def test_http_handler_downloads_redacted_logs_for_done_and_error_jobs(self) -> None:
+        def successful_run_query(query: str, **kwargs):
+            recorder = kwargs["run_recorder"]
+            recorder.record(
+                "tool.response",
+                stage="company_matcher",
+                status="ok",
+                api_key="top-secret-value",
+                content="不应出现在下载中的大段政策正文",
+            )
+            recorder.set_agent_status("company_matcher", "completed")
+            recorder.finish("completed")
+            return {
+                "query": query,
+                "report": "# 普通研究报告",
+                "use_llm": False,
+                "use_mcp": False,
+                "elapsed_seconds": 0.1,
+                "run_id": recorder.run_id,
+                "requested_run_mode": "deterministic",
+                "effective_run_mode": "deterministic",
+                "agent_status": recorder.agent_status,
+                "fallback_used": False,
+            }
+
+        def failed_run_query(query: str, **kwargs):
+            recorder = kwargs["run_recorder"]
+            recorder.record(
+                "tool.error",
+                stage="policy_analyst",
+                status="failed",
+                message="Authorization=top-secret-value",
+            )
+            raise RuntimeError("正文读取失败")
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ,
+            {"POLICYCHAIN_SYNC_JOBS": "1", "POLICYCHAIN_RUN_LOG_DIR": temp_dir},
+        ):
+            with patch("app.run_query", side_effect=successful_run_query):
+                done_job_id = _create_job("政策正文", use_llm=False, use_mcp=False)
+            with patch("app.run_query", side_effect=failed_run_query):
+                error_job_id = _create_job("错误正文", use_llm=False, use_mcp=False)
+
+            done_view = _job_view(done_job_id)
+            error_view = _job_view(error_job_id)
+            self.assertEqual(done_view["status"], "done")
+            self.assertEqual(error_view["status"], "error")
+            self.assertTrue(done_view["log_download_available"])
+            self.assertTrue(error_view["log_download_available"])
+            self.assertNotIn("tool.response", done_view["report_html"])
+
+            server = HTTPServer(("127.0.0.1", 0), PolicyChainRequestHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                for job_id, expected_status in ((done_job_id, "completed"), (error_job_id, "failed")):
+                    connection = HTTPConnection(host, port, timeout=5)
+                    try:
+                        connection.request("GET", f"/api/run-log?job_id={job_id}")
+                        response = connection.getresponse()
+                        body = response.read()
+                    finally:
+                        connection.close()
+                    decoded = body.decode("utf-8")
+                    artifact = json.loads(decoded)
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.getheader("Content-Type"), "application/json; charset=utf-8")
+                    self.assertIn("attachment; filename=", response.getheader("Content-Disposition") or "")
+                    self.assertEqual(artifact["summary"]["status"], expected_status)
+                    self.assertNotIn("top-secret-value", decoded)
+
+                connection = HTTPConnection(host, port, timeout=5)
+                try:
+                    connection.request("GET", f"/api/run-logs/{done_view['run_id']}")
+                    compatibility_response = connection.getresponse()
+                    compatibility_body = compatibility_response.read()
+                finally:
+                    connection.close()
+                self.assertEqual(compatibility_response.status, 200)
+                self.assertEqual(json.loads(compatibility_body.decode("utf-8"))["summary"]["run_id"], done_view["run_id"])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
 
 
     def test_vercel_wsgi_entrypoint_serves_health_and_research_api(self) -> None:

@@ -4,9 +4,11 @@ import json
 import re
 from typing import Any
 
-from policychain.llm import LLMClient
+from policychain.agents.company_matcher import resolve_company_match_limit
+from policychain.llm import LLMClient, observed_llm_generate
+from policychain.observability import current_run_recorder, record_event
 from policychain.prompts import render_prompt
-from policychain.safety import assert_no_investment_advice
+from policychain.safety import REPORT_WRITER_SAFETY_PROFILE, assert_no_investment_advice
 from policychain.state import PolicyResearchState
 
 
@@ -17,6 +19,31 @@ class ReportWriterError(RuntimeError):
 REFERENCE_KEY_EVIDENCE_LIMIT = 2
 REFERENCE_EXTERNAL_EVIDENCE_LIMIT = 2
 REFERENCE_TOOL_LOG_LIMIT = 4
+COMPANY_REPORT_TOOL_NAMES = {
+    "search_stock",
+    "get_company_info",
+    "get_company_profile",
+    "get_segments_revenue",
+    "get_financial_indicators",
+    "get_growth_rates",
+    "get_competitors",
+    "get_company_announcements",
+    "get_stock_news",
+}
+COMPANY_SECTION_MARKERS = (
+    "a股公司业务匹配",
+    "a股公司关注清单",
+    "公司业务匹配",
+    "公司关注清单",
+    "相关公司",
+    "受益公司",
+    "重点公司",
+    "公司匹配",
+    "受益者",
+    "受益标的",
+    "公司示例",
+    "示例公司",
+)
 
 
 def write_research_report(state: PolicyResearchState) -> str:
@@ -30,13 +57,18 @@ def write_research_report(state: PolicyResearchState) -> str:
             _similar_policy_section(state.similar_policy_matches),
             _impact_path_section(state.implementation_path, state.industry_impacts),
             _company_matches_section(state.industry_impacts, state.company_matches, state.company_coverage),
-            _uncertainty_section(state.uncertainties),
+            _uncertainty_section(_report_uncertainties(state)),
             _reference_appendix(state),
             "本报告仅用于政策研究和公司业务匹配分析，不构成任何投资建议。",
         ]
     ).strip()
-    assert_no_investment_advice(report, context="Report")
+    assert_no_investment_advice(
+        report,
+        context="Report",
+        profile=REPORT_WRITER_SAFETY_PROFILE,
+    )
     state.final_report = report
+    record_event("report.source", stage="report_writer", status="ok", source="deterministic_rules")
     return report
 
 
@@ -54,41 +86,55 @@ def write_llm_research_report(state: PolicyResearchState, llm_client: LLMClient)
                     "industry_impacts": state.industry_impacts,
                     "coverage_matrix": coverage_matrix,
                     "industry_research_summary": _compact_external_evidence(state.industry_research, limit=4),
-                    "react_trace_summary": _compact_react_traces(state.react_traces, limit=4),
-                    "tool_call_summary": _compact_tool_logs(state.tool_call_logs, limit=4),
+                    "react_trace_summary": _compact_react_traces(_report_react_traces(state.react_traces), limit=4),
+                    "tool_call_summary": _compact_tool_logs(_report_tool_logs(state.tool_call_logs), limit=4),
                 }
             ),
             company_matches=_json_for_prompt(
                 {
-                    "company_candidates": state.company_candidates,
-                    "company_matches": state.company_matches,
+                    "approved_company_matches": state.company_matches,
                     "company_coverage": coverage_matrix,
-                    "company_audit": state.company_match_audit[:12],
-                    "company_research_summary": _compact_external_evidence(state.company_research, limit=4),
                 }
             ),
-            evidence=_json_for_prompt(_reference_payload(state)),
-            uncertainties=_json_for_prompt(state.uncertainties),
+            evidence=_json_for_prompt(_report_prompt_reference_payload(state)),
+            uncertainties=_json_for_prompt(_report_uncertainties(state)),
         )
-        body = _strip_reference_sections(llm_client.generate(prompt["system"], prompt["user"]))
+        body = observed_llm_generate(llm_client, prompt["system"], prompt["user"], agent="report_writer")
+        assert_no_investment_advice(
+            body,
+            context="LLM report raw output",
+            profile=REPORT_WRITER_SAFETY_PROFILE,
+        )
+        body = _strip_company_sections(_strip_reference_sections(body))
         if not body.strip():
             raise ReportWriterError("LLM Report Writer returned an empty report")
+        if re.search(r"(?<!\d)\d{6}(?!\d)", body):
+            raise ReportWriterError("LLM Report Writer emitted a company-like stock code outside the deterministic appendix")
         body = _ensure_impact_coverage(body.strip(), state)
         report = "\n\n".join(
             [
                 body,
+                _company_matches_section(state.industry_impacts, state.company_matches, coverage_matrix),
                 _reference_appendix(state),
                 "本报告仅用于政策研究和公司业务匹配分析，不构成任何投资建议。",
             ]
         ).strip()
-        assert_no_investment_advice(report, context="LLM report")
+        assert_no_investment_advice(
+            report,
+            context="LLM report",
+            profile=REPORT_WRITER_SAFETY_PROFILE,
+        )
         state.final_report = report
+        record_event("report.source", stage="report_writer", status="ok", source="llm")
         return report
     except Exception as exc:
+        recorder = current_run_recorder()
+        if recorder is not None:
+            recorder.mark_fallback("report_writer", str(exc)[:300], "deterministic_report_writer")
         state.uncertainties = _unique(
             [
                 *state.uncertainties,
-                f"LLM Report Writer 未能完成自然语言报告生成，已回退到确定性报告：{exc}",
+                "LLM Report Writer 输出未通过安全或格式校验，已回退到确定性报告。",
             ]
         )
         return write_research_report(state)
@@ -233,7 +279,7 @@ def _company_matches_section(
     for index, impact in enumerate(industry_impacts, start=1):
         impact_id = f"IMP-{index:03d}"
         coverage_item = next((item for item in coverage if item.get("impact_id") == impact_id), {})
-        scoped_matches = matches_by_impact.get(impact_id, [])[:3]
+        scoped_matches = matches_by_impact.get(impact_id, [])[:resolve_company_match_limit()]
         lines.extend(
             [
                 "",
@@ -293,7 +339,7 @@ def _reference_appendix(state: PolicyResearchState) -> str:
             source = item.get("source_url") or item.get("policy_id") or "本地政策文本"
             lines.append(f"- {source} / {item.get('chunk_id') or 'chunk'}：{_clip(str(item.get('text') or ''), 100)}")
 
-    external_evidence = _prioritize_external_evidence(state.external_evidence)[:REFERENCE_EXTERNAL_EVIDENCE_LIMIT]
+    external_evidence = _prioritize_external_evidence(_report_external_evidence(state))[:REFERENCE_EXTERNAL_EVIDENCE_LIMIT]
     if external_evidence:
         lines.append("")
         lines.append("外部资料：")
@@ -307,9 +353,11 @@ def _reference_appendix(state: PolicyResearchState) -> str:
             link = f" {url}" if url else ""
             lines.append(f"- {source}.{tool}：{title}{suffix}{link}")
 
-    tool_summaries = _compact_tool_logs(state.tool_call_logs, limit=REFERENCE_TOOL_LOG_LIMIT)
+    tool_summaries = _compact_tool_logs(_report_tool_logs(state.tool_call_logs), limit=REFERENCE_TOOL_LOG_LIMIT)
     if not tool_summaries and state.react_traces:
-        tool_summaries = _compact_react_traces(state.react_traces, limit=REFERENCE_TOOL_LOG_LIMIT)
+        tool_summaries = _compact_react_traces(
+            _report_react_traces(state.react_traces), limit=REFERENCE_TOOL_LOG_LIMIT
+        )
     if tool_summaries:
         lines.append("")
         lines.append("工具调用摘要：")
@@ -374,19 +422,10 @@ def _ensure_impact_coverage(body: str, state: PolicyResearchState) -> str:
     if not missing:
         return body
 
-    supplement_state = PolicyResearchState(user_query=state.user_query)
-    supplement_state.industry_impacts = missing
-    supplement_state.company_matches = state.company_matches
-    supplement_state.company_coverage = [
-        item
-        for item in _coverage_matrix(state)
-        if item.get("industry") in {impact.get("industry") for impact in missing}
-    ]
     supplement = "\n\n".join(
         [
             "## 补充：未充分展开的行业路径",
             _impact_path_section([], missing).replace("## 实施路径与行业影响\n\n", ""),
-            _company_matches_section(missing, state.company_matches, supplement_state.company_coverage),
         ]
     )
     return f"{body}\n\n{supplement}"
@@ -395,10 +434,20 @@ def _ensure_impact_coverage(body: str, state: PolicyResearchState) -> str:
 def _reference_payload(state: PolicyResearchState) -> dict[str, Any]:
     return {
         "key_evidence": state.evidence[:REFERENCE_KEY_EVIDENCE_LIMIT],
-        "external_evidence": _compact_external_evidence(state.external_evidence, limit=REFERENCE_EXTERNAL_EVIDENCE_LIMIT),
-        "tool_calls": _compact_tool_logs(state.tool_call_logs, limit=REFERENCE_TOOL_LOG_LIMIT),
-        "react_traces": _compact_react_traces(state.react_traces, limit=REFERENCE_TOOL_LOG_LIMIT),
+        "external_evidence": _compact_external_evidence(
+            _report_external_evidence(state), limit=REFERENCE_EXTERNAL_EVIDENCE_LIMIT
+        ),
+        "tool_calls": _compact_tool_logs(_report_tool_logs(state.tool_call_logs), limit=REFERENCE_TOOL_LOG_LIMIT),
+        "react_traces": _compact_react_traces(
+            _report_react_traces(state.react_traces), limit=REFERENCE_TOOL_LOG_LIMIT
+        ),
     }
+
+
+def _report_prompt_reference_payload(state: PolicyResearchState) -> dict[str, Any]:
+    """Return policy/industry references without rejected or candidate-company context."""
+
+    return _reference_payload(state)
 
 
 def _compact_external_evidence(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
@@ -436,12 +485,16 @@ def _compact_tool_logs(tool_logs: list[dict[str, Any]], limit: int) -> list[str]
 
 def _compact_react_traces(react_traces: list[dict[str, Any]], limit: int) -> list[str]:
     output = []
-    for trace in react_traces[:limit]:
+    for trace in react_traces:
+        if _is_catalog_tool(str(trace.get("action") or "")):
+            continue
         stage = trace.get("stage") or "react"
         action = trace.get("action") or "unknown"
         count = trace.get("evidence_count")
         detail = trace.get("error") or trace.get("observation") or trace.get("message") or ""
         output.append(f"{stage}.{action} -> count={count}; {_clip(str(detail), 100)}")
+        if len(output) >= limit:
+            break
     return output
 
 
@@ -452,6 +505,8 @@ def _prioritize_external_evidence(external_evidence: list[dict[str, Any]]) -> li
         "other": [],
     }
     for item in external_evidence:
+        if _is_catalog_tool(str(item.get("tool_name") or "")):
+            continue
         server = str(item.get("server_name") or item.get("source_name") or "").lower()
         grouped[server if server in grouped else "other"].append(item)
 
@@ -463,7 +518,17 @@ def _prioritize_external_evidence(external_evidence: list[dict[str, Any]]) -> li
 
 def _prioritize_tool_logs(tool_logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     order = {"cn-financial": 0, "policychain": 1, "web-search": 2}
-    return sorted(tool_logs, key=lambda item: order.get(str(item.get("server_name") or ""), 9))
+    visible = [
+        item
+        for item in tool_logs
+        if not item.get("internal_only") and not _is_catalog_tool(str(item.get("tool_name") or ""))
+    ]
+    return sorted(visible, key=lambda item: order.get(str(item.get("server_name") or ""), 9))
+
+
+def _is_catalog_tool(tool_name: str) -> bool:
+    normalized = tool_name.rsplit(".", 1)[-1]
+    return normalized in {"get_industry_list", "get_concept_list"}
 
 
 def _strip_reference_sections(text: str) -> str:
@@ -473,6 +538,99 @@ def _strip_reference_sections(text: str) -> str:
         if index > 0:
             cleaned = cleaned[:index].rstrip()
     return cleaned
+
+
+def _strip_company_sections(text: str) -> str:
+    """Remove every model-authored company section before deterministic rendering."""
+
+    output: list[str] = []
+    skipped_level: int | None = None
+    for line in text.splitlines():
+        heading = re.match(r"^(#{1,6})\s*(.*?)\s*$", line)
+        if heading:
+            level = len(heading.group(1))
+            title = re.sub(r"[\W_]+", "", heading.group(2), flags=re.UNICODE).lower()
+            if skipped_level is not None and level <= skipped_level:
+                skipped_level = None
+            if any(marker in title for marker in COMPANY_SECTION_MARKERS):
+                skipped_level = level
+                continue
+        if skipped_level is None:
+            output.append(line)
+    return "\n".join(output).strip()
+
+
+def _report_external_evidence(state: PolicyResearchState) -> list[dict[str, Any]]:
+    company_keys = {_external_evidence_key(item) for item in state.company_research}
+    return [
+        item
+        for item in state.external_evidence
+        if _external_evidence_key(item) not in company_keys
+        and _normalized_tool_name(str(item.get("tool_name") or "")) not in COMPANY_REPORT_TOOL_NAMES
+    ]
+
+
+def _report_tool_logs(tool_logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in tool_logs
+        if _normalized_tool_name(str(item.get("tool_name") or "")) not in COMPANY_REPORT_TOOL_NAMES
+    ]
+
+
+def _report_react_traces(react_traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in react_traces
+        if "company" not in str(item.get("stage") or "").lower()
+        and _normalized_tool_name(str(item.get("action") or "")) not in COMPANY_REPORT_TOOL_NAMES
+    ]
+
+
+def _report_uncertainties(state: PolicyResearchState) -> list[str]:
+    rejected_identifiers = _rejected_company_identifiers(state)
+    return [
+        str(item)
+        for item in state.uncertainties
+        if not any(identifier in str(item) for identifier in rejected_identifiers)
+    ]
+
+
+def _rejected_company_identifiers(state: PolicyResearchState) -> set[str]:
+    approved = {
+        str(value)
+        for item in state.company_matches
+        for value in (item.get("company_name"), item.get("stock_code"))
+        if value
+    }
+    observed: set[str] = set()
+    for item in [*state.company_candidates, *state.company_research, *state.company_match_audit]:
+        if not isinstance(item, dict):
+            continue
+        raw = item.get("raw_payload") if isinstance(item.get("raw_payload"), dict) else {}
+        for value in (
+            item.get("company_name"),
+            item.get("stock_code"),
+            raw.get("company_name"),
+            raw.get("stock_code"),
+            raw.get("名称"),
+            raw.get("代码"),
+        ):
+            text = str(value or "").strip()
+            if len(text) >= 2:
+                observed.add(text)
+    return observed - approved
+
+
+def _external_evidence_key(item: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        str(item.get(key) or "")
+        for key in ("server_name", "tool_name", "source_url", "title", "company_name", "query")
+    )
+
+
+def _normalized_tool_name(tool_name: str) -> str:
+    return tool_name.rsplit(".", 1)[-1]
 
 
 def _infer_level_from_text(text: str) -> str:

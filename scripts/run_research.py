@@ -12,7 +12,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from policychain.graph import run_llm_policy_research_workflow, run_policy_research_workflow
 from policychain.llm import LLMClient
 from policychain.mcp import MCPToolInvoker, StdioMCPInvoker, cache_mcp_invoker
+from policychain.observability import RunRecorder
 from policychain.paths import FULL_DB_PATH, SAMPLE_DB_PATH, is_full_db_path, resolve_default_db_path
+from policychain.state import PolicyResearchState
 from policychain.storage import SQLitePolicyStore
 from scripts.ingest_sample import ingest_sample_database
 
@@ -26,19 +28,27 @@ def run_research(
     ensure_sample_db: bool = True,
     rebuild_sample_db: bool = False,
     output_path: str | Path | None = None,
-    use_llm: bool = False,
+    use_llm: bool = True,
     llm_client: LLMClient | None = None,
     mcp_invoker: MCPToolInvoker | None = None,
     progress_callback: Callable[[int, str, str], None] | None = None,
-) -> str:
+    run_recorder: RunRecorder | None = None,
+    return_state: bool = False,
+) -> str | PolicyResearchState:
+    recorder = run_recorder or RunRecorder(mode="llm" if use_llm else "deterministic")
     db = Path(db_path) if db_path else resolve_default_db_path()
-    if ensure_sample_db and (rebuild_sample_db or not db.exists()):
-        if is_full_db_path(db):
-            raise FileNotFoundError(
-                "Full policy database does not exist. Build it with "
-                "`python scripts/ingest_policy_dir.py --reset` before running against the full database."
-            )
-        ingest_sample_database(db_path=db, reset=rebuild_sample_db)
+    try:
+        if ensure_sample_db and (rebuild_sample_db or not db.exists()):
+            if is_full_db_path(db):
+                raise FileNotFoundError(
+                    "Full policy database does not exist. Build it with "
+                    "`python scripts/ingest_policy_dir.py --reset` before running against the full database."
+                )
+            ingest_sample_database(db_path=db, reset=rebuild_sample_db)
+    except Exception as exc:
+        if recorder.status == "running":
+            recorder.finish("failed", error=f"{exc.__class__.__name__}: {str(exc)[:300]}")
+        raise
 
     store = SQLitePolicyStore(db)
     try:
@@ -49,6 +59,7 @@ def run_research(
                 llm_client=llm_client,
                 mcp_invoker=mcp_invoker,
                 progress_callback=progress_callback,
+                run_recorder=recorder,
             )
         else:
             state = run_policy_research_workflow(
@@ -56,6 +67,7 @@ def run_research(
                 store,
                 mcp_invoker=mcp_invoker,
                 progress_callback=progress_callback,
+                run_recorder=recorder,
             )
     finally:
         store.close()
@@ -65,7 +77,7 @@ def run_research(
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(report, encoding="utf-8")
-    return report
+    return state if return_state else report
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -77,7 +89,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rebuild-sample-db", action="store_true", help="Rebuild the sample database before running.")
     parser.add_argument("--no-ingest", action="store_true", help="Do not auto-build a missing sample database.")
     parser.add_argument("--out", default=None, help="Optional Markdown report output path.")
-    parser.add_argument("--llm", action="store_true", help="Use the optional LLM-backed workflow.")
+    llm_mode = parser.add_mutually_exclusive_group()
+    llm_mode.add_argument(
+        "--llm",
+        dest="use_llm",
+        action="store_true",
+        default=True,
+        help="Use the default DeepSeek-backed workflow (default).",
+    )
+    llm_mode.add_argument(
+        "--no-llm",
+        dest="use_llm",
+        action="store_false",
+        help="Explicitly use the deterministic fallback workflow.",
+    )
     parser.add_argument("--mcp", action="store_true", help="Use real stdio MCP tools from a local MCP config.")
     parser.add_argument("--mcp-config", default=".mcp.local.json", help="Path to local MCP config used with --mcp.")
     parser.add_argument("--mcp-timeout", type=float, default=60, help="Timeout seconds per MCP tool call.")
@@ -118,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
         ensure_sample_db=not args.no_ingest,
         rebuild_sample_db=args.rebuild_sample_db,
         output_path=args.out,
-        use_llm=args.llm,
+        use_llm=args.use_llm,
         mcp_invoker=mcp_invoker,
     )
     print(report)

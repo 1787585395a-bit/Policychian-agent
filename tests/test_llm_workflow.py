@@ -38,11 +38,23 @@ class TimeoutOnImpactLLMClient:
 class LLMWorkflowTests(unittest.TestCase):
     def test_run_llm_policy_research_workflow_runs_three_llm_agents_and_report(self) -> None:
         store = build_sample_store()
+        policy_payload = _policy_payload()
+        policy_payload["evidence"][0].update(
+            {
+                "policy_id": "POL-2099-NAT-9999",
+                "chunk_id": None,
+                "source_url": "https://www.gov.cn/zhengce/zhengceku/202307/content_6891752.htm",
+            }
+        )
         client = SequenceLLMClient(
             [
-                json.dumps(_policy_payload(), ensure_ascii=False),
+                json.dumps(policy_payload, ensure_ascii=False),
                 json.dumps(_impact_payload(), ensure_ascii=False),
-                "# LLM 自由报告\n\n这是由 report_writer 生成的自然语言报告。",
+                json.dumps(_company_discovery_payload(), ensure_ascii=False),
+                (
+                    "# LLM 自由报告\n\n这是由 report_writer 生成的自然语言报告。"
+                    "若评估需求按期释放，服务订单可能形成阶段性利好；若合规成本上升，则可能形成利空。"
+                ),
             ]
         )
         try:
@@ -52,11 +64,21 @@ class LLMWorkflowTests(unittest.TestCase):
                 llm_client=client,
             )
 
-            self.assertEqual(len(client.calls), 3)
+            self.assertEqual(len(client.calls), 4)
             self.assertEqual(state.policy_analysis["policy_identity"]["policy_id"], "POL-2023-NAT-0048")
+            self.assertEqual(state.policy_analysis["evidence"][0]["policy_id"], "POL-2023-NAT-0048")
+            self.assertEqual(state.evidence[0]["policy_id"], "POL-2023-NAT-0048")
+            self.assertEqual(state.agent_status.get("policy_analyst"), "completed")
+            self.assertNotIn("policy_analyst_fallback", state.agent_status)
+            self.assertFalse(state.fallback_used)
+            self.assertFalse(any("LLM Policy Analyst 失败" in item for item in state.uncertainties))
+            self.assertFalse(any(event["stage"] == "政策分析回退" for event in state.progress_events))
+            self.assertNotIn("POL-2099-NAT-9999", client.calls[1][1])
             self.assertEqual(state.industry_impacts[0]["industry"], "算法模型研发与评估")
             self.assertEqual(state.company_matches, [])
             self.assertIn("LLM 自由报告", state.final_report)
+            self.assertIn("阶段性利好", state.final_report)
+            self.assertIn("形成利空", state.final_report)
             self.assertIn("参考资料与工具依据", state.final_report)
             for term in PROHIBITED_TERMS:
                 self.assertNotIn(term, state.final_report)
@@ -201,6 +223,15 @@ def _company_payload() -> dict[str, object]:
             }
         ],
         "uncertainties": ["公司资料来自本地 mock 数据，仅用于验证流程。"],
+    }
+
+
+def _company_discovery_payload() -> dict[str, object]:
+    return {
+        "impact_id": "IMP-001",
+        "web_queries": [],
+        "seeds": [],
+        "uncertainties": ["测试环境未配置外部公司发现通道。"],
     }
 
 

@@ -5,7 +5,9 @@ import unittest
 
 from policychain.safety import SafetyViolation
 from policychain.schemas.agent_outputs import (
+    CompanyDiscoveryOutput,
     CompanyMatchOutput,
+    CompanySeedOutput,
     ImpactAnalysisOutput,
     PolicyAnalysisOutput,
 )
@@ -73,6 +75,62 @@ class StructuredOutputTests(unittest.TestCase):
         self.assertEqual(data["companies"][0]["company_name"], "示例公司")
         self.assertEqual(data["companies"][0]["confidence"], 0.82)
 
+    def test_parse_structured_company_seed_output(self) -> None:
+        output = parse_structured_output(json.dumps(_company_seed_payload(), ensure_ascii=False), "CompanySeedOutput")
+
+        self.assertIsInstance(output, CompanySeedOutput)
+        self.assertEqual(output.seeds[0].impact_id, "IMP-001")
+        self.assertEqual(output.seeds[0].proposed_stock_code, "300123")
+        self.assertEqual(output.seeds[0].historical_names, ["示例旧名"])
+
+    def test_company_discovery_output_enforces_path_queries_and_seed_budget(self) -> None:
+        payload = {
+            "impact_id": "IMP-001",
+            "web_queries": ["反渗透膜 A股 公司 主营业务", "海水淡化设备 证券代码 公告"],
+            "seeds": _company_seed_payload()["seeds"],
+            "uncertainties": [],
+        }
+
+        output = validate_structured_payload(payload, "CompanyDiscoveryOutput")
+
+        self.assertIsInstance(output, CompanyDiscoveryOutput)
+        self.assertEqual(output.impact_id, "IMP-001")
+        self.assertEqual(len(output.web_queries), 2)
+
+        payload["web_queries"].append("第三条查询")
+        with self.assertRaisesRegex(StructuredOutputError, "at most 2"):
+            validate_structured_payload(payload, "CompanyDiscoveryOutput")
+
+        mismatch = {
+            **payload,
+            "web_queries": [],
+            "seeds": [{**_company_seed_payload()["seeds"][0], "impact_id": "IMP-002"}],
+        }
+        with self.assertRaisesRegex(StructuredOutputError, "match the top-level"):
+            validate_structured_payload(mismatch, "CompanyDiscoveryOutput")
+
+    def test_company_seed_output_enforces_six_per_impact_and_three_historical_names(self) -> None:
+        too_many = _company_seed_payload()
+        too_many["seeds"] = [dict(too_many["seeds"][0]) for _ in range(7)]
+        with self.assertRaisesRegex(StructuredOutputError, "at most 6"):
+            validate_structured_payload(too_many, "CompanySeedOutput")
+
+        aliases = _company_seed_payload()
+        aliases["seeds"][0]["historical_names"] = ["旧名一", "旧名二", "旧名三", "旧名四"]
+        with self.assertRaisesRegex(StructuredOutputError, "historical_names"):
+            validate_structured_payload(aliases, "CompanySeedOutput")
+
+    def test_company_seed_output_rejects_invalid_code_or_extra_seed_fields(self) -> None:
+        invalid_code = _company_seed_payload()
+        invalid_code["seeds"][0]["proposed_stock_code"] = "ABC123"
+        with self.assertRaisesRegex(StructuredOutputError, "six-digit"):
+            validate_structured_payload(invalid_code, "CompanySeedOutput")
+
+        extra = _company_seed_payload()
+        extra["seeds"][0]["verified"] = True
+        with self.assertRaisesRegex(StructuredOutputError, "unsupported field"):
+            validate_structured_payload(extra, "CompanySeedOutput")
+
     def test_company_uncertainties_accept_object_items_from_llm(self) -> None:
         payload = _company_payload()
         payload["uncertainties"] = [
@@ -120,6 +178,13 @@ class StructuredOutputTests(unittest.TestCase):
     def test_parse_structured_output_rejects_prohibited_terms(self) -> None:
         payload = _company_payload()
         payload["companies"][0]["policy_link"] = "业务相关性不能写成推荐股票"
+
+        with self.assertRaises(SafetyViolation):
+            parse_structured_output(json.dumps(payload, ensure_ascii=False), "CompanyMatchOutput")
+
+    def test_structured_output_keeps_report_soft_terms_strictly_prohibited(self) -> None:
+        payload = _company_payload()
+        payload["companies"][0]["policy_link"] = "该政策对相关业务构成利好"
 
         with self.assertRaises(SafetyViolation):
             parse_structured_output(json.dumps(payload, ensure_ascii=False), "CompanyMatchOutput")
@@ -204,6 +269,22 @@ def _company_payload() -> dict[str, object]:
             }
         ],
         "uncertainties": ["真实业务匹配需接入公开资料"],
+    }
+
+
+def _company_seed_payload() -> dict[str, object]:
+    return {
+        "seeds": [
+            {
+                "impact_id": "IMP-001",
+                "proposed_name": "示例科技",
+                "historical_names": ["示例旧名"],
+                "proposed_stock_code": "300123",
+                "seed_reason": "公开线索显示其具体设备业务可能对应路径",
+                "origin_channels": ["llm", "web"],
+            }
+        ],
+        "uncertainties": ["seed 尚未完成身份或业务验证"],
     }
 
 

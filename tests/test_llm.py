@@ -18,6 +18,7 @@ from policychain.llm import (
     MockLLMClient,
     create_llm_client,
     load_local_env,
+    observed_llm_generate,
 )
 from policychain.safety import SafetyViolation
 
@@ -41,6 +42,30 @@ class LLMTests(unittest.TestCase):
 
         with self.assertRaises(SafetyViolation):
             client.generate("system", "user")
+
+    def test_observed_report_generation_uses_relaxed_builtin_profile_only_for_report_writer(self) -> None:
+        client = MockLLMClient(response="若项目落地，订单增长可能构成阶段性利好。")
+
+        self.assertEqual(
+            observed_llm_generate(client, "system", "user", agent="report_writer"),
+            client.response,
+        )
+        with self.assertRaises(SafetyViolation):
+            observed_llm_generate(client, "system", "user", agent="impact_analyst")
+        with self.assertRaises(SafetyViolation):
+            client.generate("system", "user")
+
+    def test_observed_report_generation_keeps_hard_bans_and_supports_two_argument_custom_clients(self) -> None:
+        unsafe = MockLLMClient(response="建议买入并设定目标价")
+        with self.assertRaises(SafetyViolation):
+            observed_llm_generate(unsafe, "system", "user", agent="report_writer")
+
+        custom = _TwoArgumentClient("若成本上升，相关经营环节可能形成利空。")
+        self.assertEqual(
+            observed_llm_generate(custom, "system", "user", agent="report_writer"),
+            custom.response,
+        )
+        self.assertEqual(custom.calls, [("system", "user")])
 
     def test_mock_llm_generation_metadata(self) -> None:
         client = MockLLMClient(response="安全输出", model="mock-v1")
@@ -101,6 +126,22 @@ class LLMTests(unittest.TestCase):
             ),
         )
 
+        with self.assertRaises(SafetyViolation):
+            client.generate("system", "user")
+
+    def test_deepseek_report_generation_uses_report_profile_but_default_remains_strict(self) -> None:
+        response_text = "若配套资金落实，确定性需求可能对订单形成利好。"
+        client = DeepSeekClient(
+            api_key="test-key",
+            http_post=lambda request, timeout: _FakeResponse(
+                {"choices": [{"message": {"content": response_text}}]}
+            ),
+        )
+
+        self.assertEqual(
+            observed_llm_generate(client, "system", "user", agent="report_writer"),
+            response_text,
+        )
         with self.assertRaises(SafetyViolation):
             client.generate("system", "user")
 
@@ -175,9 +216,13 @@ class LLMTests(unittest.TestCase):
 
         self.assertTrue(client.use_system_proxy)
 
-    def test_create_llm_client_defaults_to_mock(self) -> None:
-        with patch.dict("os.environ", {"POLICYCHAIN_DISABLE_DOTENV": "1"}, clear=True):
-            self.assertIsInstance(create_llm_client(), MockLLMClient)
+    def test_create_llm_client_defaults_to_deepseek(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"POLICYCHAIN_DISABLE_DOTENV": "1", "DEEPSEEK_API_KEY": "default-key"},
+            clear=True,
+        ):
+            self.assertIsInstance(create_llm_client(), DeepSeekClient)
 
     def test_create_llm_client_can_read_local_env_file(self) -> None:
         temp_dir = _workspace_temp_dir()
@@ -232,6 +277,16 @@ class _FakeResponse:
 
     def read(self) -> bytes:
         return json.dumps(self.payload).encode("utf-8")
+
+
+class _TwoArgumentClient:
+    def __init__(self, response: str) -> None:
+        self.response = response
+        self.calls: list[tuple[str, str]] = []
+
+    def generate(self, system_prompt: str, user_prompt: str) -> str:
+        self.calls.append((system_prompt, user_prompt))
+        return self.response
 
 
 class _FakeErrorBody:

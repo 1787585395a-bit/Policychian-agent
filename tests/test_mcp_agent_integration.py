@@ -62,7 +62,8 @@ class MCPAgentIntegrationTests(unittest.TestCase):
             run_impact_analyst(state, mcp_invoker=invoker)
 
             self.assertTrue(state.industry_research)
-            self.assertTrue(any(item["tool_name"] == "get_industry_list" for item in state.industry_research))
+            self.assertFalse(any(item["tool_name"] == "get_industry_list" for item in state.industry_research))
+            self.assertTrue(any(log["tool_name"] == "get_industry_list" and log.get("internal_only") for log in state.tool_call_logs))
             impact = state.industry_impacts[0]
             self.assertTrue(impact["chain_segment"])
             self.assertTrue(impact["business_variables"])

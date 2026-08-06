@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Iterable
 
-from policychain.llm import LLMClient, create_llm_client
+from policychain.llm import LLMClient, create_llm_client, observed_llm_generate
 from policychain.mcp import MCPToolInvoker, consume_mcp_invoker_errors, is_unavailable_invoker
 from policychain.prompts import render_prompt
 from policychain.schemas.agent_outputs import ImpactAnalysisOutput
@@ -62,7 +62,7 @@ def run_llm_impact_analyst(
         industry_research=_json_for_prompt(_filter_external_evidence(state.industry_research, "cn-financial")),
         web_evidence=_json_for_prompt(_filter_external_evidence(state.industry_research, "web-search")),
     )
-    raw_output = client.generate(prompt["system"], prompt["user"])
+    raw_output = observed_llm_generate(client, prompt["system"], prompt["user"], agent="impact_analyst")
     output = parse_structured_output(raw_output, prompt["output_schema_name"])
     if not isinstance(output, ImpactAnalysisOutput):
         raise LLMImpactAnalysisError("LLM Impact Analyst returned an unexpected output schema")
@@ -112,6 +112,8 @@ def _merge_evidence(existing: list[dict[str, object]], new_items: list[dict[str,
     merged: list[dict[str, object]] = []
     seen: set[tuple[object, object]] = set()
     for item in [*existing, *new_items]:
+        if str(item.get("tool_name") or "") in {"get_industry_list", "get_concept_list"}:
+            continue
         key = (item.get("policy_id"), item.get("chunk_id"))
         if key not in seen:
             seen.add(key)
@@ -123,6 +125,8 @@ def _merge_external_evidence(existing: list[dict[str, object]], new_items: list[
     merged: list[dict[str, object]] = []
     seen: set[tuple[object, object, object]] = set()
     for item in [*existing, *new_items]:
+        if str(item.get("tool_name") or "") in {"get_industry_list", "get_concept_list"}:
+            continue
         key = (item.get("server_name"), item.get("tool_name"), item.get("source_url") or item.get("title") or item.get("query"))
         if key not in seen:
             seen.add(key)

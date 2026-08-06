@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import Mock, patch
 
 from policychain.agents import (
     run_company_matcher,
@@ -9,6 +10,7 @@ from policychain.agents import (
     write_llm_research_report,
     write_research_report,
 )
+from policychain.llm import MockLLMClient
 from policychain.state import PolicyResearchState
 from tests.helpers import build_sample_store
 
@@ -59,6 +61,67 @@ class ReportWriterTests(unittest.TestCase):
                 self.assertNotIn(term, report)
         finally:
             store.close()
+
+    def test_web_fallback_match_explicitly_discloses_missing_cnfinancial_cross_check(self) -> None:
+        state = PolicyResearchState(user_query="海水淡化政策")
+        state.policy_analysis = {
+            "policy_identity": {"title": "海水淡化测试政策", "issuing_agencies": []},
+            "strength_assessment": {"level": "medium"},
+        }
+        state.industry_impacts = [
+            {
+                "impact_id": "IMP-001",
+                "industry": "反渗透膜",
+                "chain_segment": "反渗透膜",
+                "business_variables": ["反渗透膜需求"],
+                "implementation_action": "示范项目采购",
+                "conditions": [],
+                "risks": [],
+            }
+        ]
+        state.company_matches = [
+            {
+                "company_name": "海膜科技",
+                "stock_code": "300123",
+                "impact_id": "IMP-001",
+                "industry_segment": "反渗透膜",
+                "chain_segment": "反渗透膜",
+                "matched_business": "反渗透膜",
+                "match_level": "low",
+                "confidence": 0.55,
+                "audit_reason": "CNFinancial 技术失败后由两处独立 Web 证据支持，固定保留为低置信匹配。",
+                "negative_evidence": ["CNFinancial 未完成交叉验证；当前仅有两处独立 Web 证据。"],
+                "business_evidence": [
+                    {
+                        "source_name": "两处独立 Web 证据",
+                        "source_url": "https://one.example/notice",
+                        "text": "公司主营反渗透膜。",
+                        "data_date": "2026-07-01",
+                    }
+                ],
+            }
+        ]
+        state.company_coverage = [
+            {
+                "impact_id": "IMP-001",
+                "industry": "反渗透膜",
+                "chain_segment": "反渗透膜",
+                "business_variables": ["反渗透膜需求"],
+                "candidate_count": 1,
+                "passed_count": 1,
+                "rejected_count": 0,
+                "coverage_status": "web_fallback",
+                "retrieval_status": "web_fallback",
+                "no_match_reason": "CNFinancial 未完成交叉验证；仅由两处独立 Web 证据形成低置信业务匹配。",
+            }
+        ]
+        state.uncertainties.append("部分低置信公司仅由两处独立 Web 证据支持，CNFinancial 未完成交叉验证。")
+
+        report = write_research_report(state)
+
+        self.assertIn("CNFinancial 未完成交叉验证", report)
+        self.assertIn("固定保留为低置信匹配", report)
+        self.assertIn("low / 0.55", report)
 
     def test_reference_appendix_limits_evidence_and_tool_logs(self) -> None:
         state = PolicyResearchState(user_query="测试")
@@ -188,8 +251,201 @@ class ReportWriterTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 1)
         self.assertIn("模型自行组织的政策研究说明", report)
         self.assertIn("参考资料与工具依据", report)
-        self.assertIn("cn-financial.get_industry_list", report)
+        self.assertNotIn("cn-financial.get_industry_list", report)
+        self.assertNotIn("行业列表", client.calls[0][1])
         self.assertEqual(state.final_report, report)
+
+    def test_conditional_soft_report_uses_llm_source_and_deterministic_company_appendix(self) -> None:
+        state = PolicyResearchState(user_query="测试")
+        state.policy_analysis = {
+            "policy_identity": {"title": "产业政策"},
+            "policy_measures": ["推进示范项目"],
+        }
+        state.industry_impacts = [
+            {
+                "impact_id": "IMP-001",
+                "industry": "设备产业",
+                "chain_segment": "具体设备",
+                "business_variables": ["订单", "成本", "资本开支"],
+            }
+        ]
+        state.company_matches = [_approved_match("白名单公司", "300001", "IMP-001", 0.8)]
+        state.company_coverage = [
+            {"impact_id": "IMP-001", "industry": "设备产业", "passed_count": 1}
+        ]
+        client = MockLLMClient(
+            response=(
+                "# 政策传导分析\n\n若示范项目按期落地，设备订单可能形成阶段性利好；"
+                "若原材料成本无法传导，则可能形成利空，执行节奏应重点关注。"
+            )
+        )
+        recorder = Mock()
+
+        with (
+            patch("policychain.agents.report_writer.current_run_recorder", return_value=recorder),
+            patch("policychain.agents.report_writer.record_event") as record_event,
+        ):
+            report = write_llm_research_report(state, client)
+
+        recorder.mark_fallback.assert_not_called()
+        self.assertTrue(
+            any(
+                call.args == ("report.source",)
+                and call.kwargs.get("source") == "llm"
+                and call.kwargs.get("status") == "ok"
+                for call in record_event.call_args_list
+            )
+        )
+        self.assertIn("阶段性利好", report)
+        self.assertIn("形成利空", report)
+        self.assertIn("白名单公司", report)
+        self.assertIn("300001", report)
+        self.assertEqual(report.count("## A 股公司业务匹配"), 1)
+
+    def test_llm_company_section_is_replaced_and_rejected_company_context_is_not_prompted(self) -> None:
+        state = _seven_path_state()
+        state.company_candidates = [{"company_name": "诱导候选", "stock_code": "300999"}]
+        state.company_seeds = [
+            {
+                "seed_id": "seed-rejected",
+                "impact_id": "IMP-001",
+                "proposed_name": "未验证Seed公司",
+                "proposed_stock_code": "300997",
+                "status": "unverified",
+            }
+        ]
+        state.company_seed_audit = [
+            {
+                "seed_id": "seed-rejected",
+                "impact_id": "IMP-001",
+                "company_name": "身份冲突公司",
+                "stock_code": "300998",
+                "status": "rejected",
+                "reason_code": "name_code_conflict",
+            }
+        ]
+        state.company_research = [
+            {
+                "server_name": "web-search",
+                "tool_name": "search",
+                "company_name": "研究候选",
+                "title": "研究候选业务资料",
+                "source_url": "https://example.test/rejected-company",
+            }
+        ]
+        state.external_evidence = list(state.company_research)
+        state.uncertainties = ["诱导候选未通过审计。", "政策执行进度仍待验证。"]
+        state.tool_call_logs = [
+            {
+                "server_name": "cn-financial",
+                "tool_name": "get_company_profile",
+                "arguments": {"symbol": "300999"},
+                "status": "ok",
+                "count": 1,
+            }
+        ]
+        client = _OneShotClient(
+            "# 政策传导说明\n\n正文只解释政策与行业路径。\n\n"
+            "## A 股公司业务匹配\n\n- 编造公司（300888）：示例候选。\n\n"
+            "## 风险说明\n\n执行进度仍有不确定性。"
+        )
+
+        report = write_llm_research_report(state, client)
+        prompt = client.calls[0][0] + client.calls[0][1]
+
+        for forbidden in (
+            "诱导候选",
+            "研究候选",
+            "300999",
+            "未验证Seed公司",
+            "300997",
+            "身份冲突公司",
+            "300998",
+            "编造公司",
+            "300888",
+        ):
+            self.assertNotIn(
+                forbidden,
+                prompt
+                if forbidden in {"诱导候选", "研究候选", "300999", "未验证Seed公司", "300997", "身份冲突公司", "300998"}
+                else report,
+            )
+        self.assertNotIn("编造公司", report)
+        self.assertNotIn("300888", report)
+        self.assertEqual(report.count("## A 股公司业务匹配"), 1)
+
+        for index in range(1, 8):
+            self.assertIn(f"IMP-{index:03d}", report)
+        self.assertEqual(report.count("暂未形成可靠 A 股公司匹配"), 7)
+
+    def test_unsafe_llm_report_falls_back_without_echoing_prohibited_or_fabricated_content(self) -> None:
+        state = _seven_path_state()
+        client = _OneShotClient(
+            "# 报告\n\n## 相关公司\n编造公司（300888）。\n\n"
+            "对于 投资者 而言，应、重点关注确定性，需求、利好和成长-叙事，并建议买入，目标价为 10 元。"
+        )
+        recorder = Mock()
+
+        with patch("policychain.agents.report_writer.current_run_recorder", return_value=recorder):
+            report = write_llm_research_report(state, client)
+
+        recorder.mark_fallback.assert_called_once()
+        self.assertNotIn("编造公司", report)
+        self.assertNotIn("300888", report)
+        for forbidden in (
+            "对于 投资者 而言",
+            "应、重点关注",
+            "确定性，需求",
+            "利好",
+            "成长-叙事",
+            "买入",
+            "目标价",
+        ):
+            self.assertNotIn(forbidden, report)
+        for index in range(1, 8):
+            self.assertIn(f"IMP-{index:03d}", report)
+
+    def test_llm_report_company_appendix_contains_only_approved_matches_and_caps_each_path(self) -> None:
+        state = PolicyResearchState(user_query="测试")
+        state.industry_impacts = [
+            {"industry": "路径一", "chain_segment": "液冷服务器", "business_variables": ["设备需求"]},
+            {"industry": "路径二", "chain_segment": "反渗透膜", "business_variables": ["项目需求"]},
+        ]
+        state.company_matches = [
+            _approved_match("白名单甲", "300001", "IMP-001", 0.92),
+            _approved_match("白名单乙", "300002", "IMP-001", 0.85),
+            _approved_match("白名单丙", "300003", "IMP-001", 0.75),
+            _approved_match("白名单超额", "300004", "IMP-001", 0.65),
+            _approved_match("白名单丁", "300005", "IMP-002", 0.8),
+        ]
+        state.company_coverage = [
+            {"impact_id": "IMP-001", "industry": "路径一", "passed_count": 4},
+            {"impact_id": "IMP-002", "industry": "路径二", "passed_count": 1},
+        ]
+        client = _OneShotClient(
+            "# 政策说明\n\n行业传导正文。\n\n## 公司关注清单\n- 编造公司（300888）"
+        )
+
+        with patch.dict("os.environ", {"POLICYCHAIN_MAX_COMPANY_MATCHES_PER_IMPACT": ""}):
+            report = write_llm_research_report(state, client)
+
+        for name in ("白名单甲", "白名单乙", "白名单丙", "白名单丁"):
+            self.assertIn(name, report)
+        self.assertNotIn("白名单超额", report)
+        self.assertNotIn("300004", report)
+        self.assertNotIn("编造公司", report)
+        self.assertNotIn("300888", report)
+        self.assertEqual(report.count("## A 股公司业务匹配"), 1)
+
+        with patch.dict("os.environ", {"POLICYCHAIN_MAX_COMPANY_MATCHES_PER_IMPACT": "4"}):
+            report_with_four = write_llm_research_report(state, client)
+        self.assertNotIn("白名单超额", report_with_four)
+        self.assertNotIn("300004", report_with_four)
+
+        with patch.dict("os.environ", {"POLICYCHAIN_MAX_COMPANY_MATCHES_PER_IMPACT": "9"}):
+            report_with_nine = write_llm_research_report(state, client)
+        self.assertNotIn("白名单超额", report_with_nine)
+        self.assertNotIn("300004", report_with_nine)
 
 
 class _OneShotClient:
@@ -200,6 +456,43 @@ class _OneShotClient:
     def generate(self, system_prompt: str, user_prompt: str) -> str:
         self.calls.append((system_prompt, user_prompt))
         return self.response
+
+
+def _seven_path_state() -> PolicyResearchState:
+    state = PolicyResearchState(user_query="测试")
+    state.industry_impacts = [
+        {
+            "industry": f"测试路径{index}",
+            "chain_segment": f"测试产业链{index}",
+            "business_variables": [f"变量{index}"],
+        }
+        for index in range(1, 8)
+    ]
+    state.company_coverage = [
+        {
+            "impact_id": f"IMP-{index:03d}",
+            "industry": f"测试路径{index}",
+            "passed_count": 0,
+            "no_match_reason": f"路径{index}没有通过审计的公司。",
+        }
+        for index in range(1, 8)
+    ]
+    return state
+
+
+def _approved_match(name: str, code: str, impact_id: str, confidence: float) -> dict[str, object]:
+    return {
+        "company_name": name,
+        "stock_code": code,
+        "impact_id": impact_id,
+        "chain_segment": "具体设备",
+        "matched_business": "具体设备主营业务",
+        "business_evidence": [{"text": "公开资料显示主营具体设备"}],
+        "negative_evidence": ["收入占比待核验"],
+        "match_level": "medium",
+        "confidence": confidence,
+        "audit_reason": "已通过业务相关性审查",
+    }
 
 
 if __name__ == "__main__":

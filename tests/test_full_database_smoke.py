@@ -22,6 +22,7 @@ class FullDatabaseSmokeTests(unittest.TestCase):
             query="生成式人工智能服务提供者有哪些管理要求",
             db_path=FULL_DB_PATH,
             ensure_sample_db=True,
+            use_llm=False,
         )
 
         self.assertIn("PolicyChain 政策研究报告", report)

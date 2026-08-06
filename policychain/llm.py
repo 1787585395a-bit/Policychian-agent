@@ -5,11 +5,17 @@ import json
 import os
 from pathlib import Path
 import socket
+from time import perf_counter
 from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
-from policychain.safety import assert_no_investment_advice
+from policychain.safety import (
+    REPORT_WRITER_SAFETY_PROFILE,
+    STRICT_SAFETY_PROFILE,
+    assert_no_investment_advice,
+)
+from policychain.observability import record_event
 
 
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -47,11 +53,28 @@ class MockLLMClient:
         self.model = model
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
+        return self.generate_with_safety_profile(
+            system_prompt,
+            user_prompt,
+            safety_profile=STRICT_SAFETY_PROFILE,
+        )
+
+    def generate_with_safety_profile(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        safety_profile: str,
+    ) -> str:
         if not system_prompt.strip():
             raise ValueError("system_prompt is required")
         if not user_prompt.strip():
             raise ValueError("user_prompt is required")
-        assert_no_investment_advice(self.response, context="LLM response")
+        assert_no_investment_advice(
+            self.response,
+            context="LLM response",
+            profile=safety_profile,
+        )
         return self.response
 
     def generate_with_metadata(self, system_prompt: str, user_prompt: str) -> LLMGeneration:
@@ -117,6 +140,19 @@ class DeepSeekClient:
         )
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
+        return self.generate_with_safety_profile(
+            system_prompt,
+            user_prompt,
+            safety_profile=STRICT_SAFETY_PROFILE,
+        )
+
+    def generate_with_safety_profile(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        safety_profile: str,
+    ) -> str:
         if not system_prompt.strip():
             raise ValueError("system_prompt is required")
         if not user_prompt.strip():
@@ -146,7 +182,11 @@ class DeepSeekClient:
             raise LLMProviderError("DeepSeek API returned invalid JSON") from exc
 
         text = _extract_chat_completion_text(response_payload)
-        assert_no_investment_advice(text, context="DeepSeek response")
+        assert_no_investment_advice(
+            text,
+            context="DeepSeek response",
+            profile=safety_profile,
+        )
         return text
 
     def generate_with_metadata(self, system_prompt: str, user_prompt: str) -> LLMGeneration:
@@ -185,12 +225,80 @@ class DeepSeekClient:
 
 def create_llm_client(provider: str | None = None) -> LLMClient:
     load_local_env()
-    selected_provider = (provider or os.getenv("POLICYCHAIN_LLM_PROVIDER", "mock")).strip().lower()
+    selected_provider = (provider or os.getenv("POLICYCHAIN_LLM_PROVIDER") or "deepseek").strip().lower()
     if selected_provider == "mock":
         return MockLLMClient()
     if selected_provider == "deepseek":
         return DeepSeekClient.from_env()
     raise LLMConfigurationError(f"Unsupported LLM provider: {selected_provider}")
+
+
+def observed_llm_generate(
+    client: LLMClient,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    agent: str,
+    prompt_version: str = "v1",
+) -> str:
+    provider = _llm_provider_name(client)
+    model = str(getattr(client, "model", client.__class__.__name__))
+    started = perf_counter()
+    record_event(
+        "llm.call.start",
+        stage=agent,
+        status="running",
+        agent=agent,
+        provider=provider,
+        model=model,
+        prompt_version=prompt_version,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+    )
+    try:
+        profile_aware_generate = getattr(client, "generate_with_safety_profile", None)
+        if agent == "report_writer" and callable(profile_aware_generate):
+            response = profile_aware_generate(
+                system_prompt,
+                user_prompt,
+                safety_profile=REPORT_WRITER_SAFETY_PROFILE,
+            )
+        else:
+            response = client.generate(system_prompt, user_prompt)
+    except Exception as exc:
+        record_event(
+            "llm.call.end",
+            stage=agent,
+            status="error",
+            agent=agent,
+            provider=provider,
+            model=model,
+            prompt_version=prompt_version,
+            duration_ms=round((perf_counter() - started) * 1000, 3),
+            error=f"{exc.__class__.__name__}: {str(exc)[:300]}",
+        )
+        raise
+    record_event(
+        "llm.call.end",
+        stage=agent,
+        status="ok",
+        agent=agent,
+        provider=provider,
+        model=model,
+        prompt_version=prompt_version,
+        duration_ms=round((perf_counter() - started) * 1000, 3),
+        response=response,
+    )
+    return response
+
+
+def _llm_provider_name(client: LLMClient) -> str:
+    name = client.__class__.__name__.lower()
+    if "deepseek" in name:
+        return "deepseek"
+    if "mock" in name:
+        return "mock"
+    return client.__class__.__name__
 
 
 def load_local_env(path: str | Path = LOCAL_ENV_PATH) -> None:

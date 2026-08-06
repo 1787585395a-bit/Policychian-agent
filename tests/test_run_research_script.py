@@ -25,6 +25,7 @@ class RunResearchScriptTests(unittest.TestCase):
             db_path=db_path,
             ensure_sample_db=True,
             rebuild_sample_db=True,
+            use_llm=False,
         )
 
         self.assertIn("PolicyChain 政策研究报告", report)
@@ -41,6 +42,7 @@ class RunResearchScriptTests(unittest.TestCase):
             ensure_sample_db=True,
             rebuild_sample_db=True,
             output_path=output_path,
+            use_llm=False,
         )
 
         self.assertTrue(output_path.exists())
@@ -54,6 +56,7 @@ class RunResearchScriptTests(unittest.TestCase):
             [
                 json.dumps(_policy_payload(), ensure_ascii=False),
                 json.dumps(_impact_payload(), ensure_ascii=False),
+                json.dumps(_company_discovery_payload(), ensure_ascii=False),
                 "# LLM 自由报告\n\n这是由 report_writer 生成的自然语言报告。",
             ]
         )
@@ -67,7 +70,7 @@ class RunResearchScriptTests(unittest.TestCase):
             llm_client=client,
         )
 
-        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(len(client.calls), 4)
         self.assertIn("LLM 自由报告", report)
         self.assertIn("参考资料与工具依据", report)
         self.assertIn("company_matches", client.calls[-1][1])
@@ -82,6 +85,7 @@ class RunResearchScriptTests(unittest.TestCase):
             report = run_research(
                 query="生成式人工智能服务提供者有哪些管理要求",
                 ensure_sample_db=False,
+                use_llm=False,
             )
 
         self.assertIn("PolicyChain 政策研究报告", report)
@@ -99,6 +103,7 @@ class RunResearchScriptTests(unittest.TestCase):
                     query="生成式人工智能服务提供者有哪些管理要求",
                     db_path=full_db_path,
                     ensure_sample_db=True,
+                    use_llm=False,
                 )
 
         self.assertFalse(full_db_path.exists())
@@ -111,6 +116,11 @@ class RunResearchScriptTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             with redirect_stderr(stderr):
                 parse_args(["--sample-db", "--full-db"])
+
+    def test_cli_defaults_to_deepseek_and_allows_explicit_fallback(self) -> None:
+        self.assertTrue(parse_args([]).use_llm)
+        self.assertTrue(parse_args(["--llm"]).use_llm)
+        self.assertFalse(parse_args(["--no-llm"]).use_llm)
 
     def test_parse_args_accepts_mcp_flags(self) -> None:
         args = parse_args(
@@ -235,6 +245,15 @@ def _company_payload() -> dict[str, object]:
             }
         ],
         "uncertainties": ["公司资料来自本地 mock 数据，仅用于验证流程。"],
+    }
+
+
+def _company_discovery_payload() -> dict[str, object]:
+    return {
+        "impact_id": "IMP-001",
+        "web_queries": [],
+        "seeds": [],
+        "uncertainties": ["测试环境未配置外部公司发现通道。"],
     }
 
 

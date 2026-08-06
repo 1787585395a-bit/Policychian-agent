@@ -16,6 +16,7 @@ from app import (  # noqa: E402
     _create_job,
     _health_payload,
     _job_view,
+    _load_run_log,
     _payload_bool,
     render_example_report_page,
     render_page,
@@ -46,6 +47,16 @@ def _handle_get(environ: dict[str, Any], path: str, start_response: StartRespons
         params = parse_qs(str(environ.get("QUERY_STRING") or ""))
         job_id = (params.get("job_id") or [""])[0]
         return _json_response(start_response, _job_view(job_id))
+    if path == "api/run-log":
+        params = parse_qs(str(environ.get("QUERY_STRING") or ""))
+        job_id = (params.get("job_id") or [""])[0]
+        payload, status_code, filename = _load_run_log(job_id=job_id)
+        return _attachment_json_response(start_response, payload, status_code=status_code, filename=filename)
+    if path == "api/run-logs" or path.startswith("api/run-logs/"):
+        params = parse_qs(str(environ.get("QUERY_STRING") or ""))
+        run_id = path.removeprefix("api/run-logs/") if path.startswith("api/run-logs/") else (params.get("run_id") or [""])[0]
+        payload, status_code, filename = _load_run_log(run_id=run_id)
+        return _attachment_json_response(start_response, payload, status_code=status_code, filename=filename)
     if path == "example-report":
         return _response(start_response, render_example_report_page(), content_type="text/html; charset=utf-8")
     return _response(start_response, render_page(), content_type="text/html; charset=utf-8")
@@ -104,17 +115,44 @@ def _json_response(start_response: StartResponse, payload: dict[str, Any], statu
     return _response(start_response, body, status=status, content_type="application/json; charset=utf-8")
 
 
+def _attachment_json_response(
+    start_response: StartResponse,
+    payload: dict[str, Any],
+    *,
+    status_code: int,
+    filename: str,
+) -> Iterable[bytes]:
+    body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    return _response(
+        start_response,
+        body,
+        status=_status_line(status_code),
+        content_type="application/json; charset=utf-8",
+        extra_headers=[("Content-Disposition", f'attachment; filename="{filename}"')],
+    )
+
+
+def _status_line(status_code: int) -> str:
+    return {
+        200: "200 OK",
+        400: "400 Bad Request",
+        404: "404 Not Found",
+    }.get(status_code, f"{status_code} Error")
+
+
 def _response(
     start_response: StartResponse,
     body: bytes,
     status: str = "200 OK",
     content_type: str = "text/html; charset=utf-8",
+    extra_headers: list[tuple[str, str]] | None = None,
 ) -> Iterable[bytes]:
     start_response(
         status,
         [
             ("Content-Type", content_type),
             ("Content-Length", str(len(body))),
+            *(extra_headers or []),
         ],
     )
     return [body]

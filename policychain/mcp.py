@@ -26,6 +26,10 @@ class MCPToolError(RuntimeError):
     """Raised when a configured MCP tool fails at runtime."""
 
 
+class MCPToolCircuitOpen(MCPToolUnavailable):
+    """Raised when a run-local MCP circuit is open and a call is skipped."""
+
+
 PROXY_ENV_KEYS = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -101,6 +105,295 @@ class FakeMCPInvoker:
         errors = list(self.errors)
         self.errors.clear()
         return errors
+
+
+MCP_CATALOG_TOOLS = {"get_industry_list", "get_concept_list"}
+MCP_SERVICE_FATAL_PATTERNS = (
+    "winerror 5",
+    "access is denied",
+    "permission denied",
+    "createprocess",
+    "failed to create process",
+)
+MCP_TOOL_TRANSPORT_PATTERNS = (
+    "remotedisconnected",
+    "remote end closed connection",
+    "connection reset",
+    "connection aborted",
+    "broken pipe",
+)
+
+
+@dataclass
+class RuntimeMCPInvoker:
+    """Run-local MCP health, catalog cache, and explainable circuit breaker."""
+
+    inner: MCPToolInvoker
+    failure_threshold: int = 2
+    errors: list[str] = field(default_factory=list)
+    _tool_health: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
+    _server_health: dict[str, dict[str, Any]] = field(default_factory=dict)
+    _catalog_cache: dict[tuple[str, str], Any] = field(default_factory=dict)
+    _preflight_servers: set[str] = field(default_factory=set)
+    _query_budgets: dict[tuple[str, str, str], int] = field(default_factory=dict)
+    _last_call: dict[str, Any] = field(default_factory=dict)
+
+    def preflight(self, server_name: str) -> tuple[dict[str, Any], bool]:
+        """Inspect configuration once without issuing a speculative remote call."""
+
+        first_check = server_name not in self._preflight_servers
+        self._preflight_servers.add(server_name)
+        health = self._server_health.setdefault(
+            server_name,
+            {
+                "status": "ready",
+                "consecutive_failures": 0,
+                "circuit_open": False,
+                "circuit_reason": "",
+            },
+        )
+        configured, reason = _runtime_server_configured(self.inner, server_name)
+        if not configured:
+            health.update(
+                {
+                    "status": "unavailable",
+                    "circuit_open": True,
+                    "circuit_reason": reason,
+                }
+            )
+        return deepcopy(health), first_check
+
+    def invoke(self, server_name: str, tool_name: str, arguments: dict[str, Any]) -> Any:
+        server_health, _first_check = self.preflight(server_name)
+        tool_key = (server_name, tool_name)
+        tool_health = self._tool_health.setdefault(
+            tool_key,
+            {
+                "status": "unknown",
+                "consecutive_failures": 0,
+                "circuit_open": False,
+                "circuit_reason": "",
+            },
+        )
+        self._last_call = {
+            "server_name": server_name,
+            "tool_name": tool_name,
+            "cache_hit": False,
+            "skipped": False,
+            "circuit_open": False,
+            "circuit_scope": "",
+            "failure_count": int(tool_health.get("consecutive_failures") or 0),
+            "server_status": str(server_health.get("status") or "unknown"),
+            "tool_status": str(tool_health.get("status") or "unknown"),
+        }
+
+        if server_health.get("circuit_open"):
+            self._raise_circuit_open(
+                server_name,
+                tool_name,
+                scope="service",
+                reason=str(server_health.get("circuit_reason") or "service unavailable"),
+            )
+        if tool_health.get("circuit_open"):
+            self._raise_circuit_open(
+                server_name,
+                tool_name,
+                scope="tool",
+                reason=str(tool_health.get("circuit_reason") or "tool unavailable"),
+            )
+
+        if tool_name in MCP_CATALOG_TOOLS and tool_key in self._catalog_cache:
+            cached = deepcopy(self._catalog_cache[tool_key])
+            status = "empty" if _runtime_payload_count(cached) == 0 else "ok"
+            self._last_call.update(
+                {
+                    "cache_hit": True,
+                    "status": status,
+                    "server_status": "ok",
+                    "tool_status": status,
+                    "failure_count": 0,
+                }
+            )
+            return cached
+
+        try:
+            result = self.inner.invoke(server_name, tool_name, arguments)
+            payload_error = mcp_payload_error_message(result, server_name=server_name, tool_name=tool_name)
+            if payload_error:
+                raise MCPToolError(payload_error)
+        except MCPToolCircuitOpen:
+            raise
+        except MCPToolUnavailable as exc:
+            self._register_failure(server_name, tool_name, str(exc), unavailable=True)
+            raise
+        except MCPToolError as exc:
+            self._register_failure(server_name, tool_name, str(exc), unavailable=False)
+            raise
+        except Exception as exc:
+            message = f"MCP tool failed: {server_name}.{tool_name}: {exc}"
+            self._register_failure(server_name, tool_name, message, unavailable=False)
+            raise MCPToolError(message) from exc
+
+        status = "empty" if _runtime_payload_count(result) == 0 else "ok"
+        self._register_success(server_name, tool_name, status)
+        if tool_name in MCP_CATALOG_TOOLS:
+            self._catalog_cache[tool_key] = deepcopy(result)
+        return result
+
+    def call_metadata(self) -> dict[str, Any]:
+        return deepcopy(self._last_call)
+
+    def reserve_query_budget(
+        self,
+        server_name: str,
+        tool_name: str,
+        scope_id: str,
+        *,
+        limit: int,
+    ) -> tuple[bool, int]:
+        """Reserve one actual remote attempt in a run-local scoped budget."""
+
+        key = (server_name, tool_name, scope_id)
+        used = int(self._query_budgets.get(key) or 0)
+        if used >= max(int(limit), 0):
+            return False, used
+        used += 1
+        self._query_budgets[key] = used
+        return True, used
+
+    def release_query_budget(self, server_name: str, tool_name: str, scope_id: str) -> int:
+        """Release a reservation when a circuit prevented an actual attempt."""
+
+        key = (server_name, tool_name, scope_id)
+        used = max(int(self._query_budgets.get(key) or 0) - 1, 0)
+        if used:
+            self._query_budgets[key] = used
+        else:
+            self._query_budgets.pop(key, None)
+        return used
+
+    def status_snapshot(self) -> dict[str, Any]:
+        return {
+            "servers": deepcopy(self._server_health),
+            "tools": {
+                f"{server_name}.{tool_name}": deepcopy(health)
+                for (server_name, tool_name), health in self._tool_health.items()
+            },
+            "catalog_entries": len(self._catalog_cache),
+            "preflight_servers": sorted(self._preflight_servers),
+            "query_budgets": {
+                f"{server_name}.{tool_name}.{scope_id}": used
+                for (server_name, tool_name, scope_id), used in self._query_budgets.items()
+            },
+        }
+
+    def server_is_unavailable(self, server_name: str) -> bool:
+        health, _first_check = self.preflight(server_name)
+        return bool(health.get("circuit_open") and health.get("status") == "unavailable")
+
+    def consume_errors(self) -> list[str]:
+        errors = list(self.errors)
+        self.errors.clear()
+        consumer = getattr(self.inner, "consume_errors", None)
+        if callable(consumer):
+            errors.extend(str(item) for item in consumer())
+        return list(dict.fromkeys(error for error in errors if error))
+
+    def close(self) -> None:
+        closer = getattr(self.inner, "close", None)
+        if callable(closer):
+            closer()
+
+    def _register_success(self, server_name: str, tool_name: str, status: str) -> None:
+        server_health = self._server_health.setdefault(server_name, {})
+        server_health.update(
+            {
+                "status": "ok",
+                "consecutive_failures": 0,
+                "circuit_open": False,
+                "circuit_reason": "",
+            }
+        )
+        tool_health = self._tool_health.setdefault((server_name, tool_name), {})
+        tool_health.update(
+            {
+                "status": status,
+                "consecutive_failures": 0,
+                "circuit_open": False,
+                "circuit_reason": "",
+            }
+        )
+        self._last_call.update(
+            {
+                "status": status,
+                "server_status": "ok",
+                "tool_status": status,
+                "failure_count": 0,
+            }
+        )
+
+    def _register_failure(self, server_name: str, tool_name: str, message: str, *, unavailable: bool) -> None:
+        normalized = message.lower()
+        service_fatal = any(pattern in normalized for pattern in MCP_SERVICE_FATAL_PATTERNS)
+        transport_failure = any(pattern in normalized for pattern in MCP_TOOL_TRANSPORT_PATTERNS)
+        tool_health = self._tool_health.setdefault((server_name, tool_name), {})
+        failure_count = int(tool_health.get("consecutive_failures") or 0) + 1
+        open_tool = unavailable or transport_failure or failure_count >= max(int(self.failure_threshold), 1)
+        status = "unavailable" if unavailable else "error"
+        tool_health.update(
+            {
+                "status": status,
+                "consecutive_failures": failure_count,
+                "circuit_open": bool(open_tool and not service_fatal),
+                "circuit_reason": message if open_tool and not service_fatal else "",
+            }
+        )
+        server_health = self._server_health.setdefault(server_name, {})
+        if service_fatal:
+            server_health.update(
+                {
+                    "status": "unavailable",
+                    "consecutive_failures": int(server_health.get("consecutive_failures") or 0) + 1,
+                    "circuit_open": True,
+                    "circuit_reason": message,
+                }
+            )
+        else:
+            server_health.update(
+                {
+                    "status": "degraded",
+                    "consecutive_failures": int(server_health.get("consecutive_failures") or 0) + 1,
+                    "circuit_open": False,
+                }
+            )
+        if message and message not in self.errors:
+            self.errors.append(message)
+        self._last_call.update(
+            {
+                "status": status,
+                "error": message,
+                "server_status": str(server_health.get("status") or "unknown"),
+                "tool_status": status,
+                "failure_count": failure_count,
+                "circuit_open": bool(service_fatal or (open_tool and not service_fatal)),
+                "circuit_scope": "service" if service_fatal else ("tool" if open_tool else ""),
+            }
+        )
+
+    def _raise_circuit_open(self, server_name: str, tool_name: str, *, scope: str, reason: str) -> None:
+        message = f"MCP {scope} circuit open; skipped {server_name}.{tool_name}: {reason}"
+        self._last_call.update(
+            {
+                "status": "unavailable",
+                "error": message,
+                "skipped": True,
+                "circuit_open": True,
+                "circuit_scope": scope,
+                "server_status": "unavailable" if scope == "service" else self._last_call.get("server_status", "degraded"),
+                "tool_status": "unavailable",
+            }
+        )
+        raise MCPToolCircuitOpen(message)
 
 
 @dataclass
@@ -321,6 +614,9 @@ def mcp_payload_error_message(payload: Any, server_name: str, tool_name: str) ->
 
 
 def consume_mcp_invoker_errors(invoker: MCPToolInvoker | None) -> list[str]:
+    runtime = getattr(invoker, "_policychain_runtime_invoker", None)
+    if isinstance(runtime, RuntimeMCPInvoker):
+        return runtime.consume_errors()
     consumer = getattr(invoker, "consume_errors", None)
     if callable(consumer):
         return list(consumer())
@@ -331,8 +627,49 @@ def cache_mcp_invoker(invoker: MCPToolInvoker, max_entries: int = 256) -> Cachin
     return CachingMCPInvoker(inner=invoker, max_entries=max_entries)
 
 
+def runtime_mcp_invoker(invoker: MCPToolInvoker) -> RuntimeMCPInvoker:
+    """Return the single resilient wrapper associated with this run invoker."""
+
+    if isinstance(invoker, RuntimeMCPInvoker):
+        return invoker
+    existing = getattr(invoker, "_policychain_runtime_invoker", None)
+    if isinstance(existing, RuntimeMCPInvoker):
+        return existing
+    runtime = RuntimeMCPInvoker(inner=invoker)
+    try:
+        setattr(invoker, "_policychain_runtime_invoker", runtime)
+    except (AttributeError, TypeError):
+        pass
+    return runtime
+
+
+def mcp_runtime_snapshot(invoker: MCPToolInvoker | None) -> dict[str, Any]:
+    if invoker is None:
+        return {
+            "servers": {},
+            "tools": {},
+            "catalog_entries": 0,
+            "preflight_servers": [],
+            "query_budgets": {},
+            "status": "unavailable",
+        }
+    return runtime_mcp_invoker(invoker).status_snapshot()
+
+
+def mcp_server_is_unavailable(invoker: MCPToolInvoker | None, server_name: str) -> bool:
+    if invoker is None or is_unavailable_invoker(invoker):
+        return True
+    return runtime_mcp_invoker(invoker).server_is_unavailable(server_name)
+
+
 def is_unavailable_invoker(invoker: MCPToolInvoker | None) -> bool:
-    return invoker is None or isinstance(invoker, UnavailableMCPInvoker)
+    if invoker is None or isinstance(invoker, UnavailableMCPInvoker):
+        return True
+    if isinstance(invoker, RuntimeMCPInvoker):
+        return is_unavailable_invoker(invoker.inner)
+    if isinstance(invoker, CachingMCPInvoker):
+        return is_unavailable_invoker(invoker.inner)
+    return False
 
 
 def _mcp_child_env(server_env: dict[str, str]) -> dict[str, str]:
@@ -464,6 +801,34 @@ def _truthy_env(value: str | None) -> bool:
 def _mcp_cache_key(server_name: str, tool_name: str, arguments: dict[str, Any]) -> str:
     encoded_args = json.dumps(arguments, ensure_ascii=False, sort_keys=True, default=str)
     return json.dumps([server_name, tool_name, encoded_args], ensure_ascii=False)
+
+
+def _runtime_server_configured(invoker: MCPToolInvoker, server_name: str) -> tuple[bool, str]:
+    if isinstance(invoker, RuntimeMCPInvoker):
+        return _runtime_server_configured(invoker.inner, server_name)
+    if isinstance(invoker, CachingMCPInvoker):
+        return _runtime_server_configured(invoker.inner, server_name)
+    if isinstance(invoker, UnavailableMCPInvoker):
+        return False, f"MCP server is not configured: {server_name}"
+    if isinstance(invoker, StdioMCPInvoker) and server_name not in invoker.servers:
+        return False, f"MCP server is not configured: {server_name}"
+    return True, ""
+
+
+def _runtime_payload_count(payload: Any) -> int:
+    if payload is None:
+        return 0
+    if isinstance(payload, list):
+        return len(payload)
+    if isinstance(payload, dict):
+        for key in ("results", "result", "data", "items", "reports", "announcements", "stocks", "companies"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return len(value)
+            if isinstance(value, dict):
+                return 1 if value else 0
+        return 1 if payload else 0
+    return 1
 
 
 def _diagnose_server_type(server_name: str, server: MCPServerConfig) -> MCPDiagnostic:

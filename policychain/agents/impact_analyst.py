@@ -269,6 +269,8 @@ def _merge_evidence(existing: list[dict[str, Any]], new_items: list[dict[str, An
     merged: list[dict[str, Any]] = []
     seen: set[tuple[str | None, str | None]] = set()
     for item in [*existing, *new_items]:
+        if str(item.get("tool_name") or "") in {"get_industry_list", "get_concept_list"}:
+            continue
         key = (item.get("policy_id"), item.get("chunk_id"))
         if key not in seen:
             seen.add(key)
@@ -280,6 +282,8 @@ def _merge_external_evidence(existing: list[dict[str, Any]], new_items: list[dic
     merged: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for item in [*existing, *new_items]:
+        if str(item.get("tool_name") or "") in {"get_industry_list", "get_concept_list"}:
+            continue
         key = (
             str(item.get("server_name") or ""),
             str(item.get("tool_name") or ""),

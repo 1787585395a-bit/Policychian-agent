@@ -5,10 +5,14 @@ import re
 from typing import Any, Callable, TypeVar
 
 from policychain.safety import assert_no_investment_advice
+from policychain.observability import record_event
 from policychain.schemas.agent_outputs import (
+    CompanyDiscoveryOutput,
     CompanyEvidence,
     CompanyMatch,
     CompanyMatchOutput,
+    CompanySeed,
+    CompanySeedOutput,
     EvidenceItem,
     ImpactAnalysisOutput,
     ImplementationStep,
@@ -29,6 +33,8 @@ SCHEMA_BUILDERS: dict[str, Callable[[dict[str, Any]], Any]] = {
     "PolicyAnalysisOutput": lambda payload: _build_policy_analysis(payload),
     "ImpactAnalysisOutput": lambda payload: _build_impact_analysis(payload),
     "CompanyMatchOutput": lambda payload: _build_company_match_output(payload),
+    "CompanySeedOutput": lambda payload: _build_company_seed_output(payload),
+    "CompanyDiscoveryOutput": lambda payload: _build_company_discovery_output(payload),
 }
 
 
@@ -52,10 +58,21 @@ def parse_json_object(text: str) -> dict[str, Any]:
 def parse_structured_output(text: str, schema_name: str) -> Any:
     """Parse and validate an LLM response against a supported output schema."""
 
-    assert_no_investment_advice(text, context=f"{schema_name} raw output")
-    payload = parse_json_object(text)
-    output = validate_structured_payload(payload, schema_name)
-    assert_no_investment_advice(output.to_dict(), context=schema_name)
+    try:
+        assert_no_investment_advice(text, context=f"{schema_name} raw output")
+        payload = parse_json_object(text)
+        output = validate_structured_payload(payload, schema_name)
+        assert_no_investment_advice(output.to_dict(), context=schema_name)
+    except Exception as exc:
+        record_event(
+            "schema.validation",
+            stage=schema_name,
+            status="error",
+            schema=schema_name,
+            error=f"{exc.__class__.__name__}: {str(exc)[:300]}",
+        )
+        raise
+    record_event("schema.validation", stage=schema_name, status="ok", schema=schema_name)
     return output
 
 
@@ -132,6 +149,86 @@ def _build_company_match_output(payload: dict[str, Any]) -> CompanyMatchOutput:
             for index, item in enumerate(_require_list(payload, "companies"))
         ],
         uncertainties=_coerce_explanatory_list(payload, "uncertainties"),
+    )
+
+
+def _build_company_seed_output(payload: dict[str, Any]) -> CompanySeedOutput:
+    fields = ("seeds", "uncertainties")
+    _require_fields(payload, "CompanySeedOutput", fields)
+    _reject_extra_fields(payload, "CompanySeedOutput", fields)
+    seeds = [
+        _build_company_seed(item, f"seeds[{index}]")
+        for index, item in enumerate(_require_list(payload, "seeds"))
+    ]
+    counts: dict[str, int] = {}
+    for seed in seeds:
+        counts[seed.impact_id] = counts.get(seed.impact_id, 0) + 1
+        if counts[seed.impact_id] > 6:
+            raise StructuredOutputError(f"CompanySeedOutput permits at most 6 seeds per impact: {seed.impact_id}")
+    return CompanySeedOutput(
+        seeds=seeds,
+        uncertainties=_coerce_explanatory_list(payload, "uncertainties"),
+    )
+
+
+def _build_company_discovery_output(payload: dict[str, Any]) -> CompanyDiscoveryOutput:
+    fields = ("impact_id", "web_queries", "seeds", "uncertainties")
+    _require_fields(payload, "CompanyDiscoveryOutput", fields)
+    _reject_extra_fields(payload, "CompanyDiscoveryOutput", fields)
+    impact_id = _require_str(payload, "impact_id")
+    if not re.fullmatch(r"IMP-\d{3}", impact_id):
+        raise StructuredOutputError("CompanyDiscoveryOutput.impact_id must use IMP-001 format")
+    web_queries = _require_list_of_str(payload, "web_queries")
+    if len(web_queries) > 2:
+        raise StructuredOutputError("CompanyDiscoveryOutput permits at most 2 web queries")
+    seeds = [
+        _build_company_seed(item, f"seeds[{index}]")
+        for index, item in enumerate(_require_list(payload, "seeds"))
+    ]
+    if len(seeds) > 6:
+        raise StructuredOutputError("CompanyDiscoveryOutput permits at most 6 seeds")
+    if any(seed.impact_id != impact_id for seed in seeds):
+        raise StructuredOutputError("CompanyDiscoveryOutput seeds must match the top-level impact_id")
+    return CompanyDiscoveryOutput(
+        impact_id=impact_id,
+        web_queries=web_queries,
+        seeds=seeds,
+        uncertainties=_coerce_explanatory_list(payload, "uncertainties"),
+    )
+
+
+def _build_company_seed(payload: Any, field_name: str) -> CompanySeed:
+    if not isinstance(payload, dict):
+        raise StructuredOutputError(f"{field_name} must be an object")
+    fields = (
+        "impact_id",
+        "proposed_name",
+        "historical_names",
+        "proposed_stock_code",
+        "seed_reason",
+        "origin_channels",
+    )
+    _require_fields(payload, field_name, fields)
+    _reject_extra_fields(payload, field_name, fields)
+    impact_id = _require_str(payload, "impact_id", field_name)
+    if not re.fullmatch(r"IMP-\d{3}", impact_id):
+        raise StructuredOutputError(f"{field_name}.impact_id must use IMP-001 format")
+    historical_names = _require_list_of_str(payload, "historical_names", field_name)
+    if len(historical_names) > 3:
+        raise StructuredOutputError(f"{field_name}.historical_names permits at most 3 items")
+    proposed_stock_code = _optional_str(payload, "proposed_stock_code", field_name) or ""
+    if proposed_stock_code and not re.fullmatch(r"\d{6}", proposed_stock_code):
+        raise StructuredOutputError(f"{field_name}.proposed_stock_code must be empty or a six-digit code")
+    origin_channels = _require_list_of_str(payload, "origin_channels", field_name)
+    if not origin_channels:
+        raise StructuredOutputError(f"{field_name}.origin_channels must contain at least one source channel")
+    return CompanySeed(
+        impact_id=impact_id,
+        proposed_name=_require_str(payload, "proposed_name", field_name),
+        historical_names=historical_names,
+        proposed_stock_code=proposed_stock_code,
+        seed_reason=_require_str(payload, "seed_reason", field_name),
+        origin_channels=origin_channels,
     )
 
 
@@ -282,6 +379,12 @@ def _require_fields(payload: dict[str, Any], object_name: str, fields: tuple[str
     missing = [field for field in fields if field not in payload]
     if missing:
         raise StructuredOutputError(f"{object_name} missing required field(s): {', '.join(missing)}")
+
+
+def _reject_extra_fields(payload: dict[str, Any], object_name: str, fields: tuple[str, ...]) -> None:
+    extras = sorted(set(payload) - set(fields))
+    if extras:
+        raise StructuredOutputError(f"{object_name} contains unsupported field(s): {', '.join(extras)}")
 
 
 def _require_dict(payload: dict[str, Any], field_name: str, parent: str | None = None) -> dict[str, Any]:

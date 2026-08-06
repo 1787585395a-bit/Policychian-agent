@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 from policychain.mcp import StdioMCPInvoker, cache_mcp_invoker
-from policychain.llm import LLMConfigurationError
+from policychain.observability import RunRecorder, load_run_artifact
 from policychain.paths import resolve_default_db_path
 from scripts.run_research import run_research
 
@@ -73,12 +73,14 @@ PORT = _resolve_port()
 def run_query(
     query: str,
     db_path: str | Path | None = None,
-    use_llm: bool = False,
+    use_llm: bool = True,
     use_mcp: bool = False,
     progress_callback: Any | None = None,
+    run_recorder: RunRecorder | None = None,
 ) -> dict[str, Any]:
     started = perf_counter()
     effective_use_llm = use_llm
+    recorder = run_recorder or RunRecorder(mode="llm" if use_llm else "deterministic")
     mcp_invoker = None
     runtime_notes: list[str] = []
     if use_mcp:
@@ -89,40 +91,30 @@ def run_query(
         except Exception as exc:
             message = f"MCP 外部工具初始化失败，已回退到本地流程：{exc}"
             runtime_notes.append(message)
+            recorder.mark_fallback("mcp", str(exc)[:300], "local_tools")
             if progress_callback:
                 progress_callback(2, "MCP 初始化", message)
     try:
-        try:
-            report = run_research(
-                query=query.strip() or DEFAULT_POLICY_INPUT,
-                db_path=db_path or resolve_default_db_path(),
-                ensure_sample_db=True,
-                rebuild_sample_db=False,
-                use_llm=effective_use_llm,
-                mcp_invoker=mcp_invoker,
-                progress_callback=progress_callback,
-            )
-        except LLMConfigurationError as exc:
-            if not effective_use_llm:
-                raise
-            effective_use_llm = False
-            message = f"模型分析初始化失败，已回退到确定性流程：{exc}"
-            runtime_notes.append(message)
-            if progress_callback:
-                progress_callback(3, "模型初始化", message)
-            report = run_research(
-                query=query.strip() or DEFAULT_POLICY_INPUT,
-                db_path=db_path or resolve_default_db_path(),
-                ensure_sample_db=True,
-                rebuild_sample_db=False,
-                use_llm=False,
-                mcp_invoker=mcp_invoker,
-                progress_callback=progress_callback,
-            )
+        state = run_research(
+            query=query.strip() or DEFAULT_POLICY_INPUT,
+            db_path=db_path or resolve_default_db_path(),
+            ensure_sample_db=True,
+            rebuild_sample_db=False,
+            use_llm=effective_use_llm,
+            mcp_invoker=mcp_invoker,
+            progress_callback=progress_callback,
+            run_recorder=recorder,
+            return_state=True,
+        )
     finally:
         closer = getattr(mcp_invoker, "close", None)
         if callable(closer):
             closer()
+    report = str(getattr(state, "final_report", state) or "")
+    state_agent_status = getattr(state, "agent_status", recorder.agent_status)
+    state_fallback_used = bool(getattr(state, "fallback_used", recorder.fallback_used))
+    effective_run_mode = str(getattr(state, "run_mode", recorder.mode) or recorder.mode)
+    effective_use_llm = effective_run_mode == "llm"
     if runtime_notes:
         notes = "\n".join(f"- {escape_note}" for escape_note in runtime_notes)
         report = f"{report}\n\n## 运行环境提示\n\n{notes}"
@@ -132,6 +124,11 @@ def run_query(
         "use_llm": effective_use_llm,
         "use_mcp": bool(mcp_invoker),
         "elapsed_seconds": round(perf_counter() - started, 2),
+        "run_id": str(getattr(state, "run_id", recorder.run_id) or recorder.run_id),
+        "requested_run_mode": "llm" if use_llm else "deterministic",
+        "effective_run_mode": effective_run_mode,
+        "agent_status": _public_agent_status(state_agent_status),
+        "fallback_used": state_fallback_used or recorder.fallback_used,
     }
 
 
@@ -442,6 +439,70 @@ def render_page(
     }}
     .log-item {{ padding: 4px 0; border-bottom: 1px solid #f1f1f1; white-space: pre-wrap; }}
     .log-item:last-child {{ border-bottom: 0; }}
+    .run-summary {{
+      margin-top: 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--soft);
+      padding: 14px;
+    }}
+    .run-summary-head {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+    }}
+    .run-summary-title {{ margin: 0; font-size: 14px; font-weight: 650; }}
+    .run-id {{
+      min-width: 0;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+      text-align: right;
+    }}
+    .run-facts {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px 18px;
+      margin: 14px 0 0;
+    }}
+    .run-fact {{ min-width: 0; }}
+    .run-fact dt {{ color: var(--muted); font-size: 12px; line-height: 1.4; }}
+    .run-fact dd {{ margin: 3px 0 0; font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }}
+    .agent-statuses {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 14px;
+    }}
+    .agent-status {{
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 10px;
+    }}
+    .agent-status span {{ display: block; color: var(--muted); font-size: 12px; line-height: 1.35; }}
+    .agent-status strong {{ display: block; margin-top: 4px; font-size: 13px; line-height: 1.35; overflow-wrap: anywhere; }}
+    .run-summary-actions {{ display: flex; justify-content: flex-end; margin-top: 14px; }}
+    .download-log {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 36px;
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 600;
+      padding: 0 12px;
+      text-decoration: none;
+    }}
+    .download-log:hover {{ background: var(--soft); }}
+    .download-log.is-disabled {{ color: var(--muted); background: #f1f1f1; cursor: not-allowed; pointer-events: none; }}
     .result-wrap {{ margin-top: 32px; }}
     .error {{
       margin: 0 0 14px;
@@ -502,6 +563,11 @@ def render_page(
       .log-window-head {{ align-items: stretch; flex-direction: column; }}
       .log-meta {{ white-space: normal; }}
       .copy-log {{ width: 100%; }}
+      .run-summary-head {{ flex-direction: column; gap: 6px; }}
+      .run-id {{ text-align: left; }}
+      .run-facts {{ grid-template-columns: 1fr; }}
+      .agent-statuses {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .download-log {{ width: 100%; }}
       .report h1 {{ font-size: 24px; }}
     }}
   </style>
@@ -550,6 +616,31 @@ def render_page(
           </div>
           <div class="log-panel" id="log-panel"><div class="log-item">等待提交政策链接或正文。</div></div>
         </div>
+        <section class="run-summary hidden" id="run-summary" aria-label="运行摘要">
+          <div class="run-summary-head">
+            <h2 class="run-summary-title">本次运行</h2>
+            <div class="run-id" id="run-id">Run ID: -</div>
+          </div>
+          <dl class="run-facts">
+            <div class="run-fact">
+              <dt>运行模式</dt>
+              <dd id="run-mode">-</dd>
+            </div>
+            <div class="run-fact">
+              <dt>回退情况</dt>
+              <dd id="fallback-status">-</dd>
+            </div>
+          </dl>
+          <div class="agent-statuses" aria-label="Agent 状态">
+            <div class="agent-status"><span>政策分析</span><strong id="agent-policy">等待中</strong></div>
+            <div class="agent-status"><span>行业影响</span><strong id="agent-impact">等待中</strong></div>
+            <div class="agent-status"><span>公司匹配</span><strong id="agent-company">等待中</strong></div>
+            <div class="agent-status"><span>报告生成</span><strong id="agent-report">等待中</strong></div>
+          </div>
+          <div class="run-summary-actions">
+            <a class="download-log is-disabled" id="download-log" href="#" aria-disabled="true">下载运行日志</a>
+          </div>
+        </section>
       </div>
     </section>
     <section class="result-wrap" aria-label="分析结果">
@@ -570,6 +661,17 @@ def render_page(
     const logPanel = document.getElementById("log-panel");
     const logMeta = document.getElementById("log-meta");
     const copyLogButton = document.getElementById("copy-log");
+    const runSummary = document.getElementById("run-summary");
+    const runIdLabel = document.getElementById("run-id");
+    const runModeLabel = document.getElementById("run-mode");
+    const fallbackStatus = document.getElementById("fallback-status");
+    const downloadLog = document.getElementById("download-log");
+    const agentStatusLabels = {{
+      policy: document.getElementById("agent-policy"),
+      impact: document.getElementById("agent-impact"),
+      company: document.getElementById("agent-company"),
+      report: document.getElementById("agent-report")
+    }};
     const report = document.getElementById("report");
     const errorBox = document.getElementById("error-box");
     let pollTimer = null;
@@ -593,6 +695,10 @@ def render_page(
       lastStatusPayload = {{status: "pending", progress: 0, stage: "排队中", job_id: "", logs: []}};
       copyLogButton.disabled = true;
       copyLogButton.textContent = "复制日志";
+      runSummary.classList.add("hidden");
+      downloadLog.classList.add("is-disabled");
+      downloadLog.setAttribute("aria-disabled", "true");
+      downloadLog.href = "#";
       renderStatus({{status: "pending", progress: 0, stage: "排队中", logs: [{{message: "任务已提交。"}}]}});
       try {{
         const response = await fetch("/api/research", {{
@@ -656,7 +762,44 @@ def render_page(
       logPanel.scrollTop = logPanel.scrollHeight;
       copyLogButton.disabled = !(payload.status === "done" || payload.status === "error");
       if (copyLogButton.disabled) copyLogButton.textContent = "复制日志";
+      renderRunSummary(payload);
     }}
+
+    function renderRunSummary(payload) {{
+      if (!payload.run_id) {{
+        runSummary.classList.add("hidden");
+        return;
+      }}
+      runSummary.classList.remove("hidden");
+      runIdLabel.textContent = `Run ID: ${{payload.run_id}}`;
+      const requestedMode = formatRunMode(payload.requested_run_mode);
+      const effectiveMode = formatRunMode(payload.effective_run_mode);
+      runModeLabel.textContent = `请求：${{requestedMode}} · 实际：${{effectiveMode}}`;
+      fallbackStatus.textContent = payload.fallback_used ? "已启用回退方案，详情见运行日志" : "未发生回退";
+      const statuses = payload.agent_status || {{}};
+      Object.entries(agentStatusLabels).forEach(([key, element]) => {{
+        element.textContent = formatAgentStatus(statuses[key]);
+      }});
+      const terminal = payload.status === "done" || payload.status === "error";
+      const downloadable = terminal && Boolean(payload.log_download_available) && Boolean(payload.job_id);
+      downloadLog.classList.toggle("is-disabled", !downloadable);
+      downloadLog.setAttribute("aria-disabled", downloadable ? "false" : "true");
+      downloadLog.href = downloadable ? `/api/run-log?job_id=${{encodeURIComponent(payload.job_id)}}` : "#";
+    }}
+
+    function formatRunMode(value) {{
+      if (value === "llm") return "模型分析";
+      if (value === "deterministic") return "确定性分析";
+      return value || "待确认";
+    }}
+
+    function formatAgentStatus(value) {{
+      return ({{pending: "等待中", running: "运行中", completed: "已完成", failed: "失败"}})[value] || value || "等待中";
+    }}
+
+    downloadLog.addEventListener("click", (event) => {{
+      if (downloadLog.getAttribute("aria-disabled") === "true") event.preventDefault();
+    }});
 
     copyLogButton.addEventListener("click", async () => {{
       const text = formatLogsForCopy(lastStatusPayload);
@@ -687,8 +830,12 @@ def render_page(
       const logs = payload.logs || [];
       const lines = [
         `PolicyChain Job: ${{payload.job_id || "-"}}`,
+        `Run ID: ${{payload.run_id || "-"}}`,
         `Status: ${{payload.status || "-"}}`,
         `Final stage: ${{payload.stage || "-"}}`,
+        `Requested mode: ${{payload.requested_run_mode || "-"}}`,
+        `Effective mode: ${{payload.effective_run_mode || "-"}}`,
+        `Fallback used: ${{Boolean(payload.fallback_used)}}`,
         ""
       ];
       logs.forEach((item) => lines.push(formatLogLine(item)));
@@ -719,6 +866,7 @@ def render_page(
     }}
 
     function showError(message) {{
+      report.innerHTML = '<div class="empty">分析失败，未生成报告。</div>';
       errorBox.textContent = message;
       errorBox.classList.remove("hidden");
       statusLine.textContent = "分析失败";
@@ -918,6 +1066,9 @@ class PolicyChainRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/research-status":
             self._send_head("application/json; charset=utf-8")
             return
+        if parsed.path == "/api/run-log" or parsed.path == "/api/run-logs" or parsed.path.startswith("/api/run-logs/"):
+            self._send_head("application/json; charset=utf-8")
+            return
         self._send_head("text/html; charset=utf-8")
 
     def do_GET(self) -> None:
@@ -929,6 +1080,18 @@ class PolicyChainRequestHandler(BaseHTTPRequestHandler):
             params = parse_qs(parsed.query)
             job_id = (params.get("job_id") or [""])[0]
             self._send_json(_job_view(job_id))
+            return
+        if parsed.path == "/api/run-log":
+            params = parse_qs(parsed.query)
+            job_id = (params.get("job_id") or [""])[0]
+            payload, status, filename = _load_run_log(job_id=job_id)
+            self._send_json_attachment(payload, filename=filename, status=status)
+            return
+        if parsed.path == "/api/run-logs" or parsed.path.startswith("/api/run-logs/"):
+            params = parse_qs(parsed.query)
+            run_id = parsed.path.removeprefix("/api/run-logs/") if parsed.path.startswith("/api/run-logs/") else (params.get("run_id") or [""])[0]
+            payload, status, filename = _load_run_log(run_id=run_id)
+            self._send_json_attachment(payload, filename=filename, status=status)
             return
         if parsed.path == "/example-report":
             self._send_html(render_example_report_page())
@@ -1000,9 +1163,20 @@ class PolicyChainRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_json_attachment(self, payload: dict[str, Any], filename: str, status: int = 200) -> None:
+        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
 
 def _create_job(query: str, use_llm: bool, use_mcp: bool) -> str:
     job_id = uuid4().hex
+    requested_run_mode = "llm" if use_llm else "deterministic"
+    recorder = RunRecorder(mode=requested_run_mode)
     with JOBS_LOCK:
         JOBS[job_id] = {
             "job_id": job_id,
@@ -1016,6 +1190,12 @@ def _create_job(query: str, use_llm: bool, use_mcp: bool) -> str:
             "use_llm": use_llm,
             "use_mcp": use_mcp,
             "elapsed_seconds": None,
+            "run_id": recorder.run_id,
+            "requested_run_mode": requested_run_mode,
+            "effective_run_mode": requested_run_mode,
+            "agent_status": _public_agent_status({}),
+            "fallback_used": False,
+            "run_recorder": recorder,
         }
     if _sync_jobs_enabled():
         _run_job(job_id)
@@ -1031,12 +1211,14 @@ def _run_job(job_id: str) -> None:
         query = str(job["query"])
         use_llm = bool(job["use_llm"])
         use_mcp = bool(job["use_mcp"])
+        recorder = job["run_recorder"]
     _update_job(job_id, status="running", progress=1, stage="启动任务", message="任务开始执行")
     try:
         result = run_query(
             query,
             use_llm=use_llm,
             use_mcp=use_mcp,
+            run_recorder=recorder,
             progress_callback=lambda progress, stage, message: _update_job(
                 job_id,
                 status="running",
@@ -1045,6 +1227,12 @@ def _run_job(job_id: str) -> None:
                 message=message,
             ),
         )
+        result_run_id = str(result.get("run_id") or recorder.run_id)
+        result_agent_status = _public_agent_status(result.get("agent_status") or recorder.agent_status)
+        result_fallback_used = bool(result.get("fallback_used", recorder.fallback_used))
+        result_effective_mode = str(result.get("effective_run_mode") or recorder.mode)
+        if recorder.status == "running":
+            recorder.finish("completed", effective_run_mode=result_effective_mode)
         _update_job(
             job_id,
             status="done",
@@ -1052,9 +1240,26 @@ def _run_job(job_id: str) -> None:
             stage="完成",
             report=result["report"],
             elapsed_seconds=result["elapsed_seconds"],
+            run_id=result_run_id,
+            requested_run_mode=str(result.get("requested_run_mode") or ("llm" if use_llm else "deterministic")),
+            effective_run_mode=result_effective_mode,
+            agent_status=result_agent_status,
+            fallback_used=result_fallback_used,
         )
     except Exception as exc:
-        _update_job(job_id, status="error", stage="错误", message=str(exc), error=str(exc))
+        if recorder.status != "failed":
+            recorder.finish("failed", error=f"{exc.__class__.__name__}: {str(exc)[:300]}")
+        _update_job(
+            job_id,
+            status="error",
+            stage="错误",
+            message=str(exc),
+            error=str(exc),
+            run_id=recorder.run_id,
+            effective_run_mode=recorder.mode,
+            agent_status=_public_agent_status(recorder.agent_status),
+            fallback_used=recorder.fallback_used,
+        )
 
 
 def _update_job(
@@ -1066,6 +1271,11 @@ def _update_job(
     report: str | None = None,
     error: str | None = None,
     elapsed_seconds: float | None = None,
+    run_id: str | None = None,
+    requested_run_mode: str | None = None,
+    effective_run_mode: str | None = None,
+    agent_status: dict[str, str] | None = None,
+    fallback_used: bool | None = None,
 ) -> None:
     with JOBS_LOCK:
         job = JOBS.get(job_id)
@@ -1083,6 +1293,16 @@ def _update_job(
             job["error"] = error
         if elapsed_seconds is not None:
             job["elapsed_seconds"] = elapsed_seconds
+        if run_id is not None:
+            job["run_id"] = run_id
+        if requested_run_mode is not None:
+            job["requested_run_mode"] = requested_run_mode
+        if effective_run_mode is not None:
+            job["effective_run_mode"] = effective_run_mode
+        if agent_status is not None:
+            job["agent_status"] = _public_agent_status(agent_status)
+        if fallback_used is not None:
+            job["fallback_used"] = fallback_used
         if message:
             job["logs"].append(_log_event(stage or str(job.get("stage") or ""), message, int(job.get("progress") or 0)))
 
@@ -1093,9 +1313,22 @@ def _job_view(job_id: str) -> dict[str, Any]:
     if not job:
         return {"status": "error", "error": "任务不存在", "progress": 0, "stage": "错误", "logs": []}
     report = str(job.get("report") or "")
+    run_id = str(job.get("run_id") or "")
+    status = str(job.get("status") or "")
+    recorder = job.get("run_recorder")
+    recorder_statuses = getattr(recorder, "agent_status", {})
+    agent_status = _public_agent_status(recorder_statuses or job.get("agent_status"))
+    effective_run_mode = str(
+        (getattr(recorder, "mode", "") if status in {"pending", "running"} else "")
+        or job.get("effective_run_mode")
+        or job.get("requested_run_mode")
+        or "deterministic"
+    )
+    fallback_used = bool(job.get("fallback_used")) or bool(getattr(recorder, "fallback_used", False))
+    log_root = getattr(recorder, "log_root", None)
     return {
         "job_id": job_id,
-        "status": job.get("status"),
+        "status": status,
         "progress": job.get("progress"),
         "stage": job.get("stage"),
         "logs": job.get("logs") or [],
@@ -1103,7 +1336,61 @@ def _job_view(job_id: str) -> dict[str, Any]:
         "report_html": _markdown_to_html(report) if report else "",
         "error": job.get("error") or "",
         "elapsed_seconds": job.get("elapsed_seconds"),
+        "run_id": run_id,
+        "requested_run_mode": job.get("requested_run_mode") or "deterministic",
+        "effective_run_mode": effective_run_mode,
+        "agent_status": agent_status,
+        "fallback_used": fallback_used,
+        "log_download_available": status in {"done", "error"} and _run_artifact_available(run_id, log_root=log_root),
     }
+
+
+def _public_agent_status(statuses: Any) -> dict[str, str]:
+    raw = statuses if isinstance(statuses, dict) else {}
+    mapping = {
+        "policy": "policy_analyst",
+        "impact": "impact_analyst",
+        "company": "company_matcher",
+        "report": "report_writer",
+    }
+    public: dict[str, str] = {}
+    for public_name, recorder_name in mapping.items():
+        primary = str(raw.get(recorder_name) or raw.get(public_name) or "pending")
+        fallback = str(raw.get(f"{recorder_name}_fallback") or "")
+        public[public_name] = fallback if fallback in {"running", "completed", "failed"} else primary
+    return public
+
+
+def _run_artifact_available(run_id: str, *, log_root: str | Path | None = None) -> bool:
+    if not run_id:
+        return False
+    try:
+        load_run_artifact(run_id, log_root=log_root)
+    except (FileNotFoundError, ValueError, OSError, json.JSONDecodeError):
+        return False
+    return True
+
+
+def _load_run_log(*, job_id: str = "", run_id: str = "") -> tuple[dict[str, Any], int, str]:
+    resolved_run_id = run_id
+    if job_id:
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            resolved_run_id = str((job or {}).get("run_id") or "")
+            log_root = getattr((job or {}).get("run_recorder"), "log_root", None)
+        if not job:
+            return {"error": "任务不存在"}, 404, "policychain-run-log.json"
+    else:
+        log_root = None
+    if not resolved_run_id:
+        return {"error": "run_id 或 job_id 不能为空"}, 400, "policychain-run-log.json"
+    filename = f"policychain-{resolved_run_id}.json"
+    try:
+        return load_run_artifact(resolved_run_id, log_root=log_root), 200, filename
+    except ValueError as exc:
+        return {"error": str(exc)}, 400, filename
+    except FileNotFoundError:
+        return {"error": "运行日志不存在", "run_id": resolved_run_id}, 404, filename
 
 
 def _log_event(stage: str, message: str, progress: int) -> dict[str, Any]:

@@ -3,10 +3,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import datetime, timezone
 import json
+import re
 from typing import Iterable
 
-from policychain.llm import LLMClient, create_llm_client
+from policychain.llm import LLMClient, create_llm_client, observed_llm_generate
 from policychain.mcp import MCPToolInvoker, consume_mcp_invoker_errors, is_unavailable_invoker
+from policychain.observability import record_event
 from policychain.prompts import render_prompt
 from policychain.schemas.agent_outputs import PolicyAnalysisOutput, StrengthAssessment
 from policychain.source_policy import (
@@ -78,11 +80,13 @@ def run_llm_policy_analyst(
         similar_policy_matches=_json_for_prompt(similar_results),
         web_evidence=_json_for_prompt(web_evidence),
     )
-    raw_output = client.generate(prompt["system"], prompt["user"])
+    raw_output = observed_llm_generate(client, prompt["system"], prompt["user"], agent="policy_analyst")
     output = parse_structured_output(raw_output, prompt["output_schema_name"])
     if not isinstance(output, PolicyAnalysisOutput):
         raise LLMPolicyAnalysisError("LLM Policy Analyst returned an unexpected output schema")
     policy_id = str((source_policy.get("metadata") or {}).get("policy_id") or source_policy.get("policy_id") or "")
+    _assert_policy_identity_matches_retrieval(output, expected_policy_id=policy_id)
+    _normalize_main_policy_evidence_ids(output, source_policy=source_policy, expected_policy_id=policy_id)
     _assert_policy_id_matches_retrieval(output, expected_policy_id=policy_id)
 
     state.policy_ids = sorted({policy_id, *state.policy_ids})
@@ -204,20 +208,109 @@ def _emit_progress(
         "message": message,
     }
     state.progress_events.append(event)
+    record_event("workflow.progress", stage=stage, status="ok", progress=progress, message=message)
     if callback:
         callback(progress, stage, message)
 
 
-def _assert_policy_id_matches_retrieval(output: PolicyAnalysisOutput, expected_policy_id: str) -> None:
+def _assert_policy_identity_matches_retrieval(output: PolicyAnalysisOutput, expected_policy_id: str) -> None:
     actual_policy_id = str(output.policy_identity.get("policy_id") or "")
     if actual_policy_id != expected_policy_id:
         raise LLMPolicyAnalysisError(
             f"LLM Policy Analyst policy_id mismatch: expected {expected_policy_id}, got {actual_policy_id or 'empty'}"
         )
+
+
+def _normalize_main_policy_evidence_ids(
+    output: PolicyAnalysisOutput,
+    source_policy: dict[str, object],
+    expected_policy_id: str,
+) -> None:
+    chunks = [item for item in source_policy.get("chunks") or [] if isinstance(item, dict)]
+    main_chunks = [
+        item
+        for item in chunks
+        if str(item.get("policy_id") or expected_policy_id).strip() == expected_policy_id
+    ]
+    main_chunk_ids = {
+        str(item.get("chunk_id") or "").strip()
+        for item in main_chunks
+        if str(item.get("chunk_id") or "").strip()
+    }
+    metadata = source_policy.get("metadata") if isinstance(source_policy.get("metadata"), dict) else {}
+    main_source_urls = {
+        value
+        for value in (
+            _normalized_source_url(source_policy.get("source_url")),
+            _normalized_source_url(metadata.get("source_url")),
+            *(_normalized_source_url(item.get("source_url")) for item in main_chunks),
+        )
+        if value
+    }
+    main_texts = [
+        value
+        for value in (
+            _normalized_evidence_text(source_policy.get("text")),
+            *(_normalized_evidence_text(item.get("content")) for item in main_chunks),
+        )
+        if value
+    ]
+
+    for evidence in output.evidence:
+        if evidence.policy_id == expected_policy_id:
+            continue
+        if _evidence_belongs_to_main_policy(
+            evidence.chunk_id,
+            evidence.source_url,
+            evidence.text,
+            main_chunk_ids=main_chunk_ids,
+            main_source_urls=main_source_urls,
+            main_texts=main_texts,
+        ):
+            evidence.policy_id = expected_policy_id
+
+
+def _evidence_belongs_to_main_policy(
+    chunk_id: str | None,
+    source_url: str | None,
+    text: str,
+    *,
+    main_chunk_ids: set[str],
+    main_source_urls: set[str],
+    main_texts: list[str],
+) -> bool:
+    normalized_chunk_id = str(chunk_id or "").strip()
+    normalized_source_url = _normalized_source_url(source_url)
+
+    if normalized_chunk_id and normalized_chunk_id not in main_chunk_ids:
+        return False
+    if normalized_source_url and normalized_source_url not in main_source_urls:
+        return False
+
+    chunk_matches = bool(normalized_chunk_id and normalized_chunk_id in main_chunk_ids)
+    source_url_matches = bool(normalized_source_url and normalized_source_url in main_source_urls)
+    normalized_text = _normalized_evidence_text(text)
+    text_matches = bool(
+        len(normalized_text) >= 12
+        and any(normalized_text in main_text for main_text in main_texts)
+    )
+    return chunk_matches or source_url_matches or text_matches
+
+
+def _normalized_source_url(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _normalized_evidence_text(value: object) -> str:
+    return re.sub(r"\s+", "", str(value or "")).strip()
+
+
+def _assert_policy_id_matches_retrieval(output: PolicyAnalysisOutput, expected_policy_id: str) -> None:
+    _assert_policy_identity_matches_retrieval(output, expected_policy_id)
     mismatched_evidence = [
-        item.policy_id
+        item.policy_id or "empty"
         for item in output.evidence
-        if item.policy_id and item.policy_id != expected_policy_id
+        if item.policy_id != expected_policy_id
     ]
     if mismatched_evidence:
         raise LLMPolicyAnalysisError(

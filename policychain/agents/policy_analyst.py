@@ -11,6 +11,7 @@ from policychain.schemas.agent_outputs import (
     StrengthAssessment,
 )
 from policychain.mcp import MCPToolInvoker, consume_mcp_invoker_errors, is_unavailable_invoker
+from policychain.observability import record_event
 from policychain.safety import assert_no_investment_advice
 from policychain.source_policy import (
     SourcePolicyError,
@@ -204,6 +205,7 @@ def _emit_progress(
         "message": message,
     }
     state.progress_events.append(event)
+    record_event("workflow.progress", stage=stage, status="ok", progress=progress, message=message)
     if callback:
         callback(progress, stage, message)
 
