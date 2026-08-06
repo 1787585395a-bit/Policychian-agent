@@ -93,13 +93,125 @@ class LLMPolicyAnalystTests(unittest.TestCase):
         finally:
             store.close()
 
-    def test_run_llm_policy_analyst_rejects_evidence_policy_id_mismatch(self) -> None:
+    def test_run_llm_policy_analyst_rejects_empty_policy_identity_id(self) -> None:
         payload = _policy_payload()
-        payload["evidence"][0]["policy_id"] = "POL-2099-NAT-9999"
+        payload["policy_identity"]["policy_id"] = ""
         store = build_sample_store()
         client = RecordingLLMClient(json.dumps(payload, ensure_ascii=False))
         try:
             state = PolicyResearchState(user_query="生成式人工智能")
+
+            with self.assertRaisesRegex(LLMPolicyAnalysisError, "got empty"):
+                run_llm_policy_analyst(state, store, llm_client=client)
+        finally:
+            store.close()
+
+    def test_run_llm_policy_analyst_normalizes_evidence_id_proven_by_main_chunk(self) -> None:
+        source_policy = _main_source_policy()
+        payload = _policy_payload_for_source(source_policy)
+        payload["evidence"][0].update(
+            {
+                "policy_id": "POL-2099-NAT-9999",
+                "chunk_id": source_policy["chunks"][0]["chunk_id"],
+                "source_url": None,
+                "text": "仅为不匹配正文的概括",
+            }
+        )
+        store = build_sample_store()
+        client = RecordingLLMClient(json.dumps(payload, ensure_ascii=False))
+        try:
+            state = PolicyResearchState(user_query="主政策分析", source_policy=source_policy)
+
+            output = run_llm_policy_analyst(state, store, llm_client=client)
+
+            self.assertEqual(output.evidence[0].policy_id, source_policy["policy_id"])
+            self.assertEqual(state.evidence[0]["policy_id"], source_policy["policy_id"])
+            self.assertEqual(state.policy_analysis["evidence"][0]["policy_id"], source_policy["policy_id"])
+        finally:
+            store.close()
+
+    def test_run_llm_policy_analyst_normalizes_evidence_id_proven_by_main_url(self) -> None:
+        source_policy = _main_source_policy()
+        payload = _policy_payload_for_source(source_policy)
+        payload["evidence"][0].update(
+            {
+                "policy_id": "POL-2099-NAT-9999",
+                "chunk_id": None,
+                "source_url": source_policy["source_url"],
+                "text": "仅为不匹配正文的概括",
+            }
+        )
+        store = build_sample_store()
+        client = RecordingLLMClient(json.dumps(payload, ensure_ascii=False))
+        try:
+            state = PolicyResearchState(user_query="主政策分析", source_policy=source_policy)
+
+            output = run_llm_policy_analyst(state, store, llm_client=client)
+
+            self.assertEqual(output.evidence[0].policy_id, source_policy["policy_id"])
+            self.assertEqual(state.evidence[0]["policy_id"], source_policy["policy_id"])
+        finally:
+            store.close()
+
+    def test_run_llm_policy_analyst_normalizes_evidence_id_proven_by_main_text(self) -> None:
+        source_policy = _main_source_policy()
+        payload = _policy_payload_for_source(source_policy)
+        payload["evidence"][0].update(
+            {
+                "policy_id": "POL-2099-NAT-9999",
+                "chunk_id": None,
+                "source_url": None,
+                "text": "服务提供者应当依法履行安全义务",
+            }
+        )
+        store = build_sample_store()
+        client = RecordingLLMClient(json.dumps(payload, ensure_ascii=False))
+        try:
+            state = PolicyResearchState(user_query="主政策分析", source_policy=source_policy)
+
+            output = run_llm_policy_analyst(state, store, llm_client=client)
+
+            self.assertEqual(output.evidence[0].policy_id, source_policy["policy_id"])
+            self.assertEqual(state.evidence[0]["policy_id"], source_policy["policy_id"])
+        finally:
+            store.close()
+
+    def test_run_llm_policy_analyst_rejects_evidence_policy_id_mismatch(self) -> None:
+        source_policy = _main_source_policy()
+        payload = _policy_payload_for_source(source_policy)
+        payload["evidence"][0].update(
+            {
+                "policy_id": "POL-2099-NAT-9999",
+                "chunk_id": None,
+                "source_url": None,
+                "text": "无法在主政策正文中核验的摘要",
+            }
+        )
+        store = build_sample_store()
+        client = RecordingLLMClient(json.dumps(payload, ensure_ascii=False))
+        try:
+            state = PolicyResearchState(user_query="主政策分析", source_policy=source_policy)
+
+            with self.assertRaisesRegex(LLMPolicyAnalysisError, "evidence policy_id mismatch"):
+                run_llm_policy_analyst(state, store, llm_client=client)
+        finally:
+            store.close()
+
+    def test_run_llm_policy_analyst_rejects_similar_policy_evidence_with_overlapping_text(self) -> None:
+        source_policy = _main_source_policy()
+        payload = _policy_payload_for_source(source_policy)
+        payload["evidence"][0].update(
+            {
+                "policy_id": "POL-2023-NAT-0048",
+                "chunk_id": "POL-2023-NAT-0048-S02-C001",
+                "source_url": "https://www.gov.cn/zhengce/zhengceku/202307/content_6891752.htm",
+                "text": "服务提供者应当依法履行安全义务",
+            }
+        )
+        store = build_sample_store()
+        client = RecordingLLMClient(json.dumps(payload, ensure_ascii=False))
+        try:
+            state = PolicyResearchState(user_query="主政策分析", source_policy=source_policy)
 
             with self.assertRaisesRegex(LLMPolicyAnalysisError, "evidence policy_id mismatch"):
                 run_llm_policy_analyst(state, store, llm_client=client)
@@ -134,6 +246,50 @@ def _policy_payload() -> dict[str, object]:
         ],
         "uncertainties": ["仅基于样例政策文本"],
     }
+
+
+def _main_source_policy() -> dict[str, object]:
+    policy_id = "INPUT-ABCDEF12"
+    source_url = "https://policy.example.test/main-policy"
+    text = (
+        "主政策管理办法\n"
+        "第一条 为了规范主政策实施，服务提供者应当依法履行安全义务。\n"
+        "第二条 主管部门应当建立监督检查和风险处置机制。"
+    )
+    return {
+        "input_type": "text",
+        "raw_input": text,
+        "content_hash": "abcdef12",
+        "policy_id": policy_id,
+        "title": "主政策管理办法",
+        "source_url": source_url,
+        "text": text,
+        "metadata": {
+            "policy_id": policy_id,
+            "title": "主政策管理办法",
+            "source_url": source_url,
+        },
+        "chunks": [
+            {
+                "policy_id": policy_id,
+                "chunk_id": f"{policy_id}-S001-C001",
+                "content": text,
+            }
+        ],
+    }
+
+
+def _policy_payload_for_source(source_policy: dict[str, object]) -> dict[str, object]:
+    payload = _policy_payload()
+    payload["policy_identity"].update(
+        {
+            "policy_id": source_policy["policy_id"],
+            "title": source_policy["title"],
+            "source_url": source_policy["source_url"],
+        }
+    )
+    payload["evidence"][0]["policy_id"] = source_policy["policy_id"]
+    return payload
 
 
 if __name__ == "__main__":

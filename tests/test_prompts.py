@@ -32,6 +32,9 @@ class PromptTests(unittest.TestCase):
         self.assertIn("证据", rendered["system"])
         self.assertIn("不确定性", rendered["system"])
         self.assertIn("禁止输出买入", rendered["system"])
+        self.assertIn("policy_id 是系统控制字段", rendered["system"])
+        self.assertIn("逐字复制主政策元数据中的 policy_id", rendered["user"])
+        self.assertIn("不得把相似政策证据写入主政策 evidence", rendered["user"])
         self.assertIn('"policy_goals"', rendered["user"])
         self.assertIn('"target_entities"', rendered["user"])
         self.assertIn('"strength_assessment"', rendered["user"])
@@ -55,7 +58,11 @@ class PromptTests(unittest.TestCase):
         self.assertIn("合理性审查", rendered["system"])
         self.assertIn('"impact_id"', rendered["user"])
         self.assertIn("verification_status=web_fallback", rendered["system"])
+        self.assertIn("verification_status=identity_verified_code_profile", rendered["system"])
+        self.assertIn("get_company_info 仅作增强", rendered["system"])
         self.assertIn("confidence 不得超过 0.55", rendered["user"])
+        self.assertIn("Web fallback 则不得超过 0.40", rendered["user"])
+        self.assertIn("必须审阅输入中的每一个 evidence bundle", rendered["system"])
         self.assertIn("公司名称、代码和 impact_id 组合", rendered["user"])
 
     def test_company_seed_prompt_marks_every_proposal_unverified_and_path_scoped(self) -> None:
@@ -117,6 +124,12 @@ class PromptTests(unittest.TestCase):
         self.assertIn("不得输出公司章节", rendered["user"])
         self.assertIn("对于投资者而言", rendered["system"])
         self.assertIn("确定性趋势", rendered["system"])
+        self.assertIn("三阶段摘要契约", rendered["system"])
+        self.assertIn("订单、成本、收入结构、产能、资本开支和合规投入", rendered["system"])
+        self.assertIn("条件、传导环节、时间范围和不确定性", rendered["system"])
+        self.assertIn("可以在政策研究语境中使用", rendered["system"])
+        self.assertIn("只含审核白名单的确定性公司附录", rendered["user"])
+        self.assertIn("确定性收益", rendered["system"])
 
     def test_impact_analyst_prompt_includes_exact_json_contract(self) -> None:
         rendered = render_prompt(

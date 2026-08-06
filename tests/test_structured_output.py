@@ -182,6 +182,13 @@ class StructuredOutputTests(unittest.TestCase):
         with self.assertRaises(SafetyViolation):
             parse_structured_output(json.dumps(payload, ensure_ascii=False), "CompanyMatchOutput")
 
+    def test_structured_output_keeps_report_soft_terms_strictly_prohibited(self) -> None:
+        payload = _company_payload()
+        payload["companies"][0]["policy_link"] = "该政策对相关业务构成利好"
+
+        with self.assertRaises(SafetyViolation):
+            parse_structured_output(json.dumps(payload, ensure_ascii=False), "CompanyMatchOutput")
+
     def test_unsupported_schema_fails_clearly(self) -> None:
         with self.assertRaisesRegex(StructuredOutputError, "Unsupported structured output schema"):
             validate_structured_payload({}, "UnknownOutput")

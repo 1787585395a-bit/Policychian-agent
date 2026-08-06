@@ -63,3 +63,11 @@ python -m pytest tests/test_app.py -q
 - 下载检查：job 入口和 run_id 兼容入口均返回 200；响应为 JSON，带 `Content-Disposition`，Run ID 与状态接口一致。
 - 服务结束后确认 8010 不再 Listen。
 - 当前限制：浏览器控制插件在本次会话初始化失败，因此未完成真实浏览器点击、像素级布局和控制台错误检查；页面结构、交互契约和 HTTP/API 链路已由自动化测试与 8010 实际请求覆盖。
+
+## 2026-08-06 错误终态回归断言
+
+- 复现基线：`run-20260806T020232-ffad704b5aef` 已进入 `error`，错误框、Run ID、Agent 状态、回退情况和日志下载正常，但报告区仍残留“正在分析，请等待结果。”。
+- 修复断言：任务进入 `error` 后，`#report` 必须替换为“分析失败，未生成报告。”，且不再包含“正在分析”。
+- 保持断言：具体失败原因继续显示在 `#error-box`；Run ID、四个 Agent 状态、回退情况和失败日志下载继续由终态状态载荷渲染。
+- 回归边界：`pending` / `running` 期间仍显示“正在分析，请等待结果。”；`done` 仍优先渲染 `report_html`，仅在报告为空时显示“报告为空。”。
+- 自动化覆盖：`tests/test_app.py::AppTests::test_client_terminal_states_render_distinct_report_content` 同时锁定运行中、成功和失败三类报告区行为。

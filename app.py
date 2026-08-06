@@ -866,6 +866,7 @@ def render_page(
     }}
 
     function showError(message) {{
+      report.innerHTML = '<div class="empty">分析失败，未生成报告。</div>';
       errorBox.textContent = message;
       errorBox.classList.remove("hidden");
       statusLine.textContent = "分析失败";

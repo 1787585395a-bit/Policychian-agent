@@ -131,8 +131,9 @@ class AppTests(unittest.TestCase):
         self.assertIn("示例报告", html)
         self.assertIn("生成式人工智能服务管理暂行办法", html)
         self.assertIn("不构成任何投资建议", html)
-        self.assertIn("<blockquote>", html)
-        self.assertNotIn("&gt; 本页用于展示", html)
+        self.assertIn("IMP-005：未成年人保护相关服务", html)
+        self.assertIn("三六零（601360）", html)
+        self.assertIn("安恒信息（688023）", html)
         self.assertIn('href="/"', html)
 
     def test_http_handler_serves_example_report_page(self) -> None:
@@ -185,6 +186,23 @@ class AppTests(unittest.TestCase):
 
         self.assertIn("数据库不可用", html)
         self.assertIn('class="error"', html)
+
+    def test_client_terminal_states_render_distinct_report_content(self) -> None:
+        html = render_page().decode("utf-8")
+
+        self.assertIn(
+            "report.innerHTML = '<div class=\"empty\">正在分析，请等待结果。</div>';",
+            html,
+        )
+        self.assertIn(
+            "report.innerHTML = payload.report_html || '<div class=\"empty\">报告为空。</div>';",
+            html,
+        )
+        show_error_script = html.split("function showError(message)", maxsplit=1)[1].split(
+            "function escapeHtml(value)", maxsplit=1
+        )[0]
+        self.assertIn("分析失败，未生成报告。", show_error_script)
+        self.assertNotIn("正在分析", show_error_script)
 
     def test_run_query_can_explicitly_use_deterministic_fallback(self) -> None:
         result = run_query(DEFAULT_POLICY_INPUT, db_path=artifact_db_path("app_query"), use_llm=False)

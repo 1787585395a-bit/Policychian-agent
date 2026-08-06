@@ -397,6 +397,7 @@ def _run_web_first_company_matcher(
         state.industry_impacts,
         resolved_records,
         retrieval_by_impact=retrieval_by_impact,
+        semantic_prefilter=False,
     )
     whitelist_audit: list[dict[str, Any]] = []
     final_audit: list[dict[str, Any]] = []
@@ -433,6 +434,7 @@ def _run_web_first_company_matcher(
             ranked_records,
             top_k_per_industry=top_k_per_industry,
             retrieval_by_impact=retrieval_by_impact,
+            allow_weak_semantic_keep_low=True,
         )
         final_matches = list(audited_output.companies)
         final_coverage = list(getattr(audited_output, "_company_coverage", []))
@@ -449,6 +451,14 @@ def _run_web_first_company_matcher(
         final_coverage or rank_coverage,
         discovery_audit,
         identity_audit,
+    )
+    combined_audit = [*rank_audit, *whitelist_audit, *final_audit]
+    coverage = _annotate_web_first_coverage(
+        coverage,
+        identity_audit=identity_audit,
+        rank_audit=rank_audit,
+        whitelist_audit=whitelist_audit,
+        final_audit=final_audit,
     )
     uncertainties = _unique(
         [
@@ -468,7 +478,7 @@ def _run_web_first_company_matcher(
         output,
         candidates=ranked_records,
         coverage=coverage,
-        audit_logs=[*rank_audit, *whitelist_audit, *final_audit],
+        audit_logs=combined_audit,
     )
     return output
 
@@ -631,6 +641,7 @@ def _web_first_retrieval_statuses(
     precedence = (
         "web_fallback",
         "identity_conflict",
+        "web_fallback_exhausted",
         "cnfinancial_unavailable",
         "cnfinancial_error",
         "cnfinancial_empty",
@@ -673,11 +684,13 @@ def _finalize_web_first_coverage(
     reasons = {
         "discovery_error": "公司 discovery 或结构校验失败；Web-first 模式未回退到旧 CNFinancial-first 召回。",
         "web_empty": "Web discovery 未返回可规范化的明确公司身份线索。",
-        "cnfinancial_empty": "CNFinancial 精确名称/代码查询成功但返回空；按规则未启用 Web fallback。",
-        "cnfinancial_error": "CNFinancial 精确核验发生技术错误，且未形成满足双独立来源要求的 Web fallback。",
-        "cnfinancial_unavailable": "CNFinancial 精确核验不可用或熔断，且未形成满足双独立来源要求的 Web fallback。",
+        "cnfinancial_empty": "CNFinancial 精确查询返回空，且严格 Web fallback 未形成可靠身份与路径业务证据。",
+        "cnfinancial_error": "CNFinancial 精确核验发生技术错误，且严格 Web fallback 未形成可靠证据。",
+        "cnfinancial_unavailable": "CNFinancial 精确核验不可用或熔断，且严格 Web fallback 未形成可靠证据。",
+        "web_fallback_exhausted": "已启动严格 Web fallback，但独立来源、代码校验或路径业务证据不足。",
         "identity_conflict": "公司名称、代码或当前上市身份存在冲突，已永久否决该线索。",
         "business_rejected": "公司身份线索存在，但缺少与本路径特异产品或业务的可靠证据。",
+        "llm_not_selected": "公司已进入 LLM 逐路径评估池，但本轮未被模型选择进入最终审查清单。",
         "web_fallback": "CNFinancial 未完成交叉验证；仅由两处独立 Web 证据形成低置信业务匹配。",
         "selected": "已完成公司身份、业务证据和逐路径确定性审查。",
     }
@@ -690,11 +703,98 @@ def _finalize_web_first_coverage(
             status = "web_fallback" if "web_fallback" in identity_by_impact.get(impact_id, []) else "selected"
         else:
             status = str(item.get("retrieval_status") or "web_empty")
-            if status == "web_fallback" or "identity_verified" in identity_by_impact.get(impact_id, []):
+            if status == "web_fallback" or any(
+                reason in {
+                    "identity_verified",
+                    "identity_verified_search_profile",
+                    "identity_verified_code_profile",
+                    "alias_code_merged",
+                }
+                for reason in identity_by_impact.get(impact_id, [])
+            ):
                 status = "business_rejected"
         item["retrieval_status"] = status
         item["coverage_status"] = status
-        item["no_match_reason"] = "" if status == "selected" else reasons.get(status, item.get("no_match_reason") or "")
+        item["no_match_reason"] = (
+            "" if int(item.get("passed_count") or 0) > 0 else reasons.get(status, item.get("no_match_reason") or "")
+        )
+    return coverage
+
+
+def _annotate_web_first_coverage(
+    coverage: list[dict[str, Any]],
+    *,
+    identity_audit: list[dict[str, Any]],
+    rank_audit: list[dict[str, Any]],
+    whitelist_audit: list[dict[str, Any]],
+    final_audit: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    hard_veto_reasons = {
+        "identity_conflict",
+        "non_current_a_share_code",
+        "non_current_a_share_identity",
+        "path_provenance_mismatch",
+        "llm_company_not_whitelisted",
+        "llm_identity_not_whitelisted",
+        "llm_path_not_whitelisted",
+        "explicit_business_contradiction",
+    }
+    for item in coverage:
+        impact_id = str(item.get("impact_id") or "")
+        scoped_identity = [entry for entry in identity_audit if str(entry.get("impact_id") or "") == impact_id]
+        scoped_rank = [entry for entry in rank_audit if str(entry.get("impact_id") or "") == impact_id]
+        scoped_whitelist = [entry for entry in whitelist_audit if str(entry.get("impact_id") or "") == impact_id]
+        scoped_final = [entry for entry in final_audit if str(entry.get("impact_id") or "") == impact_id]
+        fallback_entries = [
+            entry
+            for entry in scoped_identity
+            if str(entry.get("fallback_status") or "") in {"verified", "exhausted"}
+        ]
+        item["identity_verified_count"] = sum(
+            1 for entry in scoped_identity if str(entry.get("status") or "") == "verified"
+        )
+        item["fallback_required_count"] = len(fallback_entries)
+        item["fallback_started_count"] = len(fallback_entries)
+        item["fallback_verified_count"] = sum(
+            1 for entry in fallback_entries if str(entry.get("fallback_status") or "") == "verified"
+        )
+        item["fallback_exhausted_count"] = sum(
+            1 for entry in fallback_entries if str(entry.get("fallback_status") or "") == "exhausted"
+        )
+        item["llm_input_count"] = sum(
+            1 for entry in scoped_rank if str(entry.get("reason_code") or "") == "llm_input"
+        )
+        item["llm_not_selected_count"] = sum(
+            1 for entry in scoped_whitelist if str(entry.get("reason_code") or "") == "llm_not_selected"
+        )
+        item["weak_keep_count"] = sum(
+            1
+            for entry in scoped_final
+            if str(entry.get("reason_code") or "")
+            in {"weak_semantic_keep_low", "web_weak_semantic_keep_low"}
+        )
+        item["hard_veto_count"] = sum(
+            1
+            for entry in [*scoped_identity, *scoped_whitelist, *scoped_final]
+            if str(entry.get("reason_code") or "") in hard_veto_reasons
+        )
+        item["cap_trimmed_count"] = sum(
+            1 for entry in scoped_final if str(entry.get("reason_code") or "") == "cap_trimmed"
+        )
+        item["final_count"] = int(item.get("passed_count") or 0)
+        if not item["final_count"] and item["llm_not_selected_count"]:
+            item["retrieval_status"] = "llm_not_selected"
+            item["coverage_status"] = "llm_not_selected"
+            item["no_match_reason"] = "公司已进入 LLM 逐路径评估池，但本轮未被模型选择进入最终清单。"
+        record_event(
+            "company.final_count",
+            stage="company_matcher",
+            status="ok" if item["final_count"] else "empty",
+            impact_id=impact_id,
+            final_count=item["final_count"],
+            cap_trimmed_count=item["cap_trimmed_count"],
+            llm_not_selected_count=item["llm_not_selected_count"],
+        )
     return coverage
 
 
@@ -710,7 +810,13 @@ def _verified_company_evaluation_bundles(
         }
         for index, impact in enumerate(industry_impacts, start=1)
     }
-    accepted_statuses = {"identity_verified", "web_fallback"}
+    accepted_statuses = {
+        "identity_verified",
+        "identity_verified_search_profile",
+        "identity_verified_code_profile",
+        "alias_code_merged",
+        "web_fallback",
+    }
     accepted_bundles = [
         item
         for item in evidence_bundles
@@ -811,9 +917,15 @@ def _render_verified_company_evaluation_prompt(
     ]
     prompt: dict[str, str] = {}
     compact_bundles: list[dict[str, Any]] = []
-    for text_limit, evidence_limit in ((240, 2), (140, 1), (80, 1), (40, 1)):
+    for text_limit, evidence_limit, minimal in (
+        (240, 2, False),
+        (140, 1, False),
+        (80, 1, False),
+        (80, 1, True),
+        (40, 1, True),
+    ):
         compact_bundles = [
-            _compact_verified_evaluation_bundle(item, text_limit, evidence_limit)
+            _compact_verified_evaluation_bundle(item, text_limit, evidence_limit, minimal=minimal)
             for item in evaluation_bundles
         ]
         prompt = render_prompt(
@@ -849,6 +961,8 @@ def _compact_verified_evaluation_bundle(
     bundle: dict[str, Any],
     text_limit: int,
     evidence_limit: int,
+    *,
+    minimal: bool = False,
 ) -> dict[str, Any]:
     def compact_payload(items: list[dict[str, Any]]) -> list[str]:
         return [_clip_prompt(_json_compact(item), text_limit) for item in items[:evidence_limit]]
@@ -858,18 +972,10 @@ def _compact_verified_evaluation_bundle(
         compact = _compact_web_evidence_for_prompt(item, text_limit)
         compact["tool_call_id"] = str(item.get("tool_call_id") or "")
         compact_web.append(compact)
-    return {
+    compact = {
         "impact_id": str(bundle.get("impact_id") or ""),
         "identity": dict(bundle.get("identity") or {}),
         "verification_status": str(bundle.get("verification_status") or ""),
-        "path": {
-            "industry": _clip_prompt((bundle.get("path") or {}).get("industry"), text_limit),
-            "chain_segment": _clip_prompt((bundle.get("path") or {}).get("chain_segment"), text_limit),
-            "business_variables": [
-                _clip_prompt(value, text_limit)
-                for value in ((bundle.get("path") or {}).get("business_variables") or [])[:4]
-            ],
-        },
         "path_specific_business": _clip_prompt(bundle.get("path_specific_business"), text_limit),
         "negative_evidence": [
             _clip_prompt(value, text_limit) for value in (bundle.get("negative_evidence") or [])[:3]
@@ -882,6 +988,23 @@ def _compact_verified_evaluation_bundle(
         "web_evidence": compact_web,
         "provenance": dict(bundle.get("provenance") or {}),
     }
+    if minimal:
+        compact["negative_evidence"] = compact["negative_evidence"][:1]
+        compact.pop("cnfinancial_info_evidence", None)
+        compact.pop("cnfinancial_profile_evidence", None)
+        compact.pop("tool_status", None)
+        if not compact_web:
+            compact.pop("web_evidence", None)
+        return compact
+    compact["path"] = {
+        "industry": _clip_prompt((bundle.get("path") or {}).get("industry"), text_limit),
+        "chain_segment": _clip_prompt((bundle.get("path") or {}).get("chain_segment"), text_limit),
+        "business_variables": [
+            _clip_prompt(value, text_limit)
+            for value in ((bundle.get("path") or {}).get("business_variables") or [])[:4]
+        ],
+    }
+    return compact
 
 
 def _whitelist_company_evaluation_output(
@@ -949,6 +1072,41 @@ def _whitelist_company_evaluation_output(
         if decision == "accepted":
             seen.add(key)
             accepted.append(match)
+    for record in ranked_records:
+        company_name = str(record.get("company_name") or "")
+        stock_code = str(record.get("stock_code") or "")
+        for impact_id in _unique(str(value or "") for value in (record.get("impact_ids") or [])):
+            key = (impact_id, company_name, stock_code)
+            if key in seen:
+                continue
+            provenance = next(
+                (
+                    item
+                    for item in (record.get("provenance") or [])
+                    if isinstance(item, dict) and str(item.get("impact_id") or "") == impact_id
+                ),
+                {},
+            )
+            entry = {
+                "impact_id": impact_id,
+                "company_name": company_name,
+                "stock_code": stock_code,
+                "decision": "not_selected",
+                "reason_code": "llm_not_selected",
+                "seed_id": str(provenance.get("seed_id") or ""),
+                "tool_call_id": str(provenance.get("tool_call_id") or ""),
+                "source": "llm_company_evaluation",
+                "cache_hit": False,
+                "url": str(record.get("source_url") or ""),
+                "date": str(record.get("data_date") or ""),
+            }
+            audit.append(entry)
+            record_event(
+                "company.audit",
+                stage="company_matcher",
+                status="not_selected",
+                **{field: value for field, value in entry.items() if field != "decision"},
+            )
     uncertainties = list(output.uncertainties)
     rejected_count = sum(1 for item in audit if item["decision"] == "rejected")
     if rejected_count:
@@ -1234,8 +1392,15 @@ def _rank_verified_company_records(
     company_records: list[dict[str, Any]],
     *,
     retrieval_by_impact: dict[str, dict[str, Any]],
+    semantic_prefilter: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     identity_verified = [record for record in company_records if _record_identity_is_verified(record)]
+    if not semantic_prefilter:
+        return _rank_verified_records_for_llm(
+            industry_impacts,
+            identity_verified,
+            retrieval_by_impact=retrieval_by_impact,
+        )
     matches, coverage, audit_logs = match_candidate_records_to_impacts(
         industry_impacts,
         identity_verified,
@@ -1321,6 +1486,129 @@ def _rank_verified_company_records(
             rank=included_rank,
         )
     return ranked, coverage, audit_logs
+
+
+def _rank_verified_records_for_llm(
+    industry_impacts: list[dict[str, Any]],
+    identity_verified: list[dict[str, Any]],
+    *,
+    retrieval_by_impact: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    selected_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
+    audit_logs: list[dict[str, Any]] = []
+    coverage: list[dict[str, Any]] = []
+
+    for impact_index, impact in enumerate(industry_impacts, start=1):
+        impact_id = str(impact.get("impact_id") or f"IMP-{impact_index:03d}")
+        scoped_records = [record for record in identity_verified if _record_is_for_impact(record, impact_id)]
+        selected_count = 0
+        seen_identities: set[tuple[str, str]] = set()
+        rejected_count = 0
+        for record in scoped_records:
+            identity_key = _record_identity(record)
+            if identity_key in seen_identities:
+                continue
+            seen_identities.add(identity_key)
+            business_text = str(
+                (record.get("business_evidence_by_impact") or {}).get(impact_id)
+                or record.get("business_evidence")
+                or record.get("matched_business")
+                or ""
+            ).strip()
+            provenance = next(
+                (
+                    item
+                    for item in (record.get("provenance") or [])
+                    if isinstance(item, dict)
+                    and str(item.get("impact_id") or "") == impact_id
+                    and any(item.get(field) for field in ("tool", "tool_call_id", "source_type"))
+                ),
+                None,
+            )
+            if not business_text:
+                decision = "reject"
+                reason_code = "pre_llm_missing_business_evidence"
+            elif provenance is None:
+                decision = "reject"
+                reason_code = "pre_llm_missing_provenance"
+            else:
+                decision = "accepted"
+                reason_code = "llm_input"
+                selected_count += 1
+                target = selected_by_identity.setdefault(identity_key, {**record, "impact_ids": [], "provenance": []})
+                target["impact_ids"] = _unique([*(target.get("impact_ids") or []), impact_id])
+                target["provenance"] = [
+                    *(target.get("provenance") or []),
+                    *[
+                        item
+                        for item in (record.get("provenance") or [])
+                        if not isinstance(item, dict) or str(item.get("impact_id") or "") == impact_id
+                    ],
+                ]
+            if decision == "reject":
+                rejected_count += 1
+            entry = {
+                "impact_id": impact_id,
+                "company_name": str(record.get("company_name") or ""),
+                "stock_code": str(record.get("stock_code") or ""),
+                "decision": decision,
+                "reason_code": reason_code,
+                "confidence": 0.0,
+                "shared_terms": [],
+            }
+            audit_logs.append(entry)
+            provenance_item = provenance or {}
+            event_payload = {
+                "stage": "company_matcher",
+                "status": decision,
+                "seed_id": str(provenance_item.get("seed_id") or ""),
+                "impact_id": impact_id,
+                "tool_call_id": str(provenance_item.get("tool_call_id") or ""),
+                "reason_code": reason_code,
+                "cache_hit": False,
+                "source": str(provenance_item.get("source_type") or "llm_input"),
+                "url": str(record.get("source_url") or ""),
+                "date": str(record.get("data_date") or ""),
+                "company_name": str(record.get("company_name") or ""),
+                "stock_code": str(record.get("stock_code") or ""),
+                "confidence": 0.0,
+            }
+            record_event("company.audit", **event_payload)
+            record_event(
+                "company.rank",
+                **event_payload,
+                rank=selected_count if decision == "accepted" else None,
+            )
+
+        retrieval = dict(retrieval_by_impact.get(impact_id) or {})
+        coverage.append(
+            {
+                "impact_id": impact_id,
+                "industry": str(impact.get("industry") or ""),
+                "policy_measure": str(impact.get("policy_measure") or ""),
+                "implementation_action": str(impact.get("implementation_action") or ""),
+                "chain_segment": str(impact.get("chain_segment") or ""),
+                "business_variables": list(impact.get("business_variables") or []),
+                "affected_company_types": list(impact.get("affected_company_types") or []),
+                "candidate_count": len(scoped_records),
+                "passed_count": selected_count,
+                "rejected_count": rejected_count,
+                "company_names": [
+                    str(record.get("company_name") or "")
+                    for record in selected_by_identity.values()
+                    if impact_id in (record.get("impact_ids") or [])
+                ],
+                "retrieval_status": str(retrieval.get("status") or ("ok" if scoped_records else "empty")),
+                "retrieval_error": str(retrieval.get("error") or ""),
+                "retrieval_queries": list(retrieval.get("query_terms") or []),
+                "retrieval_query_count": int(retrieval.get("query_count") or 0),
+                "retrieval_skipped_queries": list(retrieval.get("skipped_queries") or []),
+                "retrieval_skipped_query_count": int(retrieval.get("skipped_query_count") or 0),
+                "retrieval_channel_statuses": dict(retrieval.get("channel_statuses") or {}),
+                "no_match_reason": "" if selected_count else "缺少可回溯的公司业务资料或 provenance。",
+            }
+        )
+    return list(selected_by_identity.values()), coverage, audit_logs
 
 
 def _record_identity_is_verified(record: dict[str, Any]) -> bool:

@@ -17,7 +17,7 @@ from policychain.tools.mcp_tools import candidate_retrieval_statuses, mcp_unavai
 
 MATCH_LEVELS = ("high", "medium", "low")
 DEFAULT_MAX_COMPANIES_PER_IMPACT = 3
-MAX_COMPANIES_PER_IMPACT = 4
+MAX_COMPANIES_PER_IMPACT = 3
 
 DOMAIN_TERMS = (
     "钢铁",
@@ -206,6 +206,7 @@ def audit_company_match_output(
     candidate_records: list[dict[str, Any]],
     top_k_per_industry: int = DEFAULT_MAX_COMPANIES_PER_IMPACT,
     retrieval_by_impact: dict[str, dict[str, Any]] | None = None,
+    allow_weak_semantic_keep_low: bool = False,
 ) -> CompanyMatchOutput:
     """Bind LLM company matches to concrete impact paths and audit relevance."""
 
@@ -243,6 +244,8 @@ def audit_company_match_output(
         else:
             impact_index, impact = _best_impact_for_match(match, record or {}, industry_impacts)
         status = _audit_candidate_against_impact(record or _company_match_as_record(match), impact)
+        if allow_weak_semantic_keep_low:
+            status = _weak_semantic_keep_low_status(match, record or {}, impact, status)
         audited_match = _apply_audit(match, impact_index, impact, status)
         audit_logs.append(_audit_log_entry(audited_match, status, impact_index, impact))
         if status["decision"] == "reject":
@@ -253,6 +256,8 @@ def audit_company_match_output(
         impact_id = _impact_id(impact_index)
         scoped = sorted(matches_by_impact.get(impact_id, []), key=lambda item: item.confidence, reverse=True)
         audited.extend(scoped[:top_k_per_industry])
+        for trimmed in scoped[top_k_per_industry:]:
+            _mark_company_audit_cap_trimmed(audit_logs, trimmed)
 
     coverage = _build_coverage_matrix(
         industry_impacts=industry_impacts,
@@ -359,9 +364,8 @@ def _audit_candidate_against_impact(record: dict[str, Any], impact: dict[str, An
         not record.get("web_fallback_impacts") or impact_id in (record.get("web_fallback_impacts") or [])
     )
     shared_terms = _shared_terms(company_text, impact_text)
-    if web_fallback:
-        verified_terms = (record.get("verified_path_terms_by_impact") or {}).get(impact_id) or []
-        shared_terms = _unique([*shared_terms, *verified_terms])
+    verified_terms = (record.get("verified_path_terms_by_impact") or {}).get(impact_id) or []
+    shared_terms = _unique([*shared_terms, *verified_terms])
     specific_shared_terms = [term for term in shared_terms if not _is_generic_shared_term(term)]
     has_business_evidence = bool(str(record.get("business_evidence") or record.get("matched_business") or "").strip())
     source_tool = str(record.get("candidate_source_tool") or "")
@@ -371,6 +375,7 @@ def _audit_candidate_against_impact(record: dict[str, Any], impact: dict[str, An
     if not record.get("company_name"):
         return {
             "decision": "reject",
+            "reason_code": "missing_company_name",
             "match_level": "low",
             "confidence": 0.0,
             "reason": "候选记录缺少公司名称。",
@@ -378,9 +383,22 @@ def _audit_candidate_against_impact(record: dict[str, Any], impact: dict[str, An
             "negative_evidence": ["候选记录缺少公司名称。"],
         }
 
+    explicit_contradiction = _explicit_business_contradiction(record)
+    if explicit_contradiction:
+        return {
+            "decision": "reject",
+            "reason_code": "explicit_business_contradiction",
+            "match_level": "low",
+            "confidence": 0.0,
+            "reason": "业务资料含有与该路径明确冲突或明确不相关的陈述，不能作为匹配保留。",
+            "shared_terms": shared_terms,
+            "negative_evidence": [explicit_contradiction],
+        }
+
     if _is_web_only_candidate(record):
         return {
             "decision": "reject",
+            "reason_code": "web_only_candidate",
             "match_level": "low",
             "confidence": min(confidence, 0.2),
             "reason": "候选仅来自 Web 结果，不能进入 CNFinancial A 股候选白名单。",
@@ -399,6 +417,7 @@ def _audit_candidate_against_impact(record: dict[str, Any], impact: dict[str, An
         negative_evidence.append("公司与路径仅共享服务、制造、电力等泛化词，缺少路径特异产品或业务交集。")
         return {
             "decision": "reject",
+            "reason_code": "generic_only",
             "match_level": "low",
             "confidence": min(confidence, 0.3),
             "reason": "服务、制造、电力等泛化词不能单独支撑公司业务匹配。",
@@ -409,6 +428,7 @@ def _audit_candidate_against_impact(record: dict[str, Any], impact: dict[str, An
     if not shared_terms and not has_business_evidence:
         return {
             "decision": "reject",
+            "reason_code": "missing_business_and_intersection",
             "match_level": "low",
             "confidence": min(confidence, 0.25),
             "reason": "仅有行业或概念线索，缺少业务交集和业务证据。",
@@ -416,9 +436,21 @@ def _audit_candidate_against_impact(record: dict[str, Any], impact: dict[str, An
             "negative_evidence": negative_evidence,
         }
 
+    if not has_business_evidence:
+        return {
+            "decision": "reject",
+            "reason_code": "missing_business_evidence",
+            "match_level": "low",
+            "confidence": min(confidence, 0.3),
+            "reason": "缺少可回溯的主营业务、产品服务、公告或官网业务资料。",
+            "shared_terms": shared_terms,
+            "negative_evidence": negative_evidence,
+        }
+
     if not shared_terms:
         return {
             "decision": "reject",
+            "reason_code": "no_shared_terms",
             "match_level": "low",
             "confidence": min(confidence, 0.35),
             "reason": "有业务资料但未能直接对应该行业路径，剔除该路径下的公司匹配。",
@@ -429,6 +461,7 @@ def _audit_candidate_against_impact(record: dict[str, Any], impact: dict[str, An
     if source_tool in WEAK_SOURCE_TOOLS and len(shared_terms) < 2:
         return {
             "decision": "keep_low",
+            "reason_code": "weak_source_keep_low",
             "match_level": "low",
             "confidence": min(confidence, 0.55),
             "reason": "公司来自关键词补充搜索，业务交集较弱，不能提升为中高置信。",
@@ -450,12 +483,89 @@ def _audit_candidate_against_impact(record: dict[str, Any], impact: dict[str, An
 
     return {
         "decision": "passed",
+        "reason_code": "strong_business_intersection",
         "match_level": _match_level(confidence),
         "confidence": confidence,
         "reason": f"公司业务证据与路径关键词存在交集：{', '.join(shared_terms[:5])}。",
         "shared_terms": shared_terms,
         "negative_evidence": negative_evidence,
     }
+
+
+def _weak_semantic_keep_low_status(
+    match: CompanyMatch,
+    record: dict[str, Any],
+    impact: dict[str, Any],
+    status: dict[str, Any],
+) -> dict[str, Any]:
+    if str(status.get("decision") or "") != "reject":
+        return status
+    if str(status.get("reason_code") or "") not in {"generic_only", "no_shared_terms"}:
+        return status
+    impact_id = str(impact.get("impact_id") or match.impact_id or "")
+    business_text = str(
+        (record.get("business_evidence_by_impact") or {}).get(impact_id)
+        or record.get("business_evidence")
+        or record.get("matched_business")
+        or ""
+    ).strip()
+    provenance = [
+        item
+        for item in (record.get("provenance") or [])
+        if isinstance(item, dict)
+        and (not impact_id or str(item.get("impact_id") or "") == impact_id)
+        and any(item.get(field) for field in ("tool", "tool_call_id", "source_type"))
+    ]
+    explicit_conflict = _explicit_business_contradiction(record, match.negative_evidence)
+    if not business_text or not provenance or explicit_conflict or _is_web_only_candidate(record):
+        return status
+    configured_cap = record.get("confidence_cap")
+    try:
+        record_cap = float(configured_cap) if configured_cap not in (None, "") else 0.92
+    except (TypeError, ValueError):
+        record_cap = 0.92
+    web_fallback = bool(record.get("web_fallback_verified")) and (
+        not record.get("web_fallback_impacts")
+        or impact_id in (record.get("web_fallback_impacts") or [])
+    )
+    confidence_cap = 0.40 if web_fallback else 0.45
+    return {
+        "decision": "keep_low",
+        "reason_code": "web_weak_semantic_keep_low" if web_fallback else "weak_semantic_keep_low",
+        "match_level": "low",
+        "confidence": min(float(match.confidence), record_cap, confidence_cap),
+        "reason": "模型在身份与路径白名单内选择该公司；存在可回溯业务资料且无明确反面冲突，但词面交集较弱，固定保留为低置信。",
+        "shared_terms": list(status.get("shared_terms") or []),
+        "negative_evidence": _unique(
+            [
+                *list(status.get("negative_evidence") or []),
+                "业务与政策路径的词面交集较弱，仅保留为低置信研究线索。",
+            ]
+        ),
+    }
+
+
+def _explicit_business_contradiction(
+    record: dict[str, Any],
+    extra_negative_evidence: list[str] | None = None,
+) -> str:
+    impact_specific_business = " ".join(
+        str(value)
+        for value in (record.get("business_evidence_by_impact") or {}).values()
+        if value
+    )
+    negative_text = " ".join(
+        [
+            impact_specific_business,
+            *(str(value) for value in (record.get("negative_evidence") or [])),
+            *(str(value) for value in (extra_negative_evidence or [])),
+        ]
+    )
+    match = re.search(
+        r"明确不相关|业务不匹配|与.{0,12}无关|不涉及|未开展|不包含|不包括|未布局|不生产|未从事|已退出|停止经营|终止经营|否认.{0,12}业务|不存在相关",
+        negative_text,
+    )
+    return match.group(0) if match else ""
 
 
 def _confidence(
@@ -543,6 +653,7 @@ def _build_coverage_matrix(
         scoped_audits = [item for item in audit_logs if item.get("impact_id") == impact_id]
         scoped_candidates = [record for record in candidate_records if _candidate_is_for_impact(record, impact_id)]
         rejected_count = sum(1 for item in scoped_audits if item.get("decision") == "reject")
+        cap_trimmed_count = sum(1 for item in scoped_audits if item.get("reason_code") == "cap_trimmed")
         retrieval = dict((retrieval_by_impact or {}).get(impact_id) or {})
         retrieval_status = str(retrieval.get("status") or ("ok" if scoped_candidates else "empty"))
         no_match_reason = ""
@@ -566,7 +677,9 @@ def _build_coverage_matrix(
                 "affected_company_types": list(impact.get("affected_company_types") or []),
                 "candidate_count": len(scoped_candidates),
                 "passed_count": len(scoped_matches),
+                "final_count": len(scoped_matches),
                 "rejected_count": rejected_count,
+                "cap_trimmed_count": cap_trimmed_count,
                 "company_names": [match.company_name for match in scoped_matches],
                 "retrieval_status": retrieval_status,
                 "retrieval_error": str(retrieval.get("error") or ""),
@@ -603,6 +716,29 @@ def _audit_log_entry(
     }
     record_event("rule.company_audit", stage="company_matcher", status=str(status["decision"]), **entry)
     return entry
+
+
+def _mark_company_audit_cap_trimmed(
+    audit_logs: list[dict[str, Any]],
+    match: CompanyMatch,
+) -> None:
+    for entry in reversed(audit_logs):
+        if (
+            str(entry.get("impact_id") or "") == match.impact_id
+            and str(entry.get("company_name") or "") == match.company_name
+            and str(entry.get("stock_code") or "") == match.stock_code
+            and str(entry.get("decision") or "") != "reject"
+        ):
+            entry["decision"] = "trimmed"
+            entry["reason_code"] = "cap_trimmed"
+            entry["reason"] = "该公司已通过证据审查，但因每条影响路径最多保留 3 家而未进入最终清单。"
+            record_event(
+                "rule.company_audit",
+                stage="company_matcher",
+                status="trimmed",
+                **entry,
+            )
+            return
 
 
 def _audit_tool_logs(coverage: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -10,7 +10,11 @@ from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
-from policychain.safety import assert_no_investment_advice
+from policychain.safety import (
+    REPORT_WRITER_SAFETY_PROFILE,
+    STRICT_SAFETY_PROFILE,
+    assert_no_investment_advice,
+)
 from policychain.observability import record_event
 
 
@@ -49,11 +53,28 @@ class MockLLMClient:
         self.model = model
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
+        return self.generate_with_safety_profile(
+            system_prompt,
+            user_prompt,
+            safety_profile=STRICT_SAFETY_PROFILE,
+        )
+
+    def generate_with_safety_profile(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        safety_profile: str,
+    ) -> str:
         if not system_prompt.strip():
             raise ValueError("system_prompt is required")
         if not user_prompt.strip():
             raise ValueError("user_prompt is required")
-        assert_no_investment_advice(self.response, context="LLM response")
+        assert_no_investment_advice(
+            self.response,
+            context="LLM response",
+            profile=safety_profile,
+        )
         return self.response
 
     def generate_with_metadata(self, system_prompt: str, user_prompt: str) -> LLMGeneration:
@@ -119,6 +140,19 @@ class DeepSeekClient:
         )
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
+        return self.generate_with_safety_profile(
+            system_prompt,
+            user_prompt,
+            safety_profile=STRICT_SAFETY_PROFILE,
+        )
+
+    def generate_with_safety_profile(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        safety_profile: str,
+    ) -> str:
         if not system_prompt.strip():
             raise ValueError("system_prompt is required")
         if not user_prompt.strip():
@@ -148,7 +182,11 @@ class DeepSeekClient:
             raise LLMProviderError("DeepSeek API returned invalid JSON") from exc
 
         text = _extract_chat_completion_text(response_payload)
-        assert_no_investment_advice(text, context="DeepSeek response")
+        assert_no_investment_advice(
+            text,
+            context="DeepSeek response",
+            profile=safety_profile,
+        )
         return text
 
     def generate_with_metadata(self, system_prompt: str, user_prompt: str) -> LLMGeneration:
@@ -218,7 +256,15 @@ def observed_llm_generate(
         user_prompt=user_prompt,
     )
     try:
-        response = client.generate(system_prompt, user_prompt)
+        profile_aware_generate = getattr(client, "generate_with_safety_profile", None)
+        if agent == "report_writer" and callable(profile_aware_generate):
+            response = profile_aware_generate(
+                system_prompt,
+                user_prompt,
+                safety_profile=REPORT_WRITER_SAFETY_PROFILE,
+            )
+        else:
+            response = client.generate(system_prompt, user_prompt)
     except Exception as exc:
         record_event(
             "llm.call.end",

@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from policychain.mcp import FakeMCPInvoker, MCPToolError
+from policychain.mcp import FakeMCPInvoker, MCPToolCircuitOpen, MCPToolError, MCPToolUnavailable
 from policychain.tools.mcp_tools import (
     CNFINANCIAL_SERVER,
     OPEN_WEBSEARCH_SEARCH_TOOL,
@@ -15,12 +15,324 @@ from policychain.tools.mcp_tools import (
     fetch_web_content,
     merge_react_company_candidates,
     resolve_company_seeds,
+    resolve_web_first_company_seeds,
     search_web,
     _candidate_stock_search_terms,
+    _invoke_with_log,
 )
 
 
 class MCPToolsTests(unittest.TestCase):
+    def test_web_first_code_search_and_profile_verify_identity_for_every_info_terminal_state(self) -> None:
+        impacts = [
+            {"impact_id": "IMP-001", "industry": "网络安全", "chain_segment": "安全产品"},
+            {"impact_id": "IMP-002", "industry": "安全服务", "chain_segment": "安全服务"},
+        ]
+        seeds = [
+            {
+                "seed_id": f"seed-{impact_id}",
+                "impact_id": impact_id,
+                "proposed_name": "北京安博通科技股份有限公司",
+                "historical_names": ["安博通"],
+                "proposed_stock_code": "688168",
+                "seed_reason": "网络安全业务",
+                "origin_channels": ["llm"],
+            }
+            for impact_id in ("IMP-001", "IMP-002")
+        ]
+
+        def error_info(**_kwargs):
+            raise MCPToolError("info error")
+
+        def unavailable_info(**_kwargs):
+            raise MCPToolUnavailable("info unavailable")
+
+        def circuit_info(**_kwargs):
+            raise MCPToolCircuitOpen("info circuit open")
+
+        for label, info_response in (
+            ("empty", []),
+            ("error", error_info),
+            ("unavailable", unavailable_info),
+            ("circuit_open", circuit_info),
+        ):
+            with self.subTest(info_terminal=label):
+                invoker = FakeMCPInvoker(
+                    {
+                        (CNFINANCIAL_SERVER, "search_stock"): [
+                            {"company_name": "安博通", "stock_code": "688168"}
+                        ],
+                        (CNFINANCIAL_SERVER, "get_company_profile"): [
+                            {
+                                "stock_code": "688168",
+                                "main_business": "网络安全产品、平台与安全服务",
+                                "data_date": "2025",
+                            }
+                        ],
+                        (CNFINANCIAL_SERVER, "get_company_info"): info_response,
+                    }
+                )
+
+                candidates, audit, _bundles = resolve_web_first_company_seeds(
+                    seeds,
+                    impacts,
+                    [],
+                    invoker=invoker,
+                )
+
+                self.assertEqual(len(candidates), 1)
+                self.assertEqual(candidates[0]["identity_verification"], "cnfinancial_code_profile")
+                self.assertEqual(candidates[0]["impact_ids"], ["IMP-001", "IMP-002"])
+                self.assertTrue(all(item["status"] == "verified" for item in audit))
+                self.assertTrue(all(item["fallback_status"] == "not_required" for item in audit))
+                self.assertEqual(
+                    [(call["tool_name"], call["arguments"]) for call in invoker.calls],
+                    [
+                        ("search_stock", {"keyword": "688168"}),
+                        ("get_company_profile", {"symbol": "688168"}),
+                        ("get_company_info", {"symbol": "688168"}),
+                    ],
+                )
+
+    def test_web_first_all_non_conflict_cnfinancial_terminal_states_attempt_strict_web_fallback(self) -> None:
+        seed = {
+            "seed_id": "seed-fallback",
+            "impact_id": "IMP-001",
+            "proposed_name": "海膜科技",
+            "historical_names": [],
+            "proposed_stock_code": "300123",
+            "seed_reason": "反渗透膜业务",
+            "origin_channels": ["llm"],
+        }
+        impact = {
+            "impact_id": "IMP-001",
+            "industry": "海水淡化反渗透膜",
+            "chain_segment": "反渗透膜",
+            "business_variables": ["反渗透膜需求"],
+        }
+        web_evidence = [
+            {
+                "impact_id": "IMP-001",
+                "source_url": "https://one.example/notice/300123",
+                "source_org": "第一交易所",
+                "title": "证券代码与主营业务公告",
+                "summary": "海膜科技 300123 为上市公司，主营反渗透膜组件。",
+                "raw_payload": {"company_name": "海膜科技", "stock_code": "300123"},
+            },
+            {
+                "impact_id": "IMP-001",
+                "source_url": "https://two.example/company/300123",
+                "source_org": "海膜科技官网",
+                "title": "公司业务介绍",
+                "summary": "海膜科技股票代码 300123，核心产品为海水淡化反渗透膜。",
+                "raw_payload": {"company_name": "海膜科技", "stock_code": "300123"},
+            },
+        ]
+
+        def error(**_kwargs):
+            raise MCPToolError("terminal error")
+
+        def unavailable(**_kwargs):
+            raise MCPToolUnavailable("terminal unavailable")
+
+        for label, terminal in (("empty", []), ("error", error), ("unavailable", unavailable)):
+            with self.subTest(terminal=label):
+                invoker = FakeMCPInvoker(
+                    {
+                        (CNFINANCIAL_SERVER, "search_stock"): terminal,
+                        (CNFINANCIAL_SERVER, "get_company_profile"): terminal,
+                        (CNFINANCIAL_SERVER, "get_company_info"): terminal,
+                    }
+                )
+
+                candidates, audit, bundles = resolve_web_first_company_seeds(
+                    [seed],
+                    [impact],
+                    web_evidence,
+                    invoker=invoker,
+                )
+
+                self.assertEqual(len(candidates), 1)
+                self.assertTrue(candidates[0]["web_fallback_verified"])
+                self.assertEqual(candidates[0]["confidence_cap"], 0.55)
+                self.assertEqual(audit[-1]["reason_code"], "web_fallback")
+                self.assertEqual(audit[-1]["fallback_status"], "verified")
+                self.assertEqual(bundles[-1]["status"], "web_fallback")
+
+    def test_web_first_legal_full_name_accepts_verified_exact_short_alias_and_caches_enrichment(self) -> None:
+        cases = (
+            ("北京安博通科技股份有限公司", "安博通", "688168"),
+            ("杭州安恒信息技术股份有限公司", "安恒信息", "688023"),
+        )
+        impacts = [
+            {
+                "impact_id": "IMP-001",
+                "industry": "网络安全",
+                "chain_segment": "安全产品",
+                "business_variables": ["安全产品需求"],
+            },
+            {
+                "impact_id": "IMP-002",
+                "industry": "网络安全服务",
+                "chain_segment": "安全服务",
+                "business_variables": ["安全服务需求"],
+            },
+        ]
+
+        for legal_name, short_name, code in cases:
+            with self.subTest(company=short_name):
+                seeds = [
+                    {
+                        "seed_id": f"seed-{impact_id}",
+                        "impact_id": impact_id,
+                        "proposed_name": legal_name,
+                        "historical_names": [short_name],
+                        "proposed_stock_code": code,
+                        "seed_reason": "公开资料显示公司从事网络安全业务。",
+                        "origin_channels": ["llm"],
+                    }
+                    for impact_id in ("IMP-001", "IMP-002")
+                ]
+
+                def search_stock(*, arguments, **_kwargs):
+                    if arguments == {"keyword": legal_name}:
+                        return []
+                    if arguments == {"keyword": short_name}:
+                        return [{"company_name": short_name, "stock_code": code}]
+                    self.fail(f"unexpected exact identity query: {arguments}")
+
+                def unavailable_info(**_kwargs):
+                    raise MCPToolError("company info unavailable")
+
+                invoker = FakeMCPInvoker(
+                    {
+                        (CNFINANCIAL_SERVER, "search_stock"): search_stock,
+                        (CNFINANCIAL_SERVER, "get_company_info"): unavailable_info,
+                        (CNFINANCIAL_SERVER, "get_company_profile"): [
+                            {
+                                "stock_code": code,
+                                "main_business": "网络安全产品、平台与安全服务",
+                                "data_date": "2025",
+                            }
+                        ],
+                    }
+                )
+
+                candidates, audit, _bundles = resolve_web_first_company_seeds(
+                    seeds,
+                    impacts,
+                    [],
+                    invoker=invoker,
+                )
+
+                self.assertEqual(len(candidates), 1)
+                self.assertEqual(candidates[0]["stock_code"], code)
+                self.assertEqual({legal_name, short_name}, set(candidates[0]["aliases"]))
+                self.assertEqual(candidates[0]["impact_ids"], ["IMP-001", "IMP-002"])
+                self.assertTrue(all(item["status"] == "verified" for item in audit))
+                self.assertTrue(all(item["reason_code"] == "alias_code_merged" for item in audit))
+                tool_names = [call["tool_name"] for call in invoker.calls]
+                self.assertEqual(tool_names.count("search_stock"), 2)
+                self.assertEqual(tool_names.count("get_company_info"), 1)
+                self.assertEqual(tool_names.count("get_company_profile"), 1)
+
+    def test_web_first_verified_short_alias_cannot_authenticate_unrelated_legal_name(self) -> None:
+        legal_name = "完全无关科技股份有限公司"
+        short_name = "中国石化"
+        code = "600028"
+
+        def search_stock(*, arguments, **_kwargs):
+            if arguments == {"keyword": legal_name}:
+                return []
+            if arguments == {"keyword": short_name}:
+                return [{"company_name": short_name, "stock_code": code}]
+            self.fail(f"unexpected exact identity query: {arguments}")
+
+        def unavailable_info(**_kwargs):
+            raise MCPToolError("company info unavailable")
+
+        invoker = FakeMCPInvoker(
+            {
+                (CNFINANCIAL_SERVER, "search_stock"): search_stock,
+                (CNFINANCIAL_SERVER, "get_company_info"): unavailable_info,
+                (CNFINANCIAL_SERVER, "get_company_profile"): [
+                    {"stock_code": code, "main_business": "石油化工生产与销售"}
+                ],
+            }
+        )
+        seeds = [
+            {
+                "seed_id": "seed-negative",
+                "impact_id": "IMP-001",
+                "proposed_name": legal_name,
+                "historical_names": [short_name],
+                "proposed_stock_code": code,
+                "seed_reason": "待核验",
+                "origin_channels": ["llm"],
+            }
+        ]
+        impacts = [
+            {
+                "impact_id": "IMP-001",
+                "industry": "石油化工",
+                "chain_segment": "炼化生产",
+                "business_variables": ["炼化产量"],
+            }
+        ]
+
+        candidates, audit, _bundles = resolve_web_first_company_seeds(
+            seeds,
+            impacts,
+            [],
+            invoker=invoker,
+        )
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(audit[-1]["status"], "rejected")
+        self.assertEqual(audit[-1]["reason_code"], "identity_conflict")
+        tool_names = [call["tool_name"] for call in invoker.calls]
+        self.assertEqual(tool_names.count("search_stock"), 2)
+        self.assertEqual(tool_names.count("get_company_info"), 1)
+        self.assertEqual(tool_names.count("get_company_profile"), 1)
+
+    def test_company_exact_identity_queries_are_validated_separately_and_budget_exempt(self) -> None:
+        invoker = FakeMCPInvoker(
+            {
+                (CNFINANCIAL_SERVER, "search_stock"): [],
+            }
+        )
+        logs: list[dict[str, object]] = []
+
+        for query in ("中国石油天然气股份有限公司", "中国石化", "601857"):
+            _raw, log = _invoke_with_log(
+                invoker,
+                CNFINANCIAL_SERVER,
+                "search_stock",
+                {"keyword": query},
+                tool_logs=logs,
+                log_context={
+                    "impact_id": "IMP-001",
+                    "source_type": "company_exact_identity",
+                },
+            )
+            self.assertEqual(log["reason_code"], "exact_identity_allowed")
+            self.assertTrue(log["query_budget_exempt"])
+            self.assertTrue(log["actual_execution"])
+
+        for query in ("反渗透膜", "高压泵", "液冷服务器"):
+            _invoke_with_log(
+                invoker,
+                CNFINANCIAL_SERVER,
+                "search_stock",
+                {"keyword": query},
+                tool_logs=logs,
+                log_context={"impact_id": "IMP-001", "source_type": "cnfinancial_recall"},
+            )
+
+        self.assertEqual(len(invoker.calls), 5)
+        self.assertEqual(logs[-1]["status"], "skipped")
+        self.assertEqual(logs[-1]["skip_reason"], "query_budget")
+
     def test_search_web_normalizes_fake_invoker_results(self) -> None:
         invoker = FakeMCPInvoker(
             {

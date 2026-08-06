@@ -4,6 +4,8 @@ import unittest
 
 from policychain.safety import (
     PROHIBITED_INVESTMENT_TERMS,
+    REPORT_WRITER_ALLOWED_TERMS,
+    REPORT_WRITER_SAFETY_PROFILE,
     SafetyViolation,
     assert_no_investment_advice,
     contains_prohibited_terms,
@@ -48,6 +50,43 @@ class SafetyTests(unittest.TestCase):
 
     def test_neutral_company_watchlist_title_remains_allowed(self) -> None:
         assert_no_investment_advice("## A 股公司关注清单\n仅用于公司业务匹配研究。")
+
+    def test_report_profile_accepts_conditional_operating_analysis_soft_terms(self) -> None:
+        text = (
+            "若项目落地，订单确定性需求可能形成阶段性利好；若成本传导不畅则可能形成利空。"
+            "执行节奏应重点关注，当前确定性趋势和成长叙事仍取决于配套资金。"
+        )
+
+        self.assertEqual(
+            contains_prohibited_terms(text, profile=REPORT_WRITER_SAFETY_PROFILE),
+            [],
+        )
+        assert_no_investment_advice(text, profile=REPORT_WRITER_SAFETY_PROFILE)
+        for term in REPORT_WRITER_ALLOWED_TERMS:
+            self.assertIn(term, text)
+            with self.assertRaises(SafetyViolation):
+                assert_no_investment_advice(term)
+
+    def test_report_profile_still_rejects_transactions_returns_and_investor_actions(self) -> None:
+        phrases = (
+            "买入",
+            "卖出",
+            "目标价",
+            "推荐股票",
+            "确定性收益",
+            "确定性投资建议",
+            "对于投资者而言",
+            "投资者应重点关注",
+            "投资者可重点关注",
+        )
+
+        for phrase in phrases:
+            with self.subTest(phrase=phrase):
+                with self.assertRaises(SafetyViolation):
+                    assert_no_investment_advice(
+                        phrase,
+                        profile=REPORT_WRITER_SAFETY_PROFILE,
+                    )
 
 
 if __name__ == "__main__":

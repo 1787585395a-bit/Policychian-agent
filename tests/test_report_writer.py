@@ -10,6 +10,7 @@ from policychain.agents import (
     write_llm_research_report,
     write_research_report,
 )
+from policychain.llm import MockLLMClient
 from policychain.state import PolicyResearchState
 from tests.helpers import build_sample_store
 
@@ -254,6 +255,53 @@ class ReportWriterTests(unittest.TestCase):
         self.assertNotIn("行业列表", client.calls[0][1])
         self.assertEqual(state.final_report, report)
 
+    def test_conditional_soft_report_uses_llm_source_and_deterministic_company_appendix(self) -> None:
+        state = PolicyResearchState(user_query="测试")
+        state.policy_analysis = {
+            "policy_identity": {"title": "产业政策"},
+            "policy_measures": ["推进示范项目"],
+        }
+        state.industry_impacts = [
+            {
+                "impact_id": "IMP-001",
+                "industry": "设备产业",
+                "chain_segment": "具体设备",
+                "business_variables": ["订单", "成本", "资本开支"],
+            }
+        ]
+        state.company_matches = [_approved_match("白名单公司", "300001", "IMP-001", 0.8)]
+        state.company_coverage = [
+            {"impact_id": "IMP-001", "industry": "设备产业", "passed_count": 1}
+        ]
+        client = MockLLMClient(
+            response=(
+                "# 政策传导分析\n\n若示范项目按期落地，设备订单可能形成阶段性利好；"
+                "若原材料成本无法传导，则可能形成利空，执行节奏应重点关注。"
+            )
+        )
+        recorder = Mock()
+
+        with (
+            patch("policychain.agents.report_writer.current_run_recorder", return_value=recorder),
+            patch("policychain.agents.report_writer.record_event") as record_event,
+        ):
+            report = write_llm_research_report(state, client)
+
+        recorder.mark_fallback.assert_not_called()
+        self.assertTrue(
+            any(
+                call.args == ("report.source",)
+                and call.kwargs.get("source") == "llm"
+                and call.kwargs.get("status") == "ok"
+                for call in record_event.call_args_list
+            )
+        )
+        self.assertIn("阶段性利好", report)
+        self.assertIn("形成利空", report)
+        self.assertIn("白名单公司", report)
+        self.assertIn("300001", report)
+        self.assertEqual(report.count("## A 股公司业务匹配"), 1)
+
     def test_llm_company_section_is_replaced_and_rejected_company_context_is_not_prompted(self) -> None:
         state = _seven_path_state()
         state.company_candidates = [{"company_name": "诱导候选", "stock_code": "300999"}]
@@ -334,7 +382,7 @@ class ReportWriterTests(unittest.TestCase):
         state = _seven_path_state()
         client = _OneShotClient(
             "# 报告\n\n## 相关公司\n编造公司（300888）。\n\n"
-            "对于 投资者 而言，应、重点关注确定性，需求、利好和成长-叙事。"
+            "对于 投资者 而言，应、重点关注确定性，需求、利好和成长-叙事，并建议买入，目标价为 10 元。"
         )
         recorder = Mock()
 
@@ -344,7 +392,15 @@ class ReportWriterTests(unittest.TestCase):
         recorder.mark_fallback.assert_called_once()
         self.assertNotIn("编造公司", report)
         self.assertNotIn("300888", report)
-        for forbidden in ("对于 投资者 而言", "应、重点关注", "确定性，需求", "利好", "成长-叙事"):
+        for forbidden in (
+            "对于 投资者 而言",
+            "应、重点关注",
+            "确定性，需求",
+            "利好",
+            "成长-叙事",
+            "买入",
+            "目标价",
+        ):
             self.assertNotIn(forbidden, report)
         for index in range(1, 8):
             self.assertIn(f"IMP-{index:03d}", report)
@@ -383,8 +439,13 @@ class ReportWriterTests(unittest.TestCase):
 
         with patch.dict("os.environ", {"POLICYCHAIN_MAX_COMPANY_MATCHES_PER_IMPACT": "4"}):
             report_with_four = write_llm_research_report(state, client)
-        self.assertIn("白名单超额", report_with_four)
-        self.assertIn("300004", report_with_four)
+        self.assertNotIn("白名单超额", report_with_four)
+        self.assertNotIn("300004", report_with_four)
+
+        with patch.dict("os.environ", {"POLICYCHAIN_MAX_COMPANY_MATCHES_PER_IMPACT": "9"}):
+            report_with_nine = write_llm_research_report(state, client)
+        self.assertNotIn("白名单超额", report_with_nine)
+        self.assertNotIn("300004", report_with_nine)
 
 
 class _OneShotClient:

@@ -161,6 +161,44 @@ POLICY_SOURCE_PRIORITY = ("政府官网", "主管部门", "官方解读")
 INDUSTRY_SOURCE_PRIORITY = ("政府部门", "国家统计局", "行业协会", "权威机构")
 COMPANY_SOURCE_PRIORITY = ("交易所公告", "巨潮资讯", "公司官网")
 
+LEGAL_COMPANY_NAME_SUFFIXES = (
+    "股份有限公司",
+    "有限责任公司",
+    "集团有限公司",
+    "集团股份公司",
+    "股份公司",
+    "有限公司",
+)
+
+LEGAL_COMPANY_GEOGRAPHIC_PREFIXES = (
+    "北京市",
+    "上海市",
+    "天津市",
+    "重庆市",
+    "北京",
+    "上海",
+    "天津",
+    "重庆",
+    "深圳",
+    "广州",
+    "杭州",
+    "南京",
+    "武汉",
+    "成都",
+    "西安",
+    "苏州",
+    "宁波",
+    "青岛",
+    "厦门",
+)
+
+LEGAL_COMPANY_GENERIC_DESCRIPTORS = (
+    "科技",
+    "技术",
+    "集团",
+    "控股",
+)
+
 COMPANY_BUSINESS_EVIDENCE_KEYWORDS = (
     "产品",
     "服务",
@@ -200,6 +238,7 @@ GENERIC_STOCK_SEARCH_TERMS = {
     "运营商",
 }
 COMPANY_SEARCH_STOCK_MAX_CALLS_PER_IMPACT = 2
+COMPANY_EXACT_IDENTITY_MAX_QUERIES_PER_ENTITY = 3
 INVALID_STOCK_SEARCH_MARKERS = (
     "->",
     "=>",
@@ -1088,6 +1127,58 @@ def _record_company_stage_event(
         return
 
 
+def _payload_company_codes(payload: Any) -> list[str]:
+    return _unique(
+        code
+        for item in _payload_items(payload)
+        if (code := _normalize_stock_code(str(_first_value(item, COMPANY_CODE_KEYS) or "")))
+    )
+
+
+def _payload_company_names(payload: Any, expected_code: str) -> list[str]:
+    name_keys = (
+        *COMPANY_NAME_KEYS,
+        "legal_name",
+        "full_name",
+        "company_full_name",
+        "short_name",
+        "company_short_name",
+        "former_name",
+        "old_name",
+        "公司全称",
+        "证券全称",
+        "曾用名",
+    )
+    names: list[str] = []
+    for item in _payload_items(payload):
+        item_code = _normalize_stock_code(str(_first_value(item, COMPANY_CODE_KEYS) or ""))
+        if item_code and item_code != expected_code:
+            continue
+        names.extend(str(item.get(key) or "").strip() for key in name_keys if str(item.get(key) or "").strip())
+    return _unique(names)
+
+
+def _preferred_company_name(names: Iterable[str]) -> str:
+    values = _unique(str(name or "").strip() for name in names if str(name or "").strip())
+    legal_names = [
+        name
+        for name in values
+        if any(name.endswith(suffix) for suffix in LEGAL_COMPANY_NAME_SUFFIXES)
+    ]
+    if legal_names:
+        return max(legal_names, key=len)
+    return values[0] if values else ""
+
+
+def _payload_has_company_code(payload: Any, expected_code: str) -> bool:
+    codes = _payload_company_codes(payload)
+    return bool(codes) and codes == [expected_code]
+
+
+def _payload_has_conflicting_company_code(payload: Any, expected_code: str) -> bool:
+    return any(code != expected_code for code in _payload_company_codes(payload))
+
+
 def _resolve_current_company_identity(
     *,
     code: str,
@@ -1119,17 +1210,17 @@ def _resolve_current_company_identity(
         if _is_non_current_listing_status(status_value):
             non_current = True
             continue
-        name = str(_first_value(item, COMPANY_NAME_KEYS) or "").strip()
-        if name and _is_current_listing_status(status_value):
-            identities.append(
-                {
-                    "company_name": name,
-                    "source": CNFINANCIAL_SERVER,
-                    "source_url": str(_first_value(item, ("source_url", "url", "link")) or ""),
-                    "data_date": str(_first_value(item, ("data_date", "date", "publish_date")) or ""),
-                    "tool_call_id": "",
-                }
-            )
+        if _is_current_listing_status(status_value):
+            for name in _payload_company_names(item, code):
+                identities.append(
+                    {
+                        "company_name": name,
+                        "source": CNFINANCIAL_SERVER,
+                        "source_url": str(_first_value(item, ("source_url", "url", "link")) or ""),
+                        "data_date": str(_first_value(item, ("data_date", "date", "publish_date")) or ""),
+                        "tool_call_id": "",
+                    }
+                )
 
     for evidence in web_evidence:
         raw_item = evidence.get("raw_payload") if isinstance(evidence.get("raw_payload"), dict) else {}
@@ -1204,9 +1295,17 @@ def _resolve_current_company_identity(
             by_name.setdefault(normalized_name, identity)
     if not by_name:
         return {"status": "unresolved", "reason_code": "current_identity_unverified"}
-    if len(by_name) > 1:
-        return {"status": "rejected", "reason_code": "ambiguous_current_identity"}
-    return {"status": "verified", "reason_code": "identity_verified", **next(iter(by_name.values()))}
+    aliases = [str(item.get("company_name") or "") for item in by_name.values()]
+    company_name = _preferred_company_name(aliases)
+    primary = by_name[_normalize_company_name(company_name)]
+    return {
+        "status": "verified",
+        "reason_code": "alias_code_merged" if len(by_name) > 1 else "identity_verified",
+        **primary,
+        "company_name": company_name,
+        "stock_code": code,
+        "aliases": aliases,
+    }
 
 
 def _official_rename_chain(
@@ -1314,6 +1413,37 @@ def _normalize_company_name(value: str) -> str:
     return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]", "", str(value or "")).lower()
 
 
+def _legal_full_name_matches_provider_short_name(legal_name: str, provider_short_name: str) -> bool:
+    """Conservatively relate a legal full name to a provider-returned stock short name."""
+
+    legal_key = _normalize_company_name(legal_name)
+    short_key = _normalize_company_name(provider_short_name)
+    suffix = next(
+        (value for value in LEGAL_COMPANY_NAME_SUFFIXES if legal_key.endswith(value)),
+        "",
+    )
+    if not suffix or not short_key or short_key in GENERIC_STOCK_SEARCH_TERMS:
+        return False
+    chinese_count = len(re.findall(r"[\u4e00-\u9fff]", short_key))
+    stable_ascii_token = bool(re.fullmatch(r"[a-z0-9]{3,}", short_key))
+    if chinese_count < 3 and not stable_ascii_token:
+        return False
+
+    legal_core = legal_key[: -len(suffix)]
+    normalized_cores = {legal_core}
+    stripped_core = legal_core
+    for prefix in LEGAL_COMPANY_GEOGRAPHIC_PREFIXES:
+        if stripped_core.startswith(prefix) and len(stripped_core) > len(prefix):
+            stripped_core = stripped_core[len(prefix) :]
+            break
+    for descriptor in LEGAL_COMPANY_GENERIC_DESCRIPTORS:
+        if stripped_core.endswith(descriptor) and len(stripped_core) > len(descriptor):
+            stripped_core = stripped_core[: -len(descriptor)]
+            break
+    normalized_cores.add(stripped_core)
+    return any(short_key in core for core in normalized_cores if core)
+
+
 def _search_failure_reason(logs: list[dict[str, Any]], fallback: str) -> str:
     statuses = {str(item.get("status") or "") for item in logs}
     if "unavailable" in statuses:
@@ -1414,6 +1544,94 @@ def collect_company_discovery_web_evidence(
     return _dedupe_evidence(evidence), audit
 
 
+def _web_first_entity_query_keys(seeds: list[dict[str, Any]]) -> dict[int, str]:
+    """Unify the two-query exact-search ledger by code or overlapping declared names."""
+
+    parents = list(range(len(seeds)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    codes: list[str] = []
+    name_sets: list[set[str]] = []
+    for seed in seeds:
+        codes.append(_normalize_stock_code(str(seed.get("proposed_stock_code") or "")))
+        name_sets.append(
+            {
+                normalized
+                for normalized in (
+                    _normalize_company_name(str(seed.get("proposed_name") or "")),
+                    *(
+                        _normalize_company_name(str(name))
+                        for name in (seed.get("historical_names") or [])[:1]
+                    ),
+                )
+                if normalized
+            }
+        )
+
+    for left in range(len(seeds)):
+        for right in range(left + 1, len(seeds)):
+            if (codes[left] and codes[left] == codes[right]) or name_sets[left].intersection(name_sets[right]):
+                union(left, right)
+
+    components: dict[int, list[int]] = {}
+    for index in range(len(seeds)):
+        components.setdefault(find(index), []).append(index)
+
+    result: dict[int, str] = {}
+    for members in components.values():
+        component_codes = _unique(codes[index] for index in members if codes[index])
+        component_names = sorted(name for index in members for name in name_sets[index])
+        key = component_codes[0] if len(component_codes) == 1 else "|".join(component_codes or component_names[:1])
+        for index in members:
+            result[index + 1] = key
+    return result
+
+
+def _web_first_identity_queries(seed: dict[str, Any]) -> list[str]:
+    """Order bounded exact identity queries as code, short alias, then legal/supplementary name."""
+
+    proposed_code = _normalize_stock_code(str(seed.get("proposed_stock_code") or ""))
+    proposed_name = str(seed.get("proposed_name") or "").strip()
+    historical_names = _unique(
+        str(value).strip()
+        for value in (seed.get("historical_names") or [])
+        if str(value).strip()
+    )
+    declared_names = _unique([proposed_name, *historical_names])
+    short_names = [
+        name
+        for name in declared_names
+        if not any(name.endswith(suffix) for suffix in LEGAL_COMPANY_NAME_SUFFIXES)
+    ]
+    legal_names = [
+        name
+        for name in declared_names
+        if any(name.endswith(suffix) for suffix in LEGAL_COMPANY_NAME_SUFFIXES)
+    ]
+    supplementary_names = [
+        name for name in declared_names if name not in short_names and name not in legal_names
+    ]
+    return _unique(
+        [
+            proposed_code,
+            *short_names,
+            *legal_names,
+            *supplementary_names,
+        ]
+    )[:COMPANY_EXACT_IDENTITY_MAX_QUERIES_PER_ENTITY]
+
+
 def resolve_web_first_company_seeds(
     seeds: list[dict[str, Any]],
     industry_impacts: list[dict[str, Any]],
@@ -1424,8 +1642,8 @@ def resolve_web_first_company_seeds(
     """Resolve explicit Web/LLM seeds without industry or concept candidate recall.
 
     CNFinancial is queried only with an explicit company name or six-digit code.
-    A technical CNFinancial failure may use a strict two-source Web fallback;
-    a successful empty response never activates that fallback.
+    Queries are code-first and globally cached per entity. Every non-conflict
+    terminal state may use the strict two-source Web fallback.
     """
 
     impacts = {
@@ -1439,6 +1657,8 @@ def resolve_web_first_company_seeds(
     audit: list[dict[str, Any]] = []
     bundles: list[dict[str, Any]] = []
     search_cache: dict[str, tuple[Any, dict[str, Any]]] = {}
+    entity_search_counts: dict[str, int] = {}
+    entity_query_keys = _web_first_entity_query_keys(seeds)
     prepared: list[dict[str, Any]] = []
 
     for seed_index, seed in enumerate(seeds, start=1):
@@ -1459,18 +1679,19 @@ def resolve_web_first_company_seeds(
 
         search_items: list[dict[str, Any]] = []
         search_logs: list[dict[str, Any]] = []
-        search_names = [proposed_name]
         aliases = _unique(str(value).strip() for value in (seed.get("historical_names") or []) if str(value).strip())
-        if aliases:
-            search_names.append(aliases[0])
-        for name_index, exact_name in enumerate(search_names):
-            if name_index and search_items:
-                break
+        search_queries = _web_first_identity_queries(seed)
+        base["query_sequence"] = list(search_queries)
+        entity_key = entity_query_keys.get(seed_index, proposed_code or _normalize_company_name(proposed_name))
+        search_conflict = False
+        for exact_name in search_queries:
             cache_key = _normalize_company_name(exact_name)
             cache_hit = cache_key in search_cache
             if cache_hit:
                 raw, call_log = search_cache[cache_key]
             else:
+                if entity_search_counts.get(entity_key, 0) >= COMPANY_EXACT_IDENTITY_MAX_QUERIES_PER_ENTITY:
+                    break
                 raw, call_log = _invoke_with_log(
                     invoker=invoker,
                     server_name=CNFINANCIAL_SERVER,
@@ -1485,8 +1706,18 @@ def resolve_web_first_company_seeds(
                     },
                 )
                 search_cache[cache_key] = (raw, call_log)
+                entity_search_counts[entity_key] = entity_search_counts.get(entity_key, 0) + 1
             search_logs.append({**call_log, "cache_hit": cache_hit or bool(call_log.get("cache_hit"))})
-            search_items.extend(_payload_items(raw))
+            query_items = _payload_items(raw)
+            search_items.extend(query_items)
+            query_codes = _payload_company_codes(query_items)
+            if len(query_codes) > 1 or (
+                proposed_code and query_codes and any(code != proposed_code for code in query_codes)
+            ):
+                search_conflict = True
+                break
+            if len(query_codes) == 1 and (not proposed_code or query_codes[0] == proposed_code):
+                break
 
         explicit_mappings: list[tuple[str, str]] = []
         for item in search_items:
@@ -1494,32 +1725,59 @@ def resolve_web_first_company_seeds(
             item_name = str(_first_value(item, COMPANY_NAME_KEYS) or "").strip()
             if item_code and item_name:
                 explicit_mappings.append((item_name, item_code))
-        search_codes = _unique(code for _name, code in explicit_mappings)
+        search_codes = _payload_company_codes(search_items)
         base["tool_call_id"] = str(search_logs[0].get("tool_call_id") or base["tool_call_id"]) if search_logs else base["tool_call_id"]
         base["cache_hit"] = bool(search_logs and all(bool(item.get("cache_hit")) for item in search_logs))
-        if len(search_codes) > 1:
+        if search_conflict or len(search_codes) > 1:
+            base["fallback_status"] = "not_started_hard_veto"
             _append_company_seed_audit(audit, base, "rejected", "identity_conflict")
             continue
         search_code = search_codes[0] if search_codes else ""
         if proposed_code and search_code and proposed_code != search_code:
+            base["fallback_status"] = "not_started_hard_veto"
             _append_company_seed_audit(audit, base, "rejected", "identity_conflict")
             continue
 
         search_reason = _cnfinancial_log_reason(search_logs)
         web_code, web_code_conflict = _web_identity_code(
             evidence_by_impact.get(impact_id, []),
-            proposed_name,
+            [proposed_name, *aliases],
         )
         if web_code_conflict:
+            base["fallback_status"] = "not_started_hard_veto"
             _append_company_seed_audit(audit, base, "rejected", "identity_conflict")
             continue
-        resolved_code = proposed_code or search_code
-        if not resolved_code and search_reason in {"cnfinancial_error", "cnfinancial_unavailable"}:
-            resolved_code = web_code
+        resolved_code = proposed_code or search_code or web_code
         if not resolved_code:
-            _append_company_seed_audit(audit, base, "unresolved", search_reason or "cnfinancial_empty")
+            base["fallback_status"] = "required"
+            _record_company_stage_event(
+                "company.identity",
+                base=base,
+                status="fallback_required",
+                reason_code="web_fallback_required",
+            )
+            _record_company_stage_event(
+                "company.identity",
+                base=base,
+                status="fallback_started",
+                reason_code="web_fallback_started",
+            )
+            base["fallback_status"] = "exhausted"
+            _append_company_seed_audit(audit, base, "unresolved", "web_fallback_exhausted")
+            bundles.append(
+                _company_evidence_bundle(
+                    seed,
+                    "",
+                    evidence_by_impact.get(impact_id, []),
+                    [],
+                    [],
+                    status="web_fallback_exhausted",
+                    impact=impacts[impact_id],
+                )
+            )
             continue
         if not _is_current_a_share_code(resolved_code):
+            base["fallback_status"] = "not_started_hard_veto"
             _append_company_seed_audit(audit, base, "rejected", "non_current_a_share_code")
             continue
         prepared.append(
@@ -1527,6 +1785,7 @@ def resolve_web_first_company_seeds(
                 "seed": seed,
                 "base": base,
                 "code": resolved_code,
+                "search_code": search_code,
                 "search_reason": search_reason,
                 "search_items": search_items,
                 "search_names": _unique(name for name, code in explicit_mappings if code == resolved_code),
@@ -1541,19 +1800,6 @@ def resolve_web_first_company_seeds(
     for code, group in grouped.items():
         first_seed = group[0]["seed"]
         first_impact_id = str(first_seed.get("impact_id") or "")
-        info_raw, info_log = _invoke_with_log(
-            invoker=invoker,
-            server_name=CNFINANCIAL_SERVER,
-            tool_name="get_company_info",
-            arguments={"symbol": code},
-            tool_logs=active_logs,
-            log_context={
-                "stage": "company_matcher",
-                "impact_id": first_impact_id,
-                "seed_id": str(first_seed.get("seed_id") or ""),
-                "source_type": "company_exact_identity",
-            },
-        )
         profile_raw, profile_log = _invoke_with_log(
             invoker=invoker,
             server_name=CNFINANCIAL_SERVER,
@@ -1567,14 +1813,21 @@ def resolve_web_first_company_seeds(
                 "source_type": "company_exact_enrichment",
             },
         )
-        candidate_names = _unique(
-            [
-                *(name for item in group for name in item.get("search_names") or []),
-                *(str(item["seed"].get("proposed_name") or "") for item in group),
-                *(str(name) for item in group for name in (item["seed"].get("historical_names") or [])[:1]),
-            ]
+        info_raw, info_log = _invoke_with_log(
+            invoker=invoker,
+            server_name=CNFINANCIAL_SERVER,
+            tool_name="get_company_info",
+            arguments={"symbol": code},
+            tool_logs=active_logs,
+            log_context={
+                "stage": "company_matcher",
+                "impact_id": first_impact_id,
+                "seed_id": str(first_seed.get("seed_id") or ""),
+                "source_type": "company_exact_identity_enhancement",
+            },
         )
-        identity = _resolve_current_company_identity(
+        candidate_names = _unique(name for item in group for name in item.get("search_names") or [])
+        info_identity = _resolve_current_company_identity(
             code=code,
             candidate_names=candidate_names,
             company_info=info_raw,
@@ -1582,21 +1835,74 @@ def resolve_web_first_company_seeds(
         )
         info_reason = _cnfinancial_log_reason([info_log])
         profile_reason = _cnfinancial_log_reason([profile_log])
+        profile_items = _payload_items(profile_raw)
+        info_code_conflict = _payload_has_conflicting_company_code(info_raw, code)
+        profile_code_conflict = _payload_has_conflicting_company_code(profile_raw, code)
+        profile_has_matching_code = _payload_has_company_code(profile_raw, code)
+        search_identity_names = _unique(
+            name
+            for item in group
+            for name in (item.get("search_names") or [])
+            if _normalize_company_name(str(name or ""))
+        )
+        profile_business_values = _unique(
+            str(_first_value(item, BUSINESS_KEYS) or "")
+            for item in profile_items
+        )
         business_values = _unique(
             str(_first_value(item, BUSINESS_KEYS) or "")
-            for item in [*_payload_items(profile_raw), *_payload_items(info_raw)]
+            for item in [*profile_items, *_payload_items(info_raw)]
         )
+        code_profile_verified = bool(
+            any(str(item.get("search_code") or "") == code for item in group)
+            and profile_has_matching_code
+            and profile_business_values
+            and (
+                search_identity_names
+                or _payload_company_names(profile_raw, code)
+            )
+        )
+        known_aliases = _unique(
+            [
+                *search_identity_names,
+                *_payload_company_names(info_raw, code),
+                *_payload_company_names(profile_raw, code),
+                *(str(name) for name in (info_identity.get("aliases") or [])),
+                str(info_identity.get("company_name") or ""),
+            ]
+        )
+        identity = dict(info_identity)
+        code_profile_identity = str(info_identity.get("status") or "") == "unresolved" and code_profile_verified
+        if code_profile_identity:
+            identity = {
+                "status": "verified",
+                "reason_code": "alias_code_merged" if len({_normalize_company_name(name) for name in known_aliases}) > 1 else "identity_verified_code_profile",
+                "company_name": _preferred_company_name(known_aliases) or search_identity_names[0],
+                "stock_code": code,
+                "aliases": known_aliases,
+                "source": CNFINANCIAL_SERVER,
+                "source_url": "",
+                "data_date": str(_first_value(profile_items[0], ("data_date", "date", "publish_date", "year")) or ""),
+                "tool_call_id": str(profile_log.get("tool_call_id") or ""),
+            }
         accepted: list[dict[str, Any]] = []
         for group_index, item in enumerate(group):
             seed = item["seed"]
             impact_id = str(seed.get("impact_id") or "")
             impact = impacts[impact_id]
+            declared_seed_names = _unique(
+                [
+                    str(seed.get("proposed_name") or ""),
+                    *(str(name) for name in (seed.get("historical_names") or [])[:1]),
+                ]
+            )
             scoped_web = _company_scoped_web_evidence(
                 evidence_by_impact.get(impact_id, []),
                 names=[
-                    str(seed.get("proposed_name") or ""),
+                    *known_aliases,
+                    *declared_seed_names,
+                    *(str(value) for value in (identity.get("aliases") or [])),
                     str(identity.get("company_name") or ""),
-                    *(str(value) for value in (seed.get("historical_names") or [])[:1]),
                 ],
                 code=code,
             )
@@ -1622,9 +1928,15 @@ def resolve_web_first_company_seeds(
             )
 
             if _contains_non_current_listing_marker(_web_evidence_text(scoped_web)):
+                base["fallback_status"] = "not_started_hard_veto"
                 _append_company_seed_audit(audit, base, "rejected", "non_current_a_share_identity")
                 continue
+            if info_code_conflict or profile_code_conflict:
+                base["fallback_status"] = "not_started_hard_veto"
+                _append_company_seed_audit(audit, base, "rejected", "identity_conflict")
+                continue
             if str(identity.get("status") or "") == "rejected":
+                base["fallback_status"] = "not_started_hard_veto"
                 _append_company_seed_audit(
                     audit,
                     base,
@@ -1634,56 +1946,68 @@ def resolve_web_first_company_seeds(
                 continue
 
             normal_verified = str(identity.get("status") or "") == "verified" and bool(business_values)
+            identity_verification = (
+                "cnfinancial_code_profile"
+                if code_profile_verified
+                else "cnfinancial_info"
+            )
             current_name = str(identity.get("company_name") or "")
             proposed_name = str(seed.get("proposed_name") or "")
-            if normal_verified and _normalize_company_name(proposed_name) != _normalize_company_name(current_name):
-                if not _official_rename_chain(
-                    code=code,
-                    old_name=proposed_name,
-                    current_name=current_name,
-                    evidence=scoped_web,
-                ):
-                    _append_company_seed_audit(audit, base, "rejected", "identity_conflict")
-                    continue
+            provider_alias_keys = {
+                _normalize_company_name(name)
+                for name in known_aliases
+                if _normalize_company_name(name)
+            }
+            supported_seed_names = _unique(
+                name
+                for name in declared_seed_names
+                if _normalize_company_name(name) in provider_alias_keys
+                or (
+                    profile_has_matching_code
+                    and any(
+                        _legal_full_name_matches_provider_short_name(name, provider_name)
+                        for provider_name in search_identity_names
+                    )
+                )
+                or any(
+                    _official_rename_chain(
+                        code=code,
+                        old_name=name,
+                        current_name=provider_name,
+                        evidence=scoped_web,
+                    )
+                    for provider_name in known_aliases
+                )
+            )
 
             web_fallback = False
             fallback_bundle: dict[str, Any] = {}
             if not normal_verified:
-                successful_empty = (
-                    (str(info_log.get("status") or "") == "empty" and str(identity.get("status") or "") != "verified")
-                    or (str(profile_log.get("status") or "") == "empty" and not business_values)
-                    or item.get("search_reason") == "cnfinancial_empty"
+                base["fallback_status"] = "required"
+                _record_company_stage_event(
+                    "company.identity",
+                    base=base,
+                    status="fallback_required",
+                    reason_code="web_fallback_required",
                 )
-                technical_failure = any(
-                    reason in {"cnfinancial_error", "cnfinancial_unavailable"}
-                    for reason in (item.get("search_reason"), info_reason, profile_reason)
+                base["fallback_status"] = "started"
+                _record_company_stage_event(
+                    "company.identity",
+                    base=base,
+                    status="fallback_started",
+                    reason_code="web_fallback_started",
                 )
-                if successful_empty or not technical_failure:
-                    reason_code = "cnfinancial_empty" if successful_empty else "business_rejected"
-                    _append_company_seed_audit(audit, base, "unresolved", reason_code)
-                    bundles.append(
-                        _company_evidence_bundle(
-                            seed,
-                            code,
-                            scoped_web,
-                            profile_raw,
-                            info_raw,
-                            status=reason_code,
-                            identity=identity,
-                            impact=impact,
-                            path_specific_business=" ".join(business_values),
-                            profile_log=profile_log,
-                            info_log=info_log,
-                        )
-                    )
-                    continue
                 fallback_bundle = _qualify_web_fallback(seed, code, impact, scoped_web)
                 if str(fallback_bundle.get("status") or "") != "verified":
+                    base["fallback_status"] = "exhausted"
+                    base["fallback_reason"] = str(
+                        fallback_bundle.get("reason_code") or "web_fallback_unresolved"
+                    )
                     _append_company_seed_audit(
                         audit,
                         base,
-                        str(fallback_bundle.get("status") or "unresolved"),
-                        str(fallback_bundle.get("reason_code") or "web_fallback_unresolved"),
+                        "unresolved",
+                        "web_fallback_exhausted",
                     )
                     bundles.append(
                         _company_evidence_bundle(
@@ -1692,7 +2016,7 @@ def resolve_web_first_company_seeds(
                             scoped_web,
                             profile_raw,
                             info_raw,
-                            status=str(fallback_bundle.get("reason_code") or "web_fallback_unresolved"),
+                            status="web_fallback_exhausted",
                             identity=identity,
                             impact=impact,
                             path_specific_business=str(fallback_bundle.get("business_text") or ""),
@@ -1702,19 +2026,74 @@ def resolve_web_first_company_seeds(
                     )
                     continue
                 web_fallback = True
+                base["fallback_status"] = "verified"
 
-            reason_code = "web_fallback" if web_fallback else "identity_verified"
+            if not web_fallback and _normalize_company_name(proposed_name) not in {
+                _normalize_company_name(name) for name in supported_seed_names
+            }:
+                base["fallback_status"] = "not_started_hard_veto"
+                _append_company_seed_audit(audit, base, "rejected", "identity_conflict")
+                continue
+
+            accepted_aliases = _unique([*known_aliases, *supported_seed_names])
+            if web_fallback:
+                fallback_text = _normalize_company_name(
+                    _web_evidence_text(list(fallback_bundle.get("evidence") or []))
+                )
+                accepted_aliases = _unique(
+                    name
+                    for name in declared_seed_names
+                    if _normalize_company_name(name)
+                    and _normalize_company_name(name) in fallback_text
+                )
+
+            reason_code = (
+                "web_fallback"
+                if web_fallback
+                else (
+                    "alias_code_merged"
+                    if len({_normalize_company_name(name) for name in accepted_aliases if _normalize_company_name(name)}) > 1
+                    else (
+                        "identity_verified_code_profile"
+                        if code_profile_verified
+                        else str(identity.get("reason_code") or "identity_verified")
+                    )
+                )
+            )
+            if not web_fallback:
+                base["fallback_status"] = "not_required"
+            path_specific_business = (
+                str(fallback_bundle.get("business_text") or "")
+                if web_fallback
+                else " ".join(business_values)
+            )
+            verified_path_terms = (
+                list(fallback_bundle.get("path_terms") or [])
+                if web_fallback
+                else _web_path_specific_terms(impact, path_specific_business)
+            )
             _append_company_seed_audit(audit, base, "verified", reason_code)
             accepted.append(
                 {
                     "item": item,
                     "company_name": proposed_name if web_fallback else current_name,
-                    "business_text": str(fallback_bundle.get("business_text") or "") if web_fallback else " ".join(business_values),
+                    "business_text": path_specific_business,
                     "web_fallback": web_fallback,
                     "web_evidence": list(fallback_bundle.get("evidence") or scoped_web),
-                    "path_terms": list(fallback_bundle.get("path_terms") or []),
+                    "path_terms": verified_path_terms,
+                    "identity_verification": "web_fallback" if web_fallback else identity_verification,
+                    "identity_reason_code": reason_code,
+                    "aliases": accepted_aliases,
                 }
             )
+            negative_evidence = []
+            if web_fallback:
+                negative_evidence.append("CNFinancial 未完成交叉验证；当前仅有两处独立 Web 证据。")
+            elif identity_verification == "cnfinancial_code_profile" and info_reason != "cnfinancial_ok":
+                negative_evidence.append(
+                    f"get_company_info 未提供可用增强身份资料（{info_reason}）；"
+                    "当前身份由 search_stock 唯一同代码映射与同代码 get_company_profile 主营资料共同核验。"
+                )
             bundles.append(
                 _company_evidence_bundle(
                     seed,
@@ -1725,12 +2104,8 @@ def resolve_web_first_company_seeds(
                     status=reason_code,
                     identity=identity,
                     impact=impact,
-                    path_specific_business=str(fallback_bundle.get("business_text") or "")
-                    if web_fallback
-                    else " ".join(business_values),
-                    negative_evidence=["CNFinancial 未完成交叉验证；当前仅有两处独立 Web 证据。"]
-                    if web_fallback
-                    else [],
+                    path_specific_business=path_specific_business,
+                    negative_evidence=negative_evidence,
                     profile_log=profile_log,
                     info_log=info_log,
                 )
@@ -1744,6 +2119,20 @@ def resolve_web_first_company_seeds(
             str(item["item"]["seed"].get("impact_id") or "")
             for item in accepted
             if item["web_fallback"]
+        )
+        cnfinancial_identity_modes = _unique(
+            str(item.get("identity_verification") or "")
+            for item in accepted
+            if not item["web_fallback"]
+        )
+        candidate_identity_verification = (
+            "web_fallback"
+            if web_fallback_impacts
+            else (
+                "cnfinancial_code_profile"
+                if "cnfinancial_code_profile" in cnfinancial_identity_modes
+                else "cnfinancial_info"
+            )
         )
         business_by_impact = {
             str(item["item"]["seed"].get("impact_id") or ""): str(item["business_text"] or "")
@@ -1789,7 +2178,13 @@ def resolve_web_first_company_seeds(
             "impact_ids": impact_ids,
             "seed_reasons": _unique(str(item["item"]["seed"].get("seed_reason") or "") for item in accepted),
             "identity_verified": True,
-            "identity_verification": "web_fallback" if web_fallback_impacts else "cnfinancial",
+            "identity_verification": candidate_identity_verification,
+            "aliases": _unique(
+                name
+                for item in accepted
+                for name in (item.get("aliases") or [])
+            ),
+            "company_info_status": info_reason,
             "web_fallback_verified": bool(web_fallback_impacts),
             "web_fallback_impacts": web_fallback_impacts,
             "confidence_cap": 0.55 if web_fallback_impacts else 0.92,
@@ -1801,7 +2196,15 @@ def resolve_web_first_company_seeds(
                     "origin_channels": list(item["item"]["seed"].get("origin_channels") or []),
                     "tool": "web_fallback" if item["web_fallback"] else "get_company_profile",
                     "tool_call_id": str(profile_log.get("tool_call_id") or info_log.get("tool_call_id") or ""),
-                    "source_type": "web_fallback_verified" if item["web_fallback"] else "web_seed_cnfinancial_verified",
+                    "source_type": (
+                        "web_fallback_verified"
+                        if item["web_fallback"]
+                        else (
+                            "web_seed_cnfinancial_code_profile_verified"
+                            if item.get("identity_verification") == "cnfinancial_code_profile"
+                            else "web_seed_cnfinancial_info_verified"
+                        )
+                    ),
                 }
                 for item in accepted
             ],
@@ -1858,20 +2261,24 @@ def _cnfinancial_log_reason(logs: list[dict[str, Any]]) -> str:
 
 def _web_identity_code(
     evidence: list[dict[str, Any]],
-    proposed_name: str,
+    proposed_names: str | list[str],
 ) -> tuple[str, bool]:
-    name_key = _normalize_company_name(proposed_name)
+    names = [proposed_names] if isinstance(proposed_names, str) else proposed_names
+    name_keys = {
+        _normalize_company_name(name)
+        for name in names
+        if _normalize_company_name(name)
+    }
     codes: list[str] = []
     for item in evidence:
         raw = item.get("raw_payload") if isinstance(item.get("raw_payload"), dict) else {}
         text = _web_evidence_item_text(item)
         explicit_name = str(_first_value(raw, COMPANY_NAME_KEYS) or "")
+        normalized_explicit_name = _normalize_company_name(explicit_name)
+        normalized_text = _normalize_company_name(text)
         name_matches = bool(
-            name_key
-            and (
-                name_key in _normalize_company_name(explicit_name)
-                or name_key in _normalize_company_name(text)
-            )
+            name_keys
+            and any(name in normalized_explicit_name or name in normalized_text for name in name_keys)
         )
         if not name_matches:
             continue
@@ -1891,7 +2298,11 @@ def _qualify_web_fallback(
 ) -> dict[str, Any]:
     if _contains_non_current_listing_marker(_web_evidence_text(evidence)):
         return {"status": "rejected", "reason_code": "non_current_a_share_identity"}
-    identity_code, conflict = _web_identity_code(evidence, str(seed.get("proposed_name") or ""))
+    seed_aliases = [
+        str(seed.get("proposed_name") or ""),
+        *(str(name) for name in (seed.get("historical_names") or [])[:1]),
+    ]
+    identity_code, conflict = _web_identity_code(evidence, seed_aliases)
     if conflict or (identity_code and identity_code != code):
         return {"status": "rejected", "reason_code": "identity_conflict"}
 
@@ -1922,8 +2333,12 @@ def _qualify_web_fallback(
     if len(selected) < 2:
         return {"status": "unresolved", "reason_code": "web_fallback_insufficient_independent_sources"}
     combined = _web_evidence_text(selected)
-    proposed_name = str(seed.get("proposed_name") or "")
-    if _normalize_company_name(proposed_name) not in _normalize_company_name(combined) or code not in combined:
+    normalized_combined = _normalize_company_name(combined)
+    if not any(
+        _normalize_company_name(name) in normalized_combined
+        for name in seed_aliases
+        if _normalize_company_name(name)
+    ) or code not in combined:
         return {"status": "unresolved", "reason_code": "web_fallback_identity_unverified"}
     path_terms = _web_path_specific_terms(impact, combined)
     if not path_terms:
@@ -1965,6 +2380,7 @@ def _company_evidence_bundle(
         "identity": {
             "company_name": str(identity.get("company_name") or seed.get("proposed_name") or ""),
             "stock_code": str(identity.get("stock_code") or code),
+            "aliases": list(identity.get("aliases") or []),
             "status": str(identity.get("status") or ""),
             "reason_code": str(identity.get("reason_code") or ""),
             "source_url": str(identity.get("source_url") or ""),
@@ -2018,7 +2434,7 @@ def _company_scoped_web_evidence(
         explicit_code = _normalize_stock_code(str(_first_value(raw, COMPANY_CODE_KEYS) or ""))
         if explicit_code:
             explicit_codes.add(explicit_code)
-        if explicit_codes and code not in explicit_codes:
+        if explicit_codes and (code not in explicit_codes or any(item_code != code for item_code in explicit_codes)):
             continue
         scoped.append(item)
     return _dedupe_evidence(scoped)
@@ -2196,6 +2612,7 @@ def _invoke_with_log(
     log_entry = _new_tool_log(server_name=server_name, tool_name=tool_name, arguments=arguments)
     log_entry.update(log_context or {})
     is_company_stock_search = server_name == CNFINANCIAL_SERVER and tool_name == "search_stock"
+    is_exact_identity_search = is_company_stock_search and str(log_entry.get("source_type") or "") == "company_exact_identity"
     budget_scope = str(log_entry.get("impact_id") or "unscoped")
     budget_reserved = False
     if is_company_stock_search:
@@ -2204,16 +2621,26 @@ def _invoke_with_log(
             {
                 "impact_id": budget_scope,
                 "query": query,
-                "query_budget_limit": COMPANY_SEARCH_STOCK_MAX_CALLS_PER_IMPACT,
+                "query_mode": "company_exact_identity" if is_exact_identity_search else "company_recall",
+                "query_budget_limit": None if is_exact_identity_search else COMPANY_SEARCH_STOCK_MAX_CALLS_PER_IMPACT,
+                "query_budget_exempt": is_exact_identity_search,
                 "actual_execution": False,
             }
         )
-        if not _is_specific_stock_search_term(query):
+        query_allowed = (
+            _is_exact_company_identity_query(query)
+            if is_exact_identity_search
+            else _is_specific_stock_search_term(query)
+        )
+        if not query_allowed:
             log_entry.update(
                 {
                     "status": "skipped",
                     "skip_reason": "invalid_query",
-                    "error": "Rejected non-specific or descriptive company search query",
+                    "reason_code": "exact_identity_rejected" if is_exact_identity_search else "recall_query_rejected",
+                    "error": "Rejected invalid exact company identity query"
+                    if is_exact_identity_search
+                    else "Rejected non-specific or descriptive company search query",
                     "duration_ms": 0.0,
                     "query_budget_used": _query_budget_used(active_invoker, server_name, tool_name, budget_scope),
                 }
@@ -2221,7 +2648,9 @@ def _invoke_with_log(
             _append_tool_log(tool_logs, log_entry)
             _record_mcp_event(log_entry)
             return [], log_entry
-        if isinstance(active_invoker, RuntimeMCPInvoker):
+        if is_exact_identity_search:
+            log_entry["reason_code"] = "exact_identity_allowed"
+        elif isinstance(active_invoker, RuntimeMCPInvoker):
             allowed, used = active_invoker.reserve_query_budget(
                 server_name,
                 tool_name,
@@ -2705,6 +3134,29 @@ def _is_specific_stock_search_term(value: str) -> bool:
     if any(term.endswith(suffix) for suffix in GENERIC_TERM_SUFFIXES):
         return False
     return True
+
+
+def _is_exact_company_identity_query(value: str) -> bool:
+    term = re.sub(r"\s+", "", str(value or "")).strip("，。；;、/|：:")
+    if re.fullmatch(r"\d{6}", term):
+        return True
+    if not (2 <= len(term) <= 60):
+        return False
+    if re.search(r"[\r\n。！？!?；;：:,，、/|]", term):
+        return False
+    if any(marker in term for marker in INVALID_STOCK_SEARCH_MARKERS):
+        return False
+    if any(action in term for action in INVALID_STOCK_SEARCH_ACTIONS):
+        return False
+    if any(metric in term for metric in INVALID_STOCK_SEARCH_METRIC_TERMS):
+        return False
+    if any(term.endswith(suffix) and len(term) > len(suffix) for suffix in LEGAL_COMPANY_NAME_SUFFIXES):
+        return True
+    if len(term) > 12 or term in GENERIC_STOCK_SEARCH_TERMS:
+        return False
+    if any(term.endswith(suffix) for suffix in GENERIC_TERM_SUFFIXES):
+        return False
+    return bool(re.fullmatch(r"(?:\*?ST|N|C)?[0-9A-Za-z\u4e00-\u9fff]+", term, flags=re.IGNORECASE))
 
 
 def _query_budget_used(

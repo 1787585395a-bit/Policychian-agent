@@ -8,7 +8,7 @@ from policychain.agents.company_matcher import resolve_company_match_limit
 from policychain.llm import LLMClient, observed_llm_generate
 from policychain.observability import current_run_recorder, record_event
 from policychain.prompts import render_prompt
-from policychain.safety import assert_no_investment_advice
+from policychain.safety import REPORT_WRITER_SAFETY_PROFILE, assert_no_investment_advice
 from policychain.state import PolicyResearchState
 
 
@@ -62,7 +62,11 @@ def write_research_report(state: PolicyResearchState) -> str:
             "本报告仅用于政策研究和公司业务匹配分析，不构成任何投资建议。",
         ]
     ).strip()
-    assert_no_investment_advice(report, context="Report")
+    assert_no_investment_advice(
+        report,
+        context="Report",
+        profile=REPORT_WRITER_SAFETY_PROFILE,
+    )
     state.final_report = report
     record_event("report.source", stage="report_writer", status="ok", source="deterministic_rules")
     return report
@@ -96,7 +100,11 @@ def write_llm_research_report(state: PolicyResearchState, llm_client: LLMClient)
             uncertainties=_json_for_prompt(_report_uncertainties(state)),
         )
         body = observed_llm_generate(llm_client, prompt["system"], prompt["user"], agent="report_writer")
-        assert_no_investment_advice(body, context="LLM report raw output")
+        assert_no_investment_advice(
+            body,
+            context="LLM report raw output",
+            profile=REPORT_WRITER_SAFETY_PROFILE,
+        )
         body = _strip_company_sections(_strip_reference_sections(body))
         if not body.strip():
             raise ReportWriterError("LLM Report Writer returned an empty report")
@@ -111,7 +119,11 @@ def write_llm_research_report(state: PolicyResearchState, llm_client: LLMClient)
                 "本报告仅用于政策研究和公司业务匹配分析，不构成任何投资建议。",
             ]
         ).strip()
-        assert_no_investment_advice(report, context="LLM report")
+        assert_no_investment_advice(
+            report,
+            context="LLM report",
+            profile=REPORT_WRITER_SAFETY_PROFILE,
+        )
         state.final_report = report
         record_event("report.source", stage="report_writer", status="ok", source="llm")
         return report

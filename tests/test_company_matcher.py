@@ -327,6 +327,72 @@ class CompanyMatcherTests(unittest.TestCase):
         self.assertEqual(weak_audit["decision"], "reject")
         self.assertIn("泛化词", weak_audit["reason"])
 
+    def test_llm_selected_traceable_weak_semantic_match_is_kept_low_without_overriding_conflict(self) -> None:
+        impact = {
+            "impact_id": "IMP-001",
+            "industry": "氢能储运体系",
+            "chain_segment": "氢能运输基础设施",
+            "transmission_logic": "氢能运输基础设施建设影响能源运输服务",
+        }
+        record = {
+            "company_name": "中国石油天然气股份有限公司",
+            "stock_code": "601857",
+            "matched_business": "石油天然气勘探、开发与销售",
+            "business_evidence": "年报披露主营石油天然气勘探、开发与销售",
+            "impact_ids": ["IMP-001"],
+            "candidate_source_tool": "get_company_profile",
+            "provenance": [
+                {
+                    "impact_id": "IMP-001",
+                    "tool": "get_company_profile",
+                    "source_type": "web_seed_cnfinancial_info_verified",
+                    "tool_call_id": "tool-profile-601857",
+                }
+            ],
+        }
+        llm_output = CompanyMatchOutput(
+            companies=[
+                CompanyMatch(
+                    company_name=record["company_name"],
+                    stock_code=record["stock_code"],
+                    industry_segment=impact["industry"],
+                    matched_business=record["matched_business"],
+                    impact_id="IMP-001",
+                    match_level="medium",
+                    confidence=0.81,
+                )
+            ]
+        )
+
+        kept = audit_company_match_output(
+            llm_output,
+            [impact],
+            [record],
+            allow_weak_semantic_keep_low=True,
+        )
+
+        self.assertEqual(len(kept.companies), 1)
+        self.assertEqual(kept.companies[0].match_level, "low")
+        self.assertLessEqual(kept.companies[0].confidence, 0.45)
+        self.assertEqual(getattr(kept, "_audit_logs")[0]["reason_code"], "weak_semantic_keep_low")
+
+        for negative_evidence in (
+            "公司明确不涉及氢能运输基础设施业务",
+            "相关业务不包括氢能储运",
+            "公司未布局氢能运输基础设施",
+            "公司不生产氢能储运设备",
+            "公司未从事氢能运输业务",
+        ):
+            with self.subTest(negative_evidence=negative_evidence):
+                conflicted_record = {**record, "negative_evidence": [negative_evidence]}
+                rejected = audit_company_match_output(
+                    llm_output,
+                    [impact],
+                    [conflicted_record],
+                    allow_weak_semantic_keep_low=True,
+                )
+                self.assertEqual(rejected.companies, [])
+
     def test_web_only_candidate_is_rejected_even_with_specific_business_text(self) -> None:
         impact = {
             "industry": "海水淡化设备",
@@ -395,14 +461,15 @@ class CompanyMatcherTests(unittest.TestCase):
         self.assertEqual(empty_coverage["retrieval_status"], "empty")
         self.assertIn("真实返回空", empty_coverage["no_match_reason"])
 
-    def test_company_match_limit_defaults_to_three_and_never_exceeds_four(self) -> None:
+    def test_company_match_limit_is_absolutely_capped_at_three(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
             self.assertEqual(resolve_company_match_limit(), 3)
-            self.assertEqual(resolve_company_match_limit(9), 4)
+            self.assertEqual(resolve_company_match_limit(4), 3)
+            self.assertEqual(resolve_company_match_limit(9), 3)
         with patch.dict("os.environ", {"POLICYCHAIN_MAX_COMPANY_MATCHES_PER_IMPACT": "4"}):
-            self.assertEqual(resolve_company_match_limit(), 4)
+            self.assertEqual(resolve_company_match_limit(), 3)
         with patch.dict("os.environ", {"POLICYCHAIN_MAX_COMPANY_MATCHES_PER_IMPACT": "9"}):
-            self.assertEqual(resolve_company_match_limit(), 4)
+            self.assertEqual(resolve_company_match_limit(), 3)
 
 
 def _multi_path_company_invoker() -> FakeMCPInvoker:
